@@ -1,0 +1,5817 @@
+'use strict';
+
+/**
+ * Burnhouse interface.
+ *
+ * The design step is a slide editor: a filmstrip of slides on the left, the
+ * slide itself in the middle, and controls for whatever is selected on the
+ * right. Dragging a video onto a slide makes a button that plays it; dragging
+ * one onto the filmstrip makes a new slide.
+ *
+ * Written as plain DOM code with one explicit state object and one render pass
+ * per step. There is no framework here on purpose: the whole interface is three
+ * screens, and a build step would be one more thing that can break on a machine
+ * this app cannot be debugged on directly.
+ *
+ * The slide preview calls the same drawing module the disc renderer uses, with
+ * the same resolved layout from the main process, so the picture on screen and
+ * the picture burned to the disc come from one implementation.
+ */
+
+const api = window.burnhouse;
+const draw = window.BurnhouseSlideDraw;
+
+const RASTER = { width: 720, height: 480 };
+const SAFE_MARGIN = 40;
+const MAX_BUTTONS_PER_SLIDE = 18;
+
+/**
+ * The menu raster is anamorphic.
+ *
+ * A player stretches 720x480 to fill a widescreen television, so anything that
+ * should *look* 16:9 must be 3:2 in raster units. The stretch factor comes from
+ * the main process (slide_layout.js), which is the one place that owns the
+ * geometry; this is only a fallback for the moment before presets arrive.
+ */
+let rasterStretch = (16 / 9) / (RASTER.width / RASTER.height);
+
+/** The raster aspect that will display as `displayAspect` on a television. */
+function displayAspectToRaster(displayAspect) {
+  return rasterStretch > 0 ? displayAspect / rasterStretch : displayAspect;
+}
+
+/**
+ * The two settings that used to be questions on the disc setup page.
+ *
+ * They are constants now: the video system is NTSC because she is in North
+ * America, and stereo is the right answer for almost everything. The wrong
+ * answer to either is a disc that will not play or sounds wrong, so neither is
+ * worth asking about.
+ */
+const DISC_DEFAULTS = {
+  audioMode: 'stereo',
+  chaptersEnabled: true,
+  chapterMinutes: 5,
+};
+
+// ---------------------------------------------------------------- state ---
+
+const state = {
+  // Opens on the projects screen on program start so the user can choose to
+  // continue a recent project, open a file, or start fresh.
+  step: 'projects',
+  projectId: null,
+  projectFilePath: null,
+  recentProjects: [],
+  newProjectName: 'My DVD',
+  newProjectTheme: 'charcoal',
+
+  settings: null,
+  appInfo: null,
+  tools: null,
+  presets: null,
+
+  videos: [],
+  videoErrors: [],
+  plan: null,
+  totalSeconds: 0,
+
+  discTitle: '',
+
+  deck: {
+    discTitle: 'My DVD',
+    themeId: 'charcoal',
+    buttonStyle: 'bar',
+    slides: [],
+  },
+  activeSlideId: null,
+  selectedElementId: null,
+
+  layout: null,
+  /** Whether to draw the television-safe guide over the slide. */
+  showSafeArea: true,
+  panelTab: 'design',
+  driveSupported: true,
+  drives: [],
+  driveNote: null,
+  selectedDevice: null,
+
+  busy: false,
+  lastBuild: null,
+  banner: null,
+  /**
+   * Alignment lines to draw while something is being dragged, as
+   * `[{ axis: 'x'|'y', at }]`. Part of the gesture rather than of the slide, so
+   * it is cleared when the drag ends.
+   */
+  snapGuides: [],
+};
+
+let inspectTimer = null;
+let saveTimer = null;
+let renderToken = 0;
+/** Decoded pictures for the current slide, keyed by element id. */
+const imageCache = new Map();
+
+const $ = (id) => document.getElementById(id);
+
+function el(tag, attrs, children) {
+  const node = document.createElement(tag);
+  if (attrs) {
+    for (const [key, value] of Object.entries(attrs)) {
+      if (value === null || value === undefined || value === false) continue;
+      if (key === 'class') node.className = value;
+      else if (key === 'text') node.textContent = value;
+      else if (key.startsWith('on') && typeof value === 'function') {
+        node.addEventListener(key.slice(2).toLowerCase(), value);
+      } else if (key === 'dataset') {
+        for (const [dk, dv] of Object.entries(value)) node.dataset[dk] = dv;
+      } else if (value === true) node.setAttribute(key, '');
+      else node.setAttribute(key, String(value));
+    }
+  }
+  for (const child of [].concat(children || [])) {
+    if (child === null || child === undefined || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+// ------------------------------------------------------------- formatting ---
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(0)} MB`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)} KB`;
+  return `${n} bytes`;
+}
+
+function basename(p) {
+  const s = String(p || '');
+  const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+  return i === -1 ? s : s.slice(i + 1);
+}
+
+function stripExtension(name) {
+  return String(name).replace(/\.[^.]+$/, '');
+}
+
+function videoLabel(video) {
+  return video.menuLabel || stripExtension(video.name);
+}
+
+/** The main process does the real layout; this keeps the editor responsive. */
+function activeSlide() {
+  return state.deck.slides.find((s) => s.id === state.activeSlideId) || null;
+}
+
+function activeSlideLayout() {
+  if (!state.layout) return null;
+  return state.layout.slides.find((s) => s.slide && s.slide.id === state.activeSlideId) || null;
+}
+
+function findElement(elementId) {
+  for (const slide of state.deck.slides) {
+    const element = slide.elements.find((e) => e.id === elementId);
+    if (element) return { slide, element };
+  }
+  return { slide: null, element: null };
+}
+
+// ------------------------------------------------------------------ boot ---
+
+async function boot() {
+  document.body.classList.add(
+    navigator.platform.toLowerCase().includes('mac') ? 'platform-mac' : 'platform-win'
+  );
+
+  try {
+    const [appInfo, settings, presets, recentProjects] = await Promise.all([
+      api.app.info(),
+      api.settings.get(),
+      api.deck.presets(),
+      api.project.listRecent(),
+    ]);
+
+    state.appInfo = appInfo;
+    state.settings = settings;
+    state.presets = presets;
+    state.recentProjects = Array.isArray(recentProjects) ? recentProjects : [];
+
+    // Adopt the geometry the main process owns, so the preview and the disc
+    // cannot disagree about how wide the picture is.
+    if (presets && Number.isFinite(presets.stretch) && presets.stretch > 0) {
+      rasterStretch = presets.stretch;
+    }
+
+    applySettings(settings);
+    await refreshLayout();
+
+    api.tools.detect().then((result) => {
+      state.tools = result.tools;
+      updateBrandTag();
+      /*
+        Only complain about what is genuinely missing.
+
+        This used to announce a "preview build" on any computer that was not a
+        Mac, which was wrong twice over: both platforms burn with their own
+        system tools, and the thing that is actually absent is a program, not a
+        capability of the computer. Burning in particular needs nothing installed
+        on either platform.
+      */
+      if (!result.tools.canAuthor) {
+        setBanner('info', 'This computer cannot build a disc yet', [
+          !result.tools.ffmpeg
+            ? 'The video tools (ffmpeg) were not found. Open Setup to see how to get them.'
+            : 'The disc-building tool (dvdauthor) was not found. Open Setup to see how to get it. ' +
+              'Everything else works: you can design the whole disc and test it on the DVD player.',
+        ]);
+        render();
+      } else if (!result.tools.canBurn) {
+        setBanner('info', 'This computer cannot write discs', [
+          'The disc can still be built and tested here, and the folder or image copied ' +
+            'to a computer that can write it.',
+        ]);
+        render();
+      }
+    });
+
+    refreshDrives();
+    render();
+    bindChrome();
+    bindMenuEvents();
+    bindJobEvents();
+    installTestHooks();
+    window.addEventListener('resize', debounce(drawCanvas, 120));
+  } catch (err) {
+    document.body.innerHTML =
+      `<div style="padding:40px;color:#f3ede2">
+         <h1>Burnhouse could not start</h1>
+         <p style="color:#c4685c;margin-top:10px">${escapeHtml(String(err.message || err))}</p>
+       </div>`;
+  }
+}
+
+function applySettings(settings) {
+  state.discTitle = settings.discTitle || '';
+  state.selectedDevice = settings.lastDevice || null;
+  state.showSafeArea = settings.showSafeArea !== false;
+
+  if (settings.deck && Array.isArray(settings.deck.slides) && settings.deck.slides.length) {
+    state.deck = settings.deck;
+    state.activeSlideId = settings.activeSlideId || settings.deck.slides[0].id;
+  }
+
+  // Normal app startup begins at the Projects page so they can create or
+  // continue a project. Test mode opens directly on the slides step.
+  if (settings && settings.testHooks === true) {
+    state.step = 'slides';
+  } else {
+    state.step = 'projects';
+  }
+
+  // A project with no slides is not a valid starting point, so the first thing
+  // she sees is always a deck. The menu slide is created with no buttons; they
+  // are generated from the video list as soon as there are any videos.
+  ensureStarterSlides();
+}
+
+/**
+ * Guarantee a deck that is ready to work in: a menu slide, plus a slide to put
+ * something on.
+ *
+ * This runs on every start and after any deck change, so there is no state in
+ * which the editor has nothing to show. It only ever adds — it never removes a
+ * slide or rearranges what is already there.
+ */
+function ensureStarterSlides() {
+  if (!state.deck.slides.length) {
+    const title = state.discTitle || 'My DVD';
+    state.deck.slides.push(makeMenuSlide(title));
+    state.deck.slides.push(makeVideoSlide('Slide 2'));
+    state.activeSlideId = state.deck.slides[0].id;
+  }
+  if (!state.activeSlideId || !state.deck.slides.some((s) => s.id === state.activeSlideId)) {
+    state.activeSlideId = state.deck.slides[0].id;
+  }
+}
+
+/**
+ * The menu slide: a title and a list of buttons, one per video.
+ *
+ * Marked `role: 'menu'` so the layout knows it is a hub — a menu slide gets no
+ * Back/Next row, because it is where the disc lives.
+ */
+function makeMenuSlide(title) {
+  return {
+    id: newId('slide'),
+    title: title || 'Main menu',
+    themeId: state.deck.themeId,
+    role: 'menu',
+    elements: [
+      {
+        id: newId('text'),
+        kind: 'text',
+        text: title || 'Main menu',
+        x: SAFE_MARGIN,
+        y: 44,
+        width: RASTER.width - SAFE_MARGIN * 2,
+        fontSize: 'huge',
+        fontId: 'title',
+        color: 'text',
+        align: 'left',
+        background: 'none',
+        autoHeight: true,
+        height: 60,
+      },
+    ],
+  };
+}
+
+/** A blank slide for holding a video. */
+function makeVideoSlide(title) {
+  return {
+    id: newId('slide'),
+    title: title || 'Slide 2',
+    themeId: state.deck.themeId,
+    role: 'content',
+    elements: [],
+  };
+}
+
+function newId(prefix) {
+  return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function persistDeck() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    api.settings
+      .set({
+        deck: state.deck,
+        activeSlideId: state.activeSlideId,
+        discTitle: state.discTitle,
+      })
+      .catch(() => {});
+  }, 500);
+}
+
+function updateBrandTag() {
+  const tag = $('brandTag');
+  if (!tag) return;
+  if (state.step === 'projects') {
+    tag.textContent = 'Projects';
+    return;
+  }
+
+  const title = state.discTitle || 'My DVD';
+  if (!state.tools) {
+    tag.textContent = title;
+    return;
+  }
+
+  // What this says is about capability, not about which computer it is. Both
+  // platforms can burn with their own system tools; what can still be missing is
+  // the disc-building tool, and saying "needs a Mac" when the real gap is a
+  // missing program is simply wrong.
+  if (state.tools.canAuthor && state.tools.canBurn) {
+    tag.textContent = `${title} \u2014 Ready to burn`;
+  } else if (!state.tools.ffmpeg) {
+    tag.textContent = 'Video tools missing \u2014 open Setup';
+  } else if (!state.tools.canAuthor) {
+    tag.textContent = 'Disc-building tool missing \u2014 open Setup';
+  } else {
+    tag.textContent = `${title} \u2014 Ready to build`;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function debounce(fn, ms) {
+  let timer = null;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+}
+
+// -------------------------------------------------------------- videos ---
+
+async function addVideoPaths(paths) {
+  const incoming = (paths || []).filter(Boolean);
+  if (!incoming.length) return [];
+
+  const existing = new Set(state.videos.map((v) => v.path));
+  const added = incoming.filter((p) => !existing.has(p) && looksLikeVideo(p));
+
+  const rejected = incoming.filter((p) => !existing.has(p) && !looksLikeVideo(p));
+  if (rejected.length) {
+    setBanner(
+      'info',
+      'Some files were not videos',
+      rejected.map((p) => `${basename(p)} was skipped.`).slice(0, 4)
+    );
+  }
+
+  if (!added.length) {
+    if (!rejected.length) {
+      setBanner('info', 'Already added', 'Every one of those videos is already on the disc.');
+    }
+    render();
+    return [];
+  }
+
+  for (const path of added) {
+    state.videos.push({
+      id: `v${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      path,
+      name: basename(path),
+      menuLabel: '',
+      duration: 0,
+      probe: null,
+      sizeBytes: 0,
+    });
+  }
+
+  // A folder name is almost always what the disc is "about", so it makes a
+  // better first guess at a title than an empty box.
+  if (!state.discTitle) {
+    const folder = basename(added[0].slice(0, Math.max(added[0].lastIndexOf('/'), added[0].lastIndexOf('\\'))));
+    if (folder && !/^[A-Za-z]:$/.test(folder) && folder.length < 40) {
+      state.discTitle = folder.replace(/[_-]+/g, ' ').trim();
+      state.deck.discTitle = state.discTitle;
+      // Keep the menu slide's heading in step with the disc name, unless she
+      // has typed her own words into it.
+      const menu = state.deck.slides.find((s) => s.role === 'menu');
+      const heading = menu && menu.elements.find((e) => e.kind === 'text');
+      if (heading && !heading.edited) heading.text = state.discTitle;
+    }
+  }
+
+  state.banner = null;
+  // The video is on the disc straight away; the reading and the menu buttons
+  // follow as soon as they are ready. Returns the videos added by this call
+  // (with probe results and posters attached) so a drop onto a slide can put
+  // tiles down for exactly the files that were just dropped.
+  render();
+  await runInspect();
+  syncMenuSlides();
+  persistDeck();
+  render();
+  return state.videos.filter((v) => added.includes(v.path));
+}
+
+const VIDEO_EXTENSIONS = new Set([
+  '.mp4', '.m4v', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm', '.mpg',
+  '.mpeg', '.m2v', '.vob', '.ts', '.mts', '.m2ts', '.3gp', '.ogv', '.dv',
+  '.divx', '.rm', '.rmvb', '.asf', '.f4v',
+]);
+
+function looksLikeVideo(path) {
+  const lower = String(path).toLowerCase();
+  const dot = lower.lastIndexOf('.');
+  return dot !== -1 && VIDEO_EXTENSIONS.has(lower.slice(dot));
+}
+
+const IMAGE_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.heic', '.heif', '.tif', '.tiff',
+]);
+
+/**
+ * Whether a path looks like a picture.
+ *
+ * By extension only, and only to choose a sensible response to a drop — a file
+ * that claims to be a picture but cannot be decoded is caught when it is read,
+ * which is the check that actually matters.
+ */
+function looksLikeImage(path) {
+  const lower = String(path).toLowerCase();
+  const dot = lower.lastIndexOf('.');
+  return dot !== -1 && IMAGE_EXTENSIONS.has(lower.slice(dot));
+}
+
+/** Whether a drag is an internal video being dragged onto a slide. */
+function hasVideoDrag(event) {
+  const types = (event.dataTransfer && event.dataTransfer.types) || [];
+  return Array.prototype.includes.call(types, 'application/x-burnhouse-video');
+}
+
+/** Whether a drag is a slide being reordered in the list. */
+function hasSlideDrag(event) {
+  const types = (event.dataTransfer && event.dataTransfer.types) || [];
+  return Array.prototype.includes.call(types, 'application/x-burnhouse-slide');
+}
+
+async function runInspect() {
+  if (!state.videos.length) {
+    state.plan = null;
+    state.totalSeconds = 0;
+    state.videoErrors = [];
+    render();
+    return;
+  }
+
+  try {
+    const result = await api.videos.inspect({
+      videos: state.videos.map((v) => ({ id: v.id, path: v.path, name: v.name })),
+    });
+
+    const byPath = new Map(result.videos.map((v) => [v.path, v]));
+    state.videos = state.videos.map((v) => {
+      const found = byPath.get(v.path);
+      if (!found) return v;
+      return {
+        ...v,
+        probe: found.probe,
+        duration: found.duration,
+        sizeBytes: found.sizeBytes,
+        poster: found.poster || v.poster || null,
+      };
+    });
+
+    state.videoErrors = result.errors || [];
+    state.totalSeconds = result.totalSeconds;
+    state.plan = result.plan;
+  } catch (err) {
+    setBanner('error', 'Those videos could not be read', String(err.message || err));
+  }
+
+  render();
+}
+
+/**
+ * Keep every menu slide's buttons in step with the video list.
+ *
+ * A menu slide is meant to list everything on the disc, so it should never go
+ * stale: add a video and it appears, rename one and the label follows, remove
+ * one and its button goes. That only applies to buttons the editor created —
+ * marked `source: 'auto'` — so a button she added or repositioned by hand is
+ * left exactly where she put it.
+ *
+ * Runs after the video list changes, which is the only thing that can make a
+ * menu slide wrong.
+ */
+function syncMenuSlides() {
+  const ready = state.videos.filter((v) => v.probe || v.duration);
+  let changed = false;
+
+  for (const slide of state.deck.slides) {
+    if (slide.role === 'menu') {
+      const heading = slide.elements.find((e) => e.kind === 'text');
+      // The heading follows the disc name until she types over it. Typing sets
+      // `edited` on the element (see the inspector's text field), and only that
+      // opts out — otherwise a heading she wrote would be overwritten every time
+      // a video is added or renamed.
+      if (heading && !heading.edited && state.discTitle && heading.text !== state.discTitle) {
+        heading.text = state.discTitle;
+        changed = true;
+      }
+    }
+
+    /*
+      A generated list is kept in step with the videos: a renamed video renames
+      its button, and a video that is gone takes its button with it.
+
+      Nothing is ever *created* here. Dropping a video used to plant a button on
+      the menu slide, so the menu changed shape because a file was dragged in —
+      which is not what dragging a file in means. A list is made deliberately,
+      with "Add menu slide".
+    */
+    const generated = slide.elements.filter((e) => e.kind === 'button' && e.source === 'auto');
+    if (!generated.length) continue;
+
+    const keptIds = new Set(ready.map((v) => v.id));
+    const survivors = generated.filter((button) => button.videoId && keptIds.has(button.videoId));
+    if (survivors.length !== generated.length) {
+      const vanished = new Set(generated.filter((b) => !survivors.includes(b)).map((b) => b.id));
+      slide.elements = slide.elements.filter((e) => !vanished.has(e.id));
+      changed = true;
+    }
+
+    survivors.forEach((button, index) => {
+      const video = ready.find((v) => v.id === button.videoId);
+      if (!video) return;
+      const label = videoLabel(video);
+      const sublabel = video.duration ? formatDuration(video.duration) : '';
+      if (button.label !== label) {
+        button.label = label;
+        changed = true;
+      }
+      if (button.sublabel !== sublabel) {
+        button.sublabel = sublabel;
+        changed = true;
+      }
+      // Numbered down the list, so removing one never leaves a gap.
+      if (button.number !== index + 1) {
+        button.number = index + 1;
+        changed = true;
+      }
+    });
+  }
+
+  if (changed) persistDeck();
+  return changed;
+}
+
+/**
+ * Buttons for a list of videos, laid out down two columns.
+ *
+ * Overflow is not a problem here: a menu slide that cannot hold every video
+ * simply lists what fits, and "Add menu slide" makes another page for the rest.
+ * Buttons off the bottom of the picture would be invisible on a television,
+ * which is worse than a second page.
+ */
+function episodeButtons(videos) {
+  const rows = episodeRows();
+  const capacity = rows * 2;
+
+  return videos.slice(0, capacity).map((video, index) => {
+    const column = Math.floor(index / rows);
+    const row = index % rows;
+    return {
+      id: newId('btn'),
+      kind: 'button',
+      label: videoLabel(video),
+      sublabel: video.duration ? formatDuration(video.duration) : '',
+      videoId: video.id,
+      targetSlideId: null,
+      x: SAFE_MARGIN + column * 324,
+      y: 132 + row * 64,
+      width: 300,
+      height: 54,
+      fontSize: 'medium',
+      fontId: 'plain',
+      color: 'text',
+      align: 'left',
+      buttonStyle: state.deck.buttonStyle || 'bar',
+      showNumber: true,
+      number: index + 1,
+      source: 'auto',
+    };
+  });
+}
+
+/** How many episode rows fit down the picture. */
+function episodeRows() {
+  return Math.max(1, Math.floor((RASTER.height - SAFE_MARGIN - 132) / 64));
+}
+
+/** How many videos one menu slide can list. */
+function episodeCapacity() {
+  return episodeRows() * 2;
+}
+
+// -------------------------------------------------------------- slides ---
+
+function addSlide(options = {}) {
+  const slide = {
+    id: `slide_${Math.random().toString(36).slice(2, 9)}`,
+    title: options.title || `Slide ${state.deck.slides.length + 1}`,
+    themeId: state.deck.themeId,
+    role: options.role || 'content',
+    elements: [],
+  };
+
+  const index = state.deck.slides.findIndex((s) => s.id === state.activeSlideId);
+  const at = options.at !== undefined ? options.at : index + 1;
+  state.deck.slides.splice(Math.max(0, at), 0, slide);
+  state.activeSlideId = slide.id;
+  state.selectedElementId = null;
+  persistDeck();
+  render();
+  return slide;
+}
+
+/**
+ * Make a new slide at the end of the disc, named for where it is.
+ *
+ * "Slide 4" when there are three already. Not after the video that was dropped
+ * on it: a name taken from a file reads like a title somebody chose, and it
+ * stops being true the moment the video is swapped or the slide is moved.
+ *
+ * `at: length` means the default name — the next position — is always right,
+ * which is not true of a slide inserted into the middle.
+ */
+function addSlideAtEnd(options = {}) {
+  return addSlide({ ...options, at: state.deck.slides.length });
+}
+
+function duplicateSlide(slideId) {
+  const source = state.deck.slides.find((s) => s.id === slideId);
+  if (!source) return;
+  const copy = JSON.parse(JSON.stringify(source));
+  copy.id = `slide_${Math.random().toString(36).slice(2, 9)}`;
+  copy.title = `${source.title} copy`;
+  copy.elements = copy.elements.map((element) => ({
+    ...element,
+    id: `${element.kind}_${Math.random().toString(36).slice(2, 9)}`,
+  }));
+
+  const index = state.deck.slides.findIndex((s) => s.id === slideId);
+  state.deck.slides.splice(index + 1, 0, copy);
+  state.activeSlideId = copy.id;
+  state.selectedElementId = null;
+  persistDeck();
+  render();
+}
+
+function deleteSlide(slideId) {
+  const index = state.deck.slides.findIndex((s) => s.id === slideId);
+  if (index === -1) return;
+  state.deck.slides.splice(index, 1);
+  if (state.activeSlideId === slideId) {
+    const next = state.deck.slides[Math.min(index, state.deck.slides.length - 1)];
+    state.activeSlideId = next ? next.id : null;
+  }
+  persistDeck();
+  render();
+}
+
+/**
+ * Drop one slide next to another, for dragging in the slide list.
+ *
+ * Named apart from `moveSlide`, which nudge a slide by one place for the toolbar
+ * buttons. They were briefly both called `moveSlide`, and because a later
+ * function declaration wins, the nudge buttons silently started doing nothing.
+ */
+function moveSlideNextTo(slideId, targetId, after) {
+  if (slideId === targetId) return;
+
+  const slides = state.deck.slides;
+  const from = slides.findIndex((s) => s.id === slideId);
+  if (from === -1 || !slides.some((s) => s.id === targetId)) return;
+
+  const [moved] = slides.splice(from, 1);
+  // The target's index shifts by one once the moved slide is taken out, if the
+  // moved slide was ahead of it.
+  let insertAt = slides.findIndex((s) => s.id === targetId);
+  if (after) insertAt += 1;
+  slides.splice(insertAt, 0, moved);
+
+  persistDeck();
+  render();
+}
+
+function moveSlide(slideId, delta) {
+  const index = state.deck.slides.findIndex((s) => s.id === slideId);
+  const target = index + delta;
+  if (index === -1 || target < 0 || target >= state.deck.slides.length) return;
+  const [slide] = state.deck.slides.splice(index, 1);
+  state.deck.slides.splice(target, 0, slide);
+  persistDeck();
+  render();
+}
+
+function addElement(kind, patch = {}) {
+  const slide = activeSlide();
+  if (!slide) {
+    setBanner('info', 'Add a slide first', 'Every element lives on a slide.');
+    render();
+    return;
+  }
+
+  const base = {
+    id: `${kind}_${Math.random().toString(36).slice(2, 9)}`,
+    kind,
+    x: patch.x !== undefined ? patch.x : 120,
+    y: patch.y !== undefined ? patch.y : 140,
+    width: patch.width || 400,
+    height: patch.height || 60,
+  };
+
+  if (kind === 'text') {
+    Object.assign(base, {
+      text: patch.text || 'Double-click to type',
+      width: patch.width || 480,
+      fontSize: 'large',
+      fontId: 'title',
+      color: 'text',
+      align: 'left',
+      background: 'none',
+      autoHeight: true,
+    });
+  } else if (kind === 'button') {
+    Object.assign(base, {
+      label: patch.label || 'New button',
+      videoId: patch.videoId || null,
+      targetSlideId: patch.targetSlideId || null,
+      width: patch.width || 400,
+      height: patch.height || 54,
+      fontSize: 'medium',
+      fontId: 'plain',
+      color: 'text',
+      align: 'left',
+      buttonStyle: state.deck.buttonStyle || 'bar',
+      showNumber: false,
+      sublabel: '',
+    });
+  } else if (kind === 'image') {
+    Object.assign(base, {
+      src: patch.src || null,
+      fileName: patch.fileName || '',
+      width: patch.width || 260,
+      height: patch.height || 190,
+      fit: 'fit',
+    });
+  } else if (kind === 'video') {
+    Object.assign(base, {
+      videoId: patch.videoId || null,
+      label: patch.label || 'Video',
+      sublabel: patch.sublabel || '',
+      src: patch.src || null,
+      posterMissing: Boolean(patch.posterMissing),
+      width: patch.width || 300,
+      height: patch.height || 190,
+      fit: patch.fit === 'fill' ? 'fill' : 'fit',
+      fontSize: 'medium',
+      fontId: 'plain',
+      color: 'text',
+      showLabel: patch.showLabel !== false,
+    });
+  } else if (kind === 'frame') {
+    Object.assign(base, {
+      width: patch.width || 480,
+      height: patch.height || 240,
+      fill: 'panel',
+      outline: true,
+    });
+  }
+
+  // Whatever asked for this element — a drop, the toolbar, a test — the tile
+  // must land inside the television-safe area. A drop aimed near an edge would
+  // otherwise push half the new tile off the slide, where the highlight would
+  // still fire on a player but the picture would be cropped.
+  base.x = Math.min(
+    Math.max(SAFE_MARGIN, Math.round(base.x)),
+    RASTER.width - SAFE_MARGIN - base.width
+  );
+  base.y = Math.min(
+    Math.max(SAFE_MARGIN, Math.round(base.y)),
+    RASTER.height - SAFE_MARGIN - base.height
+  );
+
+  slide.elements.push(base);
+  state.selectedElementId = base.id;
+  persistDeck();
+  render();
+}
+
+function deleteElement(elementId) {
+  const { slide } = findElement(elementId);
+  if (!slide) return;
+  slide.elements = slide.elements.filter((e) => e.id !== elementId);
+  if (state.selectedElementId === elementId) state.selectedElementId = null;
+  persistDeck();
+  render();
+}
+
+function updateElement(elementId, patch) {
+  const { element } = findElement(elementId);
+  if (!element) return;
+  Object.assign(element, patch);
+  persistDeck();
+  // Redrawing belongs here, not at each call site: a helper that quietly
+  // changes something without showing it is how the right-click "show the whole
+  // picture" came to do nothing visible.
+  refreshCanvas();
+}
+
+// ------------------------------------------------------------- layout ---
+
+async function refreshLayout() {
+  try {
+    const result = await api.deck.layout({ deck: state.deck });
+    state.layout = result;
+    return result;
+  } catch {
+    // A layout the main process refused is not worth interrupting her over: the
+    // canvas simply keeps showing the last good slide.
+    state.layout = null;
+    return null;
+  }
+}
+
+/**
+ * Redraw everything on the slides step.
+ *
+ * The layout lives in the main process, so this has to be a sequence: ask for
+ * the layout, then draw from it. Firing the draw without awaiting that request
+ * is what produces a permanently blank canvas — the drawing code correctly
+ * finds nothing to draw.
+ *
+ * A token guards against two refreshes interleaving, so a slow response from an
+ * earlier edit cannot paint over a newer one.
+ */
+async function refreshEditor() {
+  const token = ++renderToken;
+  await refreshLayout();
+  if (token !== renderToken) return;
+  if (state.step === 'finish') return;
+  await drawCanvas();
+  if (token !== renderToken) return;
+  renderFilmstrip();
+  renderEditorToolbar();
+  renderInspector();
+}
+
+/** Layout and redraw after a change, without re-rendering the DOM around it. */
+function refreshCanvas() {
+  return refreshEditor();
+}
+
+/**
+ * Redraw the slide and the slide list, but leave the inspector alone.
+ *
+ * The inspector is redrawn by replacing its DOM. Doing that while somebody is
+ * typing in one of its fields destroys the field they are typing in, so the next
+ * keystroke has nowhere to go — which is why typing a text property only ever
+ * accepted one letter before kicking her out. Anything edited in place uses
+ * this; anything that changes what the inspector should *show* uses
+ * refreshCanvas.
+ */
+async function refreshCanvasOnly() {
+  const token = ++renderToken;
+  await refreshLayout();
+  if (token !== renderToken) return;
+  if (state.step === 'finish') return;
+  await drawCanvas();
+  if (token !== renderToken) return;
+  renderFilmstrip();
+}
+
+/*
+  Redrawing while something is being dragged.
+
+  The canvas draws from `state.layout`, which is produced by the main process —
+  not from the deck being edited. So a drag that only changed the deck and then
+  called drawCanvas redrew the *old* layout, and the element never appeared to
+  move. Asking for a fresh layout is the only way to draw the truth, and doing it
+  once per frame keeps that affordable.
+
+  Filmstrip thumbnails and the inspector are deliberately left alone here: the
+  thumbnails are expensive to redraw every frame, and nothing about them has
+  changed until the drag finishes.
+*/
+let dragFrame = null;
+let dragToken = 0;
+
+function redrawDuringDrag() {
+  if (dragFrame) return;
+  dragFrame = window.requestAnimationFrame(async () => {
+    dragFrame = null;
+    const token = ++dragToken;
+    await refreshLayout();
+    if (token !== dragToken) return;
+    await drawCanvas();
+  });
+}
+
+// ----------------------------------------------------------------- draw ---
+
+async function loadImage(src) {
+  if (!src) return null;
+  if (imageCache.has(src)) return imageCache.get(src);
+  const image = await new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+  imageCache.set(src, image);
+  return image;
+}
+
+/**
+ * Decode every picture a slide needs: the ones on its elements, and its own
+ * background.
+ *
+ * One helper, so the editor canvas, the filmstrip thumbnails and the simulator
+ * cannot disagree about which pictures a slide has — a disagreement that would
+ * show up as a background missing from one of the three.
+ */
+async function loadSlideImages(layout) {
+  const images = {};
+  for (const element of layout.elements) {
+    if ((element.kind === 'image' || element.kind === 'video') && element.src) {
+      images[element.id] = await loadImage(element.src);
+    }
+  }
+  if (layout.background && layout.background.src && layout.backgroundKey) {
+    images[layout.backgroundKey] = await loadImage(layout.background.src);
+  }
+  return images;
+}
+
+async function drawCanvas() {
+  const canvas = $('slideCanvas');
+  if (!canvas) return;
+
+  const layout = activeSlideLayout();
+  if (!layout) {
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  // Render at device resolution so text is crisp on a Retina display, while the
+  // drawing itself stays in raster coordinates so the layout and the picture
+  // agree exactly.
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = layout.width * dpr;
+  canvas.height = layout.height * dpr;
+  // Show the frame the shape it takes on a television, not the shape it has in
+  // pixels. A DVD raster is anamorphic, so displaying it 3:2 here would show a
+  // design that is squeezed compared with what the disc actually plays.
+  const displayAspect = (state.presets && state.presets.displayAspect) || 16 / 9;
+  canvas.style.aspectRatio = `${displayAspect} / 1`;
+
+  const ctx = canvas.getContext('2d', { alpha: false });
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+
+  // Decode every picture first so the draw itself is synchronous.
+  const images = await loadSlideImages(layout);
+
+  draw.drawSlide(ctx, layout, images);
+
+  // Anything drawn after this is editor furniture, never burned to the disc.
+  drawEditorOverlay(ctx, layout);
+}
+
+/**
+ * The eight resize handles around a selected element.
+ *
+ * One list used for drawing them and for hit-testing them, so a handle can
+ * never be drawn somewhere it cannot be grabbed.
+ */
+function handlesFor(box) {
+  const right = box.x + box.width;
+  const bottom = box.y + box.height;
+  const midX = box.x + box.width / 2;
+  const midY = box.y + box.height / 2;
+  return {
+    nw: { x: box.x, y: box.y },
+    n: { x: midX, y: box.y },
+    ne: { x: right, y: box.y },
+    w: { x: box.x, y: midY },
+    e: { x: right, y: midY },
+    sw: { x: box.x, y: bottom },
+    s: { x: midX, y: bottom },
+    se: { x: right, y: bottom },
+  };
+}
+
+/** Drawn size of a handle, and how far from its centre still counts as a grab. */
+const HANDLE_DRAW = 9;
+const HANDLE_GRAB = 11;
+
+const HANDLE_CURSORS = {
+  nw: 'nwse-resize', n: 'ns-resize', ne: 'nesw-resize',
+  w: 'ew-resize', e: 'ew-resize',
+  sw: 'nesw-resize', s: 'ns-resize', se: 'nwse-resize',
+};
+
+/** Which handle is under a point, or null. */
+function handleAt(box, point) {
+  for (const [name, spot] of Object.entries(handlesFor(box))) {
+    if (
+      Math.abs(point.x - spot.x) <= HANDLE_GRAB &&
+      Math.abs(point.y - spot.y) <= HANDLE_GRAB
+    ) {
+      return name;
+    }
+  }
+  return null;
+}
+
+/** Kinds that must keep their shape, or the picture on the disc looks stretched. */
+const SHAPE_LOCKED_KINDS = new Set(['video', 'image']);
+
+const MIN_ELEMENT_WIDTH = 40;
+const MIN_ELEMENT_HEIGHT = 24;
+
+/**
+ * The box an element becomes when a handle is dragged.
+ *
+ * `lockShape` keeps the element's proportions. It is on by default for video
+ * tiles and pictures, because a stretched face or a squashed photograph is the
+ * kind of thing nobody notices until it is on a television, and it is the whole
+ * reason the tile was sized to the video's shape in the first place. Holding
+ * Shift overrides it.
+ */
+function resizeBox(handle, origin, dx, dy, lockShape) {
+  let x = origin.x;
+  let y = origin.y;
+  let width = origin.width;
+  let height = origin.height;
+  const right = origin.x + origin.width;
+  const bottom = origin.y + origin.height;
+
+  const movesWest = handle.includes('w');
+  const movesEast = handle.includes('e');
+  const movesNorth = handle.includes('n');
+  const movesSouth = handle.includes('s');
+
+  if (lockShape && origin.height > 0) {
+    const aspect = origin.width / origin.height;
+    const horizontal = movesEast || movesWest;
+    const vertical = movesNorth || movesSouth;
+
+    if (horizontal && !vertical) {
+      width = Math.max(MIN_ELEMENT_WIDTH, origin.width + (movesWest ? -dx : dx));
+      height = Math.max(MIN_ELEMENT_HEIGHT, width / aspect);
+    } else if (vertical && !horizontal) {
+      height = Math.max(MIN_ELEMENT_HEIGHT, origin.height + (movesSouth ? dy : -dy));
+      width = Math.max(MIN_ELEMENT_WIDTH, height * aspect);
+    } else {
+      // A corner: let the wider of the two movements lead, then derive the rest.
+      const candidateW = Math.max(MIN_ELEMENT_WIDTH, origin.width + (movesWest ? -dx : dx));
+      const candidateH = Math.max(MIN_ELEMENT_HEIGHT, origin.height + (movesSouth ? dy : -dy));
+      if (candidateW / aspect >= candidateH) {
+        width = candidateW;
+        height = candidateW / aspect;
+      } else {
+        height = candidateH;
+        width = candidateH * aspect;
+      }
+    }
+
+    // Re-anchor so the side being dragged stays under the pointer.
+    if (movesWest) x = right - width;
+    if (movesNorth) y = bottom - height;
+  } else {
+    if (movesWest) {
+      x = origin.x + dx;
+      width = right - x;
+    }
+    if (movesEast) width = origin.width + dx;
+    if (movesNorth) {
+      y = origin.y + dy;
+      height = bottom - y;
+    }
+    if (movesSouth) height = origin.height + dy;
+  }
+
+  // Never invert or vanish. A zero-width box would be invisible and
+  // unselectable, so the minimum wins over the drag.
+  if (width < MIN_ELEMENT_WIDTH) {
+    if (movesWest) x = right - MIN_ELEMENT_WIDTH;
+    width = MIN_ELEMENT_WIDTH;
+  }
+  if (height < MIN_ELEMENT_HEIGHT) {
+    if (movesNorth) y = bottom - MIN_ELEMENT_HEIGHT;
+    height = MIN_ELEMENT_HEIGHT;
+  }
+
+  return { x: Math.round(x), y: Math.round(y), width: Math.round(width), height: Math.round(height) };
+}
+
+/**
+ * Which way the element under the pointer is moving, and the lines it lines up
+ * with.
+ *
+ * The canvas draws from the layout, so the guides are raster coordinates and
+ * are drawn across the whole frame — a television-safe way of showing "this edge
+ * is level with that one".
+ */
+const SNAP_TOLERANCE = 6;
+
+/** Every x and y an element could sensibly line up with. */
+function snapLines(layout, excludeId, kind) {
+  // A video tile is kept clear of the navigation row, so its own bottom limit is
+  // the line to snap to. Offering the safe-area bottom instead would draw a
+  // guide exactly where the tile is not allowed to go.
+  const bottom = kind === 'video' ? 396 : RASTER.height - SAFE_MARGIN;
+  const xs = [SAFE_MARGIN, RASTER.width - SAFE_MARGIN, RASTER.width / 2];
+  const ys = [SAFE_MARGIN, bottom, RASTER.height / 2];
+  for (const other of layout.elements) {
+    if (!other.box || other.id === excludeId) continue;
+    const box = other.box;
+    xs.push(box.x, box.x + box.width / 2, box.x + box.width);
+    ys.push(box.y, box.y + box.height / 2, box.y + box.height);
+  }
+  return { xs, ys };
+}
+
+/**
+ * Nudge a box onto the nearest line, and report which lines it landed on.
+ *
+ * All three of the box's own edges and its centre are candidates, so lining up
+ * left-to-left, centre-to-centre and right-to-left all work without her having
+ * to think about which edge is which.
+ */
+function snapBox(box, layout, excludeId, kind) {
+  const { xs, ys } = snapLines(layout, excludeId, kind);
+  const guides = [];
+
+  let bestX = null;
+  for (const edge of [box.x, box.x + box.width / 2, box.x + box.width]) {
+    for (const line of xs) {
+      const delta = line - edge;
+      if (Math.abs(delta) <= SNAP_TOLERANCE && (!bestX || Math.abs(delta) < Math.abs(bestX.delta))) {
+        bestX = { delta, at: line };
+      }
+    }
+  }
+
+  let bestY = null;
+  for (const edge of [box.y, box.y + box.height / 2, box.y + box.height]) {
+    for (const line of ys) {
+      const delta = line - edge;
+      if (Math.abs(delta) <= SNAP_TOLERANCE && (!bestY || Math.abs(delta) < Math.abs(bestY.delta))) {
+        bestY = { delta, at: line };
+      }
+    }
+  }
+
+  const x = box.x + (bestX ? bestX.delta : 0);
+  const y = box.y + (bestY ? bestY.delta : 0);
+  if (bestX) guides.push({ axis: 'x', at: bestX.at });
+  if (bestY) guides.push({ axis: 'y', at: bestY.at });
+
+  return { x: Math.round(x), y: Math.round(y), guides };
+}
+
+/** The alignment lines showing while something is being dragged. */
+function drawSnapGuides(ctx, layout) {
+  const guides = state.snapGuides || [];
+  if (!guides.length) return;
+
+  ctx.save();
+  ctx.strokeStyle = 'rgba(120, 182, 232, 0.95)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 3]);
+  for (const guide of guides) {
+    ctx.beginPath();
+    if (guide.axis === 'x') {
+      ctx.moveTo(guide.at + 0.5, 0);
+      ctx.lineTo(guide.at + 0.5, layout.height);
+    } else {
+      ctx.moveTo(0, guide.at + 0.5);
+      ctx.lineTo(layout.width, guide.at + 0.5);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/** Selection outlines, resize handles and the television-safe guide. */
+function drawEditorOverlay(ctx, layout) {
+  const selected = state.selectedElementId;
+
+  if (selected) {
+    const element = layout.elements.find((e) => e.id === selected);
+    if (element) {
+      const box = element.box;
+
+      ctx.save();
+      ctx.strokeStyle = '#d9a353';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(box.x - 2, box.y - 2, box.width + 4, box.height + 4);
+      ctx.restore();
+
+      // The resize handles. A generated element (the Back/Next row) has no
+      // handles because it is not hers to move — it is placed by the layout.
+      if (!element.generated) {
+        ctx.save();
+        for (const spot of Object.values(handlesFor(box))) {
+          const half = HANDLE_DRAW / 2;
+          ctx.fillStyle = '#f3ede2';
+          ctx.strokeStyle = '#1c1b19';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.rect(spot.x - half, spot.y - half, HANDLE_DRAW, HANDLE_DRAW);
+          ctx.fill();
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+    }
+  }
+
+  if (state.showSafeArea) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(120, 182, 232, 0.5)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.strokeRect(
+      SAFE_MARGIN + 0.5,
+      SAFE_MARGIN + 0.5,
+      layout.width - SAFE_MARGIN * 2 - 1,
+      layout.height - SAFE_MARGIN * 2 - 1
+    );
+    ctx.restore();
+  }
+
+  drawSnapGuides(ctx, layout);
+}
+
+// ---------------------------------------------------------------- hit test ---
+
+function canvasPoint(event) {
+  const canvas = $('slideCanvas');
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: ((event.clientX - rect.left) / rect.width) * RASTER.width,
+    y: ((event.clientY - rect.top) / rect.height) * RASTER.height,
+  };
+}
+
+/** The topmost element under a point, which is what a click should select. */
+function hitTest(layout, point) {
+  // Highest number wins, so a button on top of a panel is selected rather than
+  // the panel underneath it.
+  const order = { button: 5, video: 4, text: 3, image: 2, frame: 1 };
+  const candidates = layout.elements
+    .filter((element) => {
+      const box = element.box;
+      return (
+        point.x >= box.x &&
+        point.x <= box.x + box.width &&
+        point.y >= box.y &&
+        point.y <= box.y + box.height
+      );
+    })
+    .sort((a, b) => (order[b.kind] || 0) - (order[a.kind] || 0));
+  return candidates[0] || null;
+}
+
+// ------------------------------------------------------------- render ---
+
+function render() {
+  renderChrome();
+
+  const isProjects = state.step === 'projects';
+  const isTesting = state.step === 'testing';
+  const isFinish = state.step === 'finish';
+
+  document.body.classList.toggle('wide-stage', !isFinish);
+
+  const stage = $('stage');
+  const rail = $('rail');
+  stage.replaceChildren();
+  rail.replaceChildren();
+
+  if (isProjects) {
+    stage.className = 'stage stage-projects';
+    renderProjectsStep(stage);
+  } else if (isTesting) {
+    stage.className = 'stage stage-testing';
+    renderTestingStep(stage);
+  } else if (isFinish) {
+    stage.className = 'stage';
+    renderFinishStep(stage);
+    renderFinishRail(rail);
+  } else {
+    stage.className = 'stage stage-slides';
+    const banner = state.banner ? buildBanner(state.banner) : null;
+    renderSlidesStep(stage, banner);
+  }
+
+  if (!isProjects && !isTesting) renderBanner();
+
+  if (!isProjects && !isTesting && !isFinish) {
+    // The layout comes from the main process, so drawing has to wait for it.
+    refreshEditor();
+  }
+}
+
+function renderChrome() {
+  const isProjects = state.step === 'projects';
+  const stepsNav = $('steps');
+  if (stepsNav) stepsNav.hidden = isProjects;
+
+  const btnHome = $('btnProjectsHome');
+  if (btnHome) btnHome.hidden = isProjects;
+
+  const btnSave = $('btnSaveProject');
+  if (btnSave) btnSave.hidden = isProjects;
+
+  if (!isProjects) {
+    const order = ['slides', 'testing', 'finish'];
+    const currentIndex = order.indexOf(state.step);
+    for (const button of document.querySelectorAll('.step')) {
+      const index = order.indexOf(button.dataset.step);
+      button.setAttribute('aria-current', String(button.dataset.step === state.step));
+      button.dataset.complete = String(index < currentIndex);
+      button.disabled = state.busy;
+    }
+  }
+
+  const share = $('btnShare');
+  if (share) share.disabled = state.busy;
+  updateBrandTag();
+}
+
+/**
+ * Show, replace or clear the page notice that sits at the top of a step.
+ *
+ * The removal is matched on a marker class rather than on `.banner`, because
+ * `.banner` is the shared look used by the notices *inside* the panels too —
+ * "no disc burner found", "the disc is built". Matching on the appearance meant
+ * this deleted whichever of those happened to come first, then returned early
+ * because there was no page notice to draw. The panel notices were being eaten
+ * silently, on every render.
+ */
+function renderBanner() {
+  const stage = $('stage');
+  if (!stage) return;
+
+  const existing = stage.querySelector('.stage-notice');
+  if (existing) existing.remove();
+  if (!state.banner) return;
+
+  const notice = buildBanner(state.banner);
+  notice.classList.add('stage-notice');
+  stage.prepend(notice);
+}
+
+function buildBanner(banner) {
+  const mark = banner.kind === 'error' ? '\u26a0' : banner.kind === 'good' ? '\u2713' : '\u2139';
+  return el('div', { class: `banner banner-${banner.kind}` }, [
+    el('span', { class: 'banner-mark', text: mark }),
+    el('div', { class: 'banner-body' }, [
+      el('strong', { text: banner.title }),
+      ...[].concat(banner.body || []).filter(Boolean).map((line) => el('p', { text: line })),
+    ]),
+  ]);
+}
+
+function setBanner(kind, title, body) {
+  state.banner = { kind, title, body };
+}
+
+// --------------------------------------------------- projects dashboard ---
+
+/**
+ * The projects startup screen: start fresh, resume recent work, or open files.
+ *
+ * This is the front door of Burnhouse. It opens on startup so she doesn't drop
+ * into an arbitrary untitled project without context. Everything she needs to
+ * continue or begin is laid out cleanly in two cards.
+ */
+function renderProjectsStep(stage) {
+  const container = el('div', { class: 'projects-view' });
+
+  // Hero header
+  container.append(
+    el('div', { class: 'projects-hero' }, [
+      el('h1', { text: 'Welcome to Burnhouse' }),
+      el('p', {
+        class: 'lede',
+        text: 'Make a DVD that plays. Choose a recent project to continue or start fresh.',
+      }),
+    ])
+  );
+
+  const grid = el('div', { class: 'projects-grid' });
+
+  // ---- Left Card: Start Fresh --------------------------------------------
+  const newCard = el('div', { class: 'project-card-new' });
+  newCard.append(
+    el('div', { class: 'panel-head' }, [
+      el('h2', { text: 'Start Fresh' }),
+      el('span', { class: 'panel-note', text: 'New DVD' }),
+    ]),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 14px',
+      text: 'Creates a project with a menu and blank slides ready for your videos.',
+    })
+  );
+
+  const nameInput = el('input', {
+    class: 'input',
+    type: 'text',
+    value: state.newProjectName,
+    placeholder: 'e.g. Vacation 2024, Episodes, Home Movies',
+    'aria-label': 'Project name',
+  });
+  nameInput.addEventListener('input', () => {
+    state.newProjectName = nameInput.value;
+  });
+
+  newCard.append(
+    el('div', { class: 'field' }, [
+      el('label', { class: 'label', text: 'Disc title / Project name' }),
+      nameInput,
+    ])
+  );
+
+  // Theme selector
+  const themes = (state.presets && state.presets.themes) || [];
+  const themeGrid = el('div', { class: 'theme-grid', style: 'margin-bottom: 18px' });
+  for (const theme of themes) {
+    const swatch = el('button', {
+      class: 'theme-swatch',
+      type: 'button',
+      'aria-pressed': String(state.newProjectTheme === theme.id),
+      title: theme.blurb,
+    });
+    swatch.append(
+      el('div', { class: 'swatch-preview', style: `background:${theme.background}` }, [
+        el('span', { class: 'swatch-dot', style: `background:${theme.accent}` }),
+        el('span', { class: 'swatch-bar', style: `background:${theme.text}` }),
+      ]),
+      el('span', { class: 'swatch-label', text: theme.label })
+    );
+    swatch.addEventListener('click', () => {
+      state.newProjectTheme = theme.id;
+      renderProjectsStep(stage);
+    });
+    themeGrid.append(swatch);
+  }
+
+  newCard.append(
+    el('div', { class: 'field' }, [
+      el('label', { class: 'label', text: 'Choose a style' }),
+      themeGrid,
+    ]),
+    el('div', { class: 'btn-row' }, [
+      el('button', {
+        class: 'btn btn-primary',
+        type: 'button',
+        style: 'width: 100%; min-height: 38px; font-size: 14px;',
+        text: 'Create Project \u2192',
+        onclick: () => {
+          createNewProject(state.newProjectName, state.newProjectTheme);
+        },
+      }),
+    ]),
+    el('div', { class: 'rule', text: 'Or open a file' }),
+    el('div', { class: 'btn-row' }, [
+      el('button', {
+        class: 'btn btn-small btn-quiet',
+        type: 'button',
+        style: 'width: 100%;',
+        text: 'Browse Project File\u2026 (.burnhouse)',
+        onclick: openProjectDialog,
+      }),
+    ])
+  );
+
+  // ---- Right Card: Recent Projects ---------------------------------------
+  const recentPane = el('div', { class: 'recent-projects-pane' });
+  recentPane.append(
+    el('div', { class: 'panel-head' }, [
+      el('h2', { text: 'Recent Projects' }),
+      el('span', { class: 'panel-note', text: `${state.recentProjects.length} saved` }),
+    ]),
+    el('p', { class: 'hint', text: 'Pick up where you left off.' })
+  );
+
+  const recentList = el('div', { class: 'recent-list' });
+  if (!state.recentProjects.length) {
+    recentList.append(
+      el('div', { class: 'library-empty', style: 'padding: 40px 10px;' }, [
+        el('p', { class: 'dim', text: 'No saved projects yet.' }),
+        el('p', {
+          class: 'dim',
+          style: 'font-size: 11.5px',
+          text: 'Name your disc on the left and click Create Project to begin!',
+        }),
+      ])
+    );
+  } else {
+    for (const item of state.recentProjects) {
+      const row = el('div', { class: 'recent-item' });
+      const main = el('div', { class: 'recent-item-main' });
+      main.append(
+        el('div', { class: 'recent-item-title', text: item.name || 'Untitled Project' })
+      );
+
+      const meta = el('div', { class: 'recent-item-meta' });
+      meta.append(
+        el('span', { text: formatRelativeTime(item.modified) }),
+        el('span', { class: 'recent-badge', text: `${item.videoCount || 0} videos` }),
+        el('span', { class: 'recent-badge', text: `${item.slideCount || 0} slides` })
+      );
+      if (item.themeId) {
+        meta.append(el('span', { class: 'recent-badge', text: item.themeId }));
+      }
+      main.append(meta);
+
+      const actions = el('div', { class: 'recent-item-actions' });
+      actions.append(
+        el('button', {
+          class: 'btn btn-small btn-primary',
+          type: 'button',
+          text: 'Open',
+          onclick: (e) => {
+            e.stopPropagation();
+            openProject(item.id || item.filePath);
+          },
+        }),
+        el('button', {
+          class: 'icon-btn',
+          type: 'button',
+          title: 'Remove from recent projects',
+          text: '\u2715',
+          onclick: (e) => {
+            e.stopPropagation();
+            deleteRecentProject(item.id);
+          },
+        })
+      );
+
+      row.append(main, actions);
+      row.addEventListener('click', () => {
+        openProject(item.id || item.filePath);
+      });
+      recentList.append(row);
+    }
+  }
+
+  recentPane.append(recentList);
+
+  grid.append(newCard, recentPane);
+  container.append(grid);
+  stage.replaceChildren(container);
+}
+
+function formatRelativeTime(isoString) {
+  if (!isoString) return 'recently';
+  try {
+    const diff = (Date.now() - new Date(isoString).getTime()) / 1000;
+    if (diff < 60) return 'Just now';
+    if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
+    if (diff < 604800) return `${Math.round(diff / 86400)}d ago`;
+    return new Date(isoString).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  } catch {
+    return 'recently';
+  }
+}
+
+function createNewProject(name, themeId) {
+  state.projectId = 'proj_' + Date.now();
+  state.projectFilePath = null;
+  state.discTitle = (name || '').trim() || 'My DVD';
+  state.newProjectName = 'My DVD';
+  state.videos = [];
+  state.totalSeconds = 0;
+  state.plan = null;
+  state.lastBuild = null;
+  state.banner = null;
+
+  const tId = themeId || state.newProjectTheme || 'charcoal';
+  state.deck = {
+    discTitle: state.discTitle,
+    themeId: tId,
+    buttonStyle: 'bar',
+    slides: [
+      makeMenuSlide(state.discTitle),
+      makeVideoSlide('Slide 2'),
+    ],
+  };
+  state.activeSlideId = state.deck.slides[0].id;
+  state.selectedElementId = null;
+  state.step = 'slides';
+
+  saveCurrentProject(false);
+  render();
+}
+
+async function openProject(idOrPath) {
+  try {
+    const data = await api.project.load(idOrPath);
+    state.projectId = data.id || ('proj_' + Date.now());
+    state.projectFilePath = data.filePath || null;
+    state.discTitle = data.name || data.discTitle || 'My DVD';
+    state.videos = Array.isArray(data.videos) ? data.videos : [];
+    state.deck = data.deck || {
+      discTitle: state.discTitle,
+      themeId: 'charcoal',
+      buttonStyle: 'bar',
+      slides: [],
+    };
+    ensureStarterSlides();
+    state.selectedElementId = null;
+    state.lastBuild = null;
+    state.step = 'slides';
+    // No "Project Opened" notice. Opening a project is the normal way in, and
+    // announcing it every time just pushes the editor down the window to say
+    // something she already knows. Anything that actually goes wrong still
+    // reports itself.
+    state.banner = null;
+    render();
+    if (state.videos.length) {
+      runInspect();
+    }
+  } catch (err) {
+    setBanner('error', 'Could not open project', String(err.message || err));
+    render();
+  }
+}
+
+async function saveCurrentProject(showToast = true) {
+  if (state.step === 'projects') return;
+  try {
+    const projectData = {
+      id: state.projectId || ('proj_' + Date.now()),
+      name: state.discTitle || (state.deck && state.deck.discTitle) || 'My DVD',
+      discTitle: state.discTitle || 'My DVD',
+      filePath: state.projectFilePath,
+      videos: state.videos,
+      deck: state.deck,
+      themeId: state.deck ? state.deck.themeId : 'charcoal',
+      activeSlideId: state.activeSlideId,
+      modified: new Date().toISOString(),
+    };
+    const res = await api.project.save(projectData);
+    if (res && res.project) {
+      state.projectId = res.project.id;
+      state.projectFilePath = res.project.filePath;
+    }
+    api.project.listRecent().then((recent) => {
+      state.recentProjects = recent || [];
+    });
+    if (showToast) {
+      setBanner('good', 'Project Saved', `Saved "${projectData.name}"`);
+      render();
+    }
+  } catch (err) {
+    if (showToast) {
+      setBanner('error', 'Save Failed', String(err.message || err));
+      render();
+    }
+  }
+}
+
+async function saveProjectAs() {
+  if (state.step === 'projects') return;
+  try {
+    const res = await api.project.saveDialog(state.discTitle || 'My DVD');
+    if (res.canceled || !res.filePath) return;
+    state.projectFilePath = res.filePath;
+    await saveCurrentProject(true);
+  } catch (err) {
+    setBanner('error', 'Save As Failed', String(err.message || err));
+    render();
+  }
+}
+
+async function openProjectDialog() {
+  try {
+    const res = await api.project.openDialog();
+    if (res.canceled || !res.filePath) return;
+    await openProject(res.filePath);
+  } catch (err) {
+    setBanner('error', 'Could not open file', String(err.message || err));
+    render();
+  }
+}
+
+async function closeProjectToHome() {
+  if (state.step !== 'projects') {
+    await saveCurrentProject(false);
+  }
+  state.step = 'projects';
+  state.selectedElementId = null;
+  state.banner = null;
+  api.project.listRecent().then((recent) => {
+    state.recentProjects = recent || [];
+    render();
+  });
+  render();
+}
+
+async function deleteRecentProject(id) {
+  try {
+    const updated = await api.project.delete(id);
+    state.recentProjects = updated || [];
+    render();
+  } catch (err) {
+    setBanner('error', 'Could not delete project', String(err.message || err));
+    render();
+  }
+}
+
+// ------------------------------------------------------- video library ---
+
+/**
+ * The body of the Videos panel: how full the disc is, the list itself, and the
+ * button to add more.
+ *
+ * This is a panel inside the editor, not a page. Adding a video does not
+ * navigate anywhere — it appears on the menu slide straight away, which is what
+ * "put this on the disc" should feel like.
+ */
+function buildVideoLibraryBody() {
+  const body = el('div', { class: 'library-body', id: 'videoLibrary' });
+
+  body.append(buildCapacityLine());
+
+  body.append(
+    el('div', { class: 'btn-row', style: 'margin-bottom: 10px' }, [
+      el('button', {
+        class: 'btn btn-small btn-primary',
+        type: 'button',
+        text: 'Add Videos\u2026',
+        onclick: promptForVideos,
+      }),
+    ])
+  );
+
+  const list = el('div', { class: 'library-list' });
+
+  if (!state.videos.length) {
+    list.append(
+      el('div', { class: 'library-empty' }, [
+        el('p', { class: 'dim', text: 'No videos yet.' }),
+        el('p', {
+          class: 'dim',
+          style: 'font-size:11.5px',
+          text: 'Add them here, or drag files from Finder onto this window.',
+        }),
+      ])
+    );
+  }
+
+  state.videos.forEach((video, index) => {
+    list.append(buildLibraryItem(video, index));
+  });
+
+  body.append(list);
+
+  if (state.videoErrors.length) {
+    const failures = el('div', { class: 'library-errors' });
+    for (const problem of state.videoErrors) {
+      failures.append(
+        el('div', {
+          class: 'library-error',
+          title: problem.error,
+          text: `${problem.name} could not be read`,
+        })
+      );
+    }
+    body.append(failures);
+  }
+
+  body.append(
+    el('p', {
+      class: 'hint',
+      style: 'margin-top: 12px',
+      text: 'Drag a video onto a slide to make a button for it.',
+    })
+  );
+
+  attachVideoDrag(body);
+  return body;
+}
+
+/**
+ * Make the library's video items draggable onto a slide.
+ *
+ * The drag carries the video's id, which is all a drop target needs. The body
+ * gets a class so the cursor and the canvas can show that a drop is possible —
+ * without that feedback, dragging a video over a slide looks like nothing will
+ * happen.
+ */
+function attachVideoDrag(panel) {
+  panel.addEventListener('dragstart', (event) => {
+    const item = event.target.closest && event.target.closest('.library-item');
+    if (!item || !item.dataset.id) return;
+    event.dataTransfer.effectAllowed = 'copy';
+    event.dataTransfer.setData('application/x-burnhouse-video', item.dataset.id);
+    // Some drop targets only accept a drag that also carries plain text.
+    event.dataTransfer.setData('text/plain', item.dataset.id);
+    item.classList.add('dragging');
+    document.body.classList.add('dragging-video');
+  });
+
+  panel.addEventListener('dragend', (event) => {
+    const item = event.target.closest && event.target.closest('.library-item');
+    if (item) item.classList.remove('dragging');
+    document.body.classList.remove('dragging-video');
+  });
+}
+
+/** One video in the library: draggable, renamable, removable. */
+function buildLibraryItem(video, index) {
+  const item = el('div', {
+    class: 'library-item',
+    draggable: 'true',
+    dataset: { index: String(index), id: video.id },
+  });
+
+  const nameInput = el('input', {
+    class: 'video-name-input',
+    type: 'text',
+    value: video.menuLabel || stripExtension(video.name),
+    'aria-label': 'What this video is called on the disc',
+  });
+  nameInput.addEventListener('input', () => {
+    const target = state.videos.find((v) => v.id === video.id);
+    if (target) target.menuLabel = nameInput.value;
+  });
+  nameInput.addEventListener('change', () => {
+    // Renaming a video renames it on the menu, which is the whole point of
+    // naming it here at all. A dropped tile keeps the name it was dropped
+    // with — two places a video can be named, and neither overwrites the
+    // other.
+    syncMenuSlides();
+    refreshCanvas();
+  });
+
+  const meta = video.duration
+    ? formatDuration(video.duration)
+    : video.probe
+      ? 'ready'
+      : 'reading\u2026';
+
+  item.append(
+    el('span', { class: 'video-order', text: String(index + 1) }),
+    el('div', { class: 'library-main' }, [
+      nameInput,
+      el('div', { class: 'video-meta', text: meta }),
+    ]),
+    el('button', {
+      class: 'icon-btn',
+      type: 'button',
+      title: `Remove ${video.name}`,
+      'aria-label': `Remove ${video.name}`,
+      text: '\u2715',
+      onclick: () => {
+        state.videos = state.videos.filter((v) => v.id !== video.id);
+        syncMenuSlides();
+        persistDeck();
+        render();
+      },
+    })
+  );
+
+  return item;
+}
+
+/** How full the disc is, as one compact line for the library header. */
+function buildCapacityLine() {
+  const plan = state.plan;
+  const used = plan ? plan.estimatedBytes : 0;
+  const capacity = plan ? plan.discCapacityBytes : 4.38e9;
+  const percent = plan ? Math.min(100, Math.round((used / capacity) * 100)) : 0;
+  const level = percent > 100 ? 'over' : percent > 92 ? 'warn' : 'ok';
+
+  const fill = el('div', { class: 'meter-fill', dataset: { level } });
+  fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+
+  return el('div', { class: 'library-capacity' }, [
+    el('div', { class: 'meter' }, [fill]),
+    el('div', { class: 'meter-legend' }, [
+      el('span', {
+        text: plan
+          ? `${formatBytes(used)} of ${formatBytes(capacity)}`
+          : 'Nothing added yet',
+      }),
+      el('span', { text: plan ? `${percent}%` : '' }),
+    ]),
+    plan && plan.warning
+      ? el('p', { class: 'hint hint-warn', text: plan.warning })
+      : null,
+  ]);
+}
+
+function renderSlidesStep(stage, banner) {
+  stage.className = 'stage stage-slides';
+  stage.append(
+    banner || '',
+    el('div', { class: 'editor' }, [
+      el('div', { class: 'editor-filmstrip', id: 'filmstrip' }),
+      el('div', { class: 'editor-canvas-area' }, [
+        el('div', { class: 'editor-toolbar', id: 'editorToolbar' }),
+        el('div', { class: 'canvas-holder' }, [
+          el('canvas', {
+            class: 'slide-canvas',
+            id: 'slideCanvas',
+            width: String(RASTER.width),
+            height: String(RASTER.height),
+          }),
+        ]),
+        el('div', { class: 'canvas-status', id: 'canvasStatus' }),
+      ]),
+      el('div', { class: 'editor-inspector', id: 'inspector' }),
+    ])
+  );
+}
+
+/**
+ * The panel on the right: switches between the design controls and the video
+ * list.
+ *
+ * The videos need to be reachable at all times, because dragging one onto the
+ * slide is how a button gets made — but they are a source of things rather than
+ * part of the design, so they share this panel instead of taking a column of
+ * their own. Four columns squeezed the slide, the thing she is actually working
+ * on, down to a thumbnail.
+ */
+function renderInspector() {
+  const panel = $('inspector');
+  if (!panel) return;
+  panel.replaceChildren();
+
+  const tabs = el('div', { class: 'panel-tabs' }, [
+    panelTabButton('design', 'Design'),
+    panelTabButton('videos', state.videos.length ? `Videos (${state.videos.length})` : 'Videos'),
+  ]);
+  panel.append(tabs);
+
+  if (state.panelTab === 'videos') {
+    panel.append(buildVideoLibraryBody());
+    return;
+  }
+
+  const slide = activeSlide();
+  if (!slide) {
+    panel.append(el('p', { class: 'dim', text: 'No slide selected.' }));
+    return;
+  }
+
+  /*
+    Whatever was just clicked comes first.
+
+    The selected element's properties used to sit below the whole slide panel,
+    which on a real window pushed them off the bottom of the screen — so
+    clicking a button appeared to do nothing except draw an outline. The thing
+    she just selected is the thing she wants to change.
+
+    With nothing selected the slide's own settings come first, so the panel is
+    still useful.
+  */
+  const selected = state.selectedElementId ? findElement(state.selectedElementId).element : null;
+
+  if (selected) {
+    panel.append(buildElementInspector(slide, selected));
+    panel.append(el('div', { class: 'rule', text: 'This slide' }));
+  }
+
+  panel.append(buildSlideInspector(slide));
+}
+
+function panelTabButton(id, label) {
+  const button = el('button', {
+    type: 'button',
+    class: 'panel-tab',
+    'aria-pressed': String(state.panelTab === id),
+    text: label,
+  });
+  button.addEventListener('click', () => {
+    state.panelTab = id;
+    renderInspector();
+  });
+  return button;
+}
+
+function renderFilmstrip() {
+  const strip = $('filmstrip');
+  if (!strip) return;
+  strip.replaceChildren();
+
+  strip.append(
+    el('div', { class: 'filmstrip-head' }, [
+      el('span', { class: 'rail-title', style: 'margin:0', text: 'Slides' }),
+      el('button', {
+        class: 'icon-btn',
+        type: 'button',
+        title: 'Add a blank slide',
+        text: '+',
+        onclick: () => addSlide(),
+      }),
+    ])
+  );
+
+  const list = el('div', { class: 'filmstrip-list' });
+
+  if (!state.deck.slides.length) {
+    list.append(
+      el('p', {
+        class: 'dim',
+        style: 'font-size:12px;padding:8px 4px',
+        text: 'No slides yet. Add one, or drop a video here.',
+      })
+    );
+  }
+
+  state.deck.slides.forEach((slide, index) => {
+    /*
+      A slide card that can be dragged to reorder the disc.
+
+      Order is not cosmetic here: it decides which menu page is which, and which
+      film plays after which. Dragging a slide is the direct way to say "this
+      one comes first", which is much clearer than renumbering anything by hand.
+
+      The drag carries its own type, so the drop router can tell a slide being
+      moved from a video being dropped in — the two mean completely different
+      things and must not be confused.
+    */
+    const entry = el('button', {
+      class: 'slide-card',
+      type: 'button',
+      draggable: 'true',
+      'aria-pressed': String(slide.id === state.activeSlideId),
+      dataset: { slideId: slide.id, index: String(index) },
+    });
+
+    // A miniature of the real slide, drawn by the same code as the disc.
+    const thumb = el('canvas', { class: 'slide-thumb', width: '180', height: '120' });
+    entry.append(
+      el('span', { class: 'slide-number', text: String(index + 1) }),
+      thumb,
+      el('span', { class: 'slide-card-title', text: slide.title })
+    );
+
+    entry.addEventListener('click', () => {
+      state.activeSlideId = slide.id;
+      state.selectedElementId = null;
+      persistDeck();
+      render();
+    });
+
+    entry.addEventListener('dragstart', (event) => {
+      if (!event.dataTransfer) return;
+      event.dataTransfer.setData('application/x-burnhouse-slide', slide.id);
+      event.dataTransfer.effectAllowed = 'move';
+      // Some platforms refuse to start a drag without a payload of some kind.
+      event.dataTransfer.setData('text/plain', slide.title);
+      strip.classList.add('reordering');
+    });
+
+    entry.addEventListener('dragend', () => {
+      strip.classList.remove('reordering');
+      clearSlideDropMarks(list);
+    });
+
+    entry.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      state.activeSlideId = slide.id;
+      state.selectedElementId = null;
+      persistDeck();
+      render();
+      openSlideMenu(event, slide);
+    });
+
+    list.append(entry);
+    // Drawn after insertion so the canvas has layout.
+    requestAnimationFrame(() => drawThumbnail(thumb, slide));
+  });
+
+  attachSlideReorder(list);
+
+  strip.append(list);
+
+  strip.append(
+    el('div', { class: 'filmstrip-actions' }, [
+      el('button', {
+        class: 'btn btn-small btn-quiet',
+        type: 'button',
+        text: 'Add menu slide',
+        title: 'Another slide listing every video',
+        onclick: () => {
+          const ready = state.videos.filter((v) => v.probe || v.duration);
+          const index = state.deck.slides.length + 1;
+          const slide = makeMenuSlide(
+            ready.length ? `Menu ${index}` : state.discTitle || 'Main menu'
+          );
+          /*
+            The list is filled here and now, because asking for a menu slide is
+            the deliberate act. It is not filled by dragging a video in — that is
+            the thing this button exists instead of.
+          */
+          slide.elements = [...slide.elements, ...episodeButtons(ready)];
+          state.deck.slides.push(slide);
+          state.activeSlideId = slide.id;
+          persistDeck();
+          render();
+        },
+      }),
+      el('button', {
+        class: 'btn btn-small btn-quiet',
+        type: 'button',
+        text: 'Add blank slide',
+        onclick: () => addSlide(),
+      }),
+    ])
+  );
+
+  attachFilmstripHighlight(strip);
+}
+
+async function drawThumbnail(canvas, slide) {
+  const layout = state.layout && state.layout.slides.find((s) => s.slide && s.slide.id === slide.id);
+  if (!layout) return;
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const scale = canvas.width / layout.width;
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  // Match the main canvas: the thumbnail shows the frame as a television will.
+  const displayAspect = (state.presets && state.presets.displayAspect) || 16 / 9;
+  canvas.style.aspectRatio = `${displayAspect} / 1`;
+
+  // Same decode rule as the canvas, background included, or the filmstrip shows
+  // a slide that the canvas does not.
+  const images = await loadSlideImages(layout);
+  draw.drawSlide(ctx, layout, images);
+}
+
+/**
+ * Highlight the slide list while a video is being dragged over it.
+ *
+ * The drop itself is handled by the single router in bindCanvas; this only
+ * provides the visual feedback, because a drag with no response looks broken.
+ */
+function attachFilmstripHighlight(strip) {
+  strip.addEventListener('dragover', (event) => {
+    if (!dragVideoId(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    strip.classList.add('dragover');
+  });
+  strip.addEventListener('dragleave', () => strip.classList.remove('dragover'));
+  strip.addEventListener('drop', () => strip.classList.remove('dragover'));
+}
+
+/**
+ * Set a slide's background from a file on disk.
+ *
+ * Shared by the file picker and by dropping a picture onto the control, so both
+ * routes end up with the same picture, treated the same way.
+ */
+async function setSlideBackgroundFromPath(slide, filePath) {
+  try {
+    const dataUrl = await api.files.readImage(filePath);
+    const prepared = await shrinkPicture(dataUrl, 1600);
+    if (!prepared) {
+      setBanner(
+        'error',
+        'That picture could not be read',
+        'It may be in a format this computer cannot open. A JPEG or PNG will always work.'
+      );
+      render();
+      return false;
+    }
+    slide.backgroundImage = prepared;
+    if (!slide.backgroundFit) slide.backgroundFit = 'cover';
+    persistDeck();
+    refreshCanvas();
+    renderInspector();
+    return true;
+  } catch (err) {
+    setBanner('error', 'That picture could not be used', String(err.message || err));
+    render();
+    return false;
+  }
+}
+
+/** Choose a picture to sit behind a slide, through the file picker. */
+async function chooseSlideBackground(slide) {
+  try {
+    const result = await api.files.pickImage();
+    if (result.canceled) return;
+    await setSlideBackgroundFromPath(slide, result.path);
+  } catch (err) {
+    setBanner('error', 'Could not open the file chooser', String(err.message || err));
+    render();
+  }
+}
+
+/**
+ * Accept a picture dropped straight onto the background control.
+ *
+ * Dragging a picture onto the thing it becomes is the shortest possible way to
+ * do it, and it is what everybody tries before they look for a button. The drop
+ * is claimed here — `stopPropagation` — because the rest of the window treats a
+ * dropped file as a video to put on the disc, which is not what this is.
+ */
+function attachBackgroundDropTarget(zone, slide) {
+  const clear = () => zone.classList.remove('bg-drop-active');
+
+  zone.addEventListener('dragover', (event) => {
+    // Only pictures, and only files: an in-app video drag has no business here.
+    const types = (event.dataTransfer && event.dataTransfer.types) || [];
+    if (!Array.prototype.includes.call(types, 'Files')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = 'copy';
+    zone.classList.add('bg-drop-active');
+  });
+
+  zone.addEventListener('dragleave', (event) => {
+    if (event.relatedTarget && zone.contains(event.relatedTarget)) return;
+    clear();
+  });
+
+  zone.addEventListener('drop', async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    clear();
+
+    const files = Array.from((event.dataTransfer && event.dataTransfer.files) || []);
+    if (!files.length) return;
+
+    const paths = pathsFromFiles(files);
+    if (!paths.length) {
+      setBanner(
+        'info',
+        'Use the button instead',
+        'Dragging did not provide a file location. Press "Use a picture" and choose it.'
+      );
+      render();
+      return;
+    }
+
+    // The first picture wins; a stray video among them gets a straight answer
+    // rather than being silently turned into a background.
+    const picture = paths.find((p) => looksLikeImage(p));
+    if (!picture) {
+      setBanner(
+        'info',
+        'That is not a picture',
+        paths.some((p) => looksLikeVideo(p))
+          ? 'Videos go on the disc as a video or a tile. A background has to be an image.'
+          : 'A background has to be an image file, such as a JPEG or a PNG.'
+      );
+      render();
+      return;
+    }
+
+    await setSlideBackgroundFromPath(slide, picture);
+  });
+}
+
+/** Remove the "drop here" marks from every slide card. */
+function clearSlideDropMarks(list) {
+  if (!list) return;
+  for (const card of list.querySelectorAll('.slide-card')) {
+    card.classList.remove('drop-before', 'drop-after');
+  }
+}
+
+/** The id of the slide being dragged, or null. */
+function slideDragId(event) {
+  if (!event.dataTransfer) return null;
+  return event.dataTransfer.getData('application/x-burnhouse-slide') || null;
+}
+
+/**
+ * Dropping one slide onto another to change the order.
+ *
+ * The mark shows which side of the target the slide will land on, because
+ * "before" and "after" are a coin toss otherwise, and getting it wrong silently
+ * reorders the disc.
+ */
+function attachSlideReorder(list) {
+  list.addEventListener('dragover', (event) => {
+    const dragging = slideDragId(event);
+    if (!dragging) return;
+
+    // Claimed even over the gaps between cards, so the window's file-drop
+    // styling does not appear for a slide being moved.
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+
+    const card = event.target.closest && event.target.closest('.slide-card');
+    clearSlideDropMarks(list);
+    if (!card) return;
+    if (card.dataset.slideId === dragging) return;
+
+    const rect = card.getBoundingClientRect();
+    const after = event.clientY > rect.top + rect.height / 2;
+    card.classList.add(after ? 'drop-after' : 'drop-before');
+  });
+
+  list.addEventListener('drop', (event) => {
+    const dragging = slideDragId(event);
+    if (!dragging) return;
+
+    const card = event.target.closest && event.target.closest('.slide-card');
+    if (!card) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const rect = card.getBoundingClientRect();
+    const after = event.clientY > rect.top + rect.height / 2;
+    clearSlideDropMarks(list);
+    moveSlideNextTo(dragging, card.dataset.slideId, after);
+  });
+}
+
+function renderEditorToolbar() {
+  const bar = $('editorToolbar');
+  if (!bar) return;
+  bar.replaceChildren();
+
+  const slide = activeSlide();
+  const index = state.deck.slides.findIndex((s) => s.id === state.activeSlideId);
+
+  bar.append(
+    el('div', { class: 'toolbar-group' }, [
+      el('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: '+ Text',
+        title: 'Add words to this slide',
+        onclick: () => addElement('text'),
+      }),
+      el('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: '+ Picture\u2026',
+        title: 'Add a picture to this slide',
+        onclick: pickPicture,
+      }),
+      el('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: '+ Panel',
+        title: 'A shaded box to group things',
+        onclick: () => addElement('frame'),
+      }),
+      el('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: '+ Video',
+        title: 'Put one of your videos on this slide',
+        onclick: addVideoTile,
+      }),
+      el('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: '+ Button',
+        title: 'A button that goes to another slide',
+        onclick: addManualButton,
+      }),
+    ]),
+    el('div', { class: 'toolbar-group' }, [
+      el('button', {
+        class: 'btn btn-small btn-quiet',
+        type: 'button',
+        text: state.showSafeArea ? 'Guides on' : 'Guides off',
+        title: 'Show the area some televisions crop off',
+        onclick: () => {
+          state.showSafeArea = !state.showSafeArea;
+          api.settings.set({ showSafeArea: state.showSafeArea }).catch(() => {});
+          renderEditorToolbar();
+          drawCanvas();
+        },
+      }),
+    ]),
+    el('div', { class: 'toolbar-spacer' }),
+    el('div', { class: 'toolbar-group' }, [
+      el('button', {
+        class: 'icon-btn',
+        type: 'button',
+        title: 'Move this slide earlier',
+        text: '\u2190',
+        disabled: index <= 0,
+        onclick: () => moveSlide(state.activeSlideId, -1),
+      }),
+      el('button', {
+        class: 'icon-btn',
+        type: 'button',
+        title: 'Move this slide later',
+        text: '\u2192',
+        disabled: index < 0 || index >= state.deck.slides.length - 1,
+        onclick: () => moveSlide(state.activeSlideId, 1),
+      }),
+      el('button', {
+        class: 'icon-btn',
+        type: 'button',
+        title: 'Duplicate this slide',
+        text: '\u29c9',
+        disabled: !slide,
+        onclick: () => duplicateSlide(state.activeSlideId),
+      }),
+      el('button', {
+        class: 'icon-btn',
+        type: 'button',
+        title: 'Delete this slide',
+        text: '\u2715',
+        disabled: !slide || state.deck.slides.length <= 1,
+        onclick: () => deleteSlide(state.activeSlideId),
+      }),
+    ])
+  );
+
+  const status = $('canvasStatus');
+  if (status) {
+    const layout = activeSlideLayout();
+    const problems = (state.layout && state.layout.problems) || [];
+    status.replaceChildren();
+    if (layout && layout.buttons.length > MAX_BUTTONS_PER_SLIDE) {
+      status.append(
+        el('span', {
+          class: 'hint-warn',
+          text: `This slide has ${layout.buttons.length} buttons. A DVD menu holds ${MAX_BUTTONS_PER_SLIDE} comfortably \u2014 move some to another slide.`,
+        })
+      );
+    } else if (problems.length) {
+      status.append(el('span', { class: 'hint-warn', text: problems[0] }));
+    } else {
+      status.append(
+        el('span', {
+          class: 'dim',
+          text: 'Drag a video from the Videos panel onto this slide to make a button that plays it.',
+        })
+      );
+    }
+  }
+}
+
+/**
+ * Put a video on an episode slide from the toolbar.
+ *
+ * If she is on the 1st menu slide, it automatically creates a new episode slide
+ * and puts the video there, so the menu slide is never cluttered.
+ * The video tile is sized full-screen, perfectly centered, ready to burn.
+ */
+function addVideoTile() {
+  let targetSlide = activeSlide();
+  if (!targetSlide || targetSlide.role === 'menu' || state.deck.slides.indexOf(targetSlide) === 0) {
+    let found = state.deck.slides.find((s) => s.role !== 'menu' && s.elements.filter((e) => e.kind === 'video').length === 0);
+    if (!found) {
+      found = addSlideAtEnd();
+    }
+    targetSlide = found;
+    state.activeSlideId = targetSlide.id;
+  }
+
+  const onThisSlide = new Set(
+    targetSlide.elements
+      .filter((e) => e.kind === 'video' && e.videoId)
+      .map((e) => e.videoId)
+  );
+  const ready = state.videos.filter((v) => v.probe || v.duration);
+  const next = ready.find((v) => !onThisSlide.has(v.id)) || ready[0];
+
+  if (!next) {
+    setBanner('info', 'No videos to add yet', 'Open the Videos tab and press Add Videos.');
+    render();
+    return;
+  }
+
+  dropVideoOnCanvas(next);
+}
+
+function addManualButton() {
+  const others = state.deck.slides.filter((s) => s.id !== state.activeSlideId);
+  const slide = activeSlide();
+  if (others.length === 0) {
+    const target = addSlide({ title: 'Second slide' });
+    addElement('button', { label: 'Go to slide 2', targetSlideId: target.id });
+    return;
+  }
+  addElement('button', { label: 'Go to another slide', targetSlideId: others[0].id });
+}
+
+async function pickPicture() {
+  try {
+    const result = await api.files.pickImage();
+    if (result.canceled) return;
+    const dataUrl = await api.files.readImage(result.path);
+    addElement('image', { src: dataUrl, fileName: basename(result.path) });
+  } catch (err) {
+    setBanner('error', 'That picture could not be used', String(err.message || err));
+    render();
+  }
+}
+
+// ------------------------------------------------------------ inspector ---
+
+
+function buildSlideInspector(slide) {
+  const themes = (state.presets && state.presets.themes) || [];
+
+  const themeGrid = el('div', { class: 'theme-grid' });
+  for (const theme of themes) {
+    const swatch = el('button', {
+      class: 'theme-swatch',
+      type: 'button',
+      'aria-pressed': String((slide.themeId || state.deck.themeId) === theme.id),
+      title: theme.blurb,
+    });
+    // "None" is the absence of a background, so its swatch shows nothing rather
+    // than the usual accent dot and text bar — otherwise it reads as just
+    // another dark theme.
+    swatch.append(
+      theme.plain
+        ? el('div', { class: 'swatch-preview swatch-empty' })
+        : el('div', { class: 'swatch-preview', style: `background:${theme.background}` }, [
+            el('span', { class: 'swatch-dot', style: `background:${theme.accent}` }),
+            el('span', { class: 'swatch-bar', style: `background:${theme.text}` }),
+          ]),
+      el('span', { class: 'swatch-label', text: theme.label })
+    );
+    swatch.addEventListener('click', () => {
+      slide.themeId = theme.id;
+      state.deck.themeId = theme.id;
+      persistDeck();
+      refreshCanvas();
+      renderInspector();
+    });
+    themeGrid.append(swatch);
+  }
+
+  /*
+    A picture of her own behind the slide.
+
+    The picture is washed toward the theme's colour when it is drawn, so the
+    words and buttons on top stay readable — which is why this sits right under
+    the background style rather than in a section of its own.
+  */
+  const hasBackground = Boolean(slide.backgroundImage);
+
+  const backgroundRow = el('div', { class: 'btn-row' }, [
+    el('button', {
+      class: 'btn btn-small',
+      type: 'button',
+      text: hasBackground ? 'Replace the picture\u2026' : 'Use a picture\u2026',
+      onclick: () => chooseSlideBackground(slide),
+    }),
+    hasBackground
+      ? el('button', {
+          class: 'btn btn-small btn-quiet',
+          type: 'button',
+          text: 'Remove',
+          onclick: () => {
+            slide.backgroundImage = null;
+            persistDeck();
+            refreshCanvas();
+            renderInspector();
+          },
+        })
+      : null,
+  ]);
+
+  const backgroundFit = hasBackground
+    ? el('div', { class: 'segmented wide' }, [
+        segmentedButton('Fill the frame', (slide.backgroundFit || 'cover') === 'cover', () => {
+          slide.backgroundFit = 'cover';
+          persistDeck();
+          refreshCanvas();
+          renderInspector();
+        }),
+        segmentedButton('Whole picture', slide.backgroundFit === 'contain', () => {
+          slide.backgroundFit = 'contain';
+          persistDeck();
+          refreshCanvas();
+          renderInspector();
+        }),
+      ])
+    : null;
+
+  const titleField = el('input', {
+    class: 'input',
+    type: 'text',
+    value: slide.title,
+    maxlength: '40',
+    'aria-label': 'Name for this slide',
+    // Named so the slide's right-click menu can put the caret in it.
+    dataset: { field: 'slide-title' },
+  });
+  titleField.addEventListener('input', () => {
+    slide.title = titleField.value;
+    persistDeck();
+    renderFilmstrip();
+  });
+
+  const applyAll = el('button', {
+    class: 'btn btn-small',
+    type: 'button',
+    text: 'Use this look on every slide',
+    onclick: () => {
+      for (const s of state.deck.slides) s.themeId = slide.themeId;
+      persistDeck();
+      refreshCanvas();
+      render();
+    },
+  });
+
+  /*
+    The background picture block, which is also a drop target: a picture dragged
+    onto it becomes the background. Built first so the drop handling can be
+    attached before it goes into the panel.
+  */
+  const backgroundField = el('div', { class: 'field bg-drop' }, [
+    el('label', { class: 'label', text: 'Background picture' }),
+    hasBackground
+      ? el('div', {
+          class: 'bg-preview',
+          style: `background-image:url("${slide.backgroundImage}")`,
+        })
+      : null,
+    backgroundRow,
+    backgroundFit,
+    el('p', {
+      class: 'hint',
+      text: hasBackground
+        ? 'Drawn behind everything and darkened a little so the words stay readable. Drop another picture here to swap it.'
+        : 'Optional. Drag a picture straight onto this box, or press the button.',
+    }),
+  ]);
+  attachBackgroundDropTarget(backgroundField, slide);
+
+  return el('div', {}, [
+    el('div', { class: 'rail-title', text: 'Slide ' + (state.deck.slides.indexOf(slide) + 1) }),
+    el('div', { class: 'field' }, [
+      el('label', { class: 'label', text: 'Name (only you see this)' }),
+      titleField,
+    ]),
+    el('div', { class: 'field' }, [
+      el('label', { class: 'label', text: 'Background style' }),
+      themeGrid,
+    ]),
+    backgroundField,
+    el('div', { class: 'btn-row' }, [applyAll]),
+    el('div', { class: 'rule', text: 'This slide' }),
+    el('p', {
+      class: 'hint',
+      text: 'Everything you change here is only on this slide.',
+    }),
+  ]);
+}
+
+/**
+ * Re-encode a picture at no more than `maxWidth` across.
+ *
+ * Returns null when the picture cannot be decoded, so the caller can say so
+ * rather than storing something that will never appear.
+ */
+async function shrinkPicture(dataUrl, maxWidth) {
+  const image = await loadImage(dataUrl);
+  if (!image || !image.naturalWidth) return null;
+
+  const scale = Math.min(1, maxWidth / image.naturalWidth);
+  const width = Math.max(2, Math.round(image.naturalWidth * scale));
+  const height = Math.max(2, Math.round(image.naturalHeight * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(image, 0, 0, width, height);
+
+  // JPEG, because a menu background has nothing to be transparent about and a
+  // photograph is several times smaller this way.
+  return canvas.toDataURL('image/jpeg', 0.85);
+}
+
+/** A button for one of a set of mutually exclusive choices. */
+function segmentedButton(label, pressed, onClick) {
+  const button = el('button', { type: 'button', text: label, 'aria-pressed': String(pressed) });
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+/**
+ * A property table, laid out the way a scene editor shows one: a muted name
+ * column, an editable value column, and category headings that fold away.
+ *
+ * Values are borderless until hovered, so a long list reads as data rather than
+ * as a wall of input boxes.
+ */
+function propTable(groups) {
+  const table = el('div', { class: 'prop-table' });
+
+  for (const group of groups) {
+    if (!group.rows || !group.rows.length) continue;
+
+    const head = el(
+      'button',
+      {
+        class: 'prop-group',
+        type: 'button',
+        'data-collapsed': String(Boolean(group.collapsed)),
+        'aria-expanded': String(!group.collapsed),
+      },
+      [el('span', { class: 'prop-caret', text: '\u25bc' }), el('span', { text: group.title })]
+    );
+    head.addEventListener('click', () => {
+      const collapsed = head.dataset.collapsed === 'true';
+      head.dataset.collapsed = String(!collapsed);
+      head.setAttribute('aria-expanded', String(collapsed));
+    });
+
+    const rows = el('div', { class: 'prop-rows' });
+    for (const row of group.rows) rows.append(row);
+
+    table.append(head, rows);
+  }
+
+  return table;
+}
+
+/** One name/value line. The name is also the filter key. */
+function propRow(name, control) {
+  const row = el('div', { class: 'prop-row' });
+  row.dataset.prop = String(name).toLowerCase();
+  const value = el('span', { class: 'prop-value' });
+  value.append(control);
+  row.append(el('span', { class: 'prop-name', text: name, title: name }), value);
+  return row;
+}
+
+function propText(value, onInput, options = {}) {
+  const input = el('input', { type: 'text', value: value || '' });
+  if (options.field) input.dataset.field = options.field;
+  input.addEventListener('input', () => onInput(input.value));
+  return input;
+}
+
+function propArea(value, onInput, options = {}) {
+  const area = el('textarea', { rows: String(options.rows || 3) });
+  if (options.field) area.dataset.field = options.field;
+  area.value = value || '';
+  area.addEventListener('input', () => onInput(area.value));
+  return area;
+}
+
+function propNumber(value, onChange, options = {}) {
+  const floor = options.min === undefined ? 0 : options.min;
+  const ceiling = options.max === undefined ? undefined : options.max;
+  const input = el('input', {
+    type: 'number',
+    value: String(Math.round((Number(value) || 0) * 100) / 100),
+    min: String(floor),
+    max: ceiling === undefined ? null : String(ceiling),
+    step: options.step === undefined ? '1' : String(options.step),
+  });
+  input.addEventListener('change', () => {
+    let next = Number(input.value);
+    if (!Number.isFinite(next)) next = floor;
+    next = Math.max(floor, next);
+    if (ceiling !== undefined) next = Math.min(ceiling, next);
+    onChange(next);
+  });
+  return input;
+}
+
+function propCheck(checked, onChange) {
+  const input = el('input', { class: 'prop-check', type: 'checkbox' });
+  input.checked = Boolean(checked);
+  input.addEventListener('change', () => onChange(input.checked));
+  return input;
+}
+
+function propSelect(choices, current, onChange) {
+  const select = el('select', {});
+  for (const choice of choices) {
+    select.append(
+      el('option', {
+        value: choice.value,
+        text: choice.label,
+        selected: choice.value === current,
+      })
+    );
+  }
+  select.addEventListener('change', () => onChange(select.value));
+  return select;
+}
+
+/** A colour: a swatch beside the list of choices, as a scene editor shows it. */
+function propColor(choices, current, onChange) {
+  const swatch = el('span', { class: 'prop-swatch' });
+  const paint = () => {
+    const found = choices.find((c) => c.value === current);
+    swatch.style.background = found ? found.color : '#888';
+  };
+  paint();
+
+  const select = propSelect(choices, current, (value) => {
+    current = value;
+    paint();
+    onChange(value);
+  });
+
+  return el('span', { class: 'prop-color' }, [swatch, select]);
+}
+
+function buildElementInspector(slide, element) {
+  const panel = el('div', {});
+
+  const kindName =
+    element.kind === 'button' ? 'Button' :
+    element.kind === 'video' ? 'Video' :
+    element.kind === 'text' ? 'Text' :
+    element.kind === 'image' ? 'Picture' : 'Panel';
+
+  panel.append(el('div', { class: 'rail-title', text: kindName }));
+
+  // Every change goes through here, so saving and redrawing cannot be forgotten
+  // on one control out of twenty.
+  //
+  // `rebuild` is for the rare change that alters what the inspector itself
+  // should show — choosing a different video renames the tile, so the rows have
+  // to be rebuilt. Everything else redraws the slide and leaves the panel, and
+  // the cursor in it, where they are.
+  const apply = (patch, options = {}) => {
+    Object.assign(element, patch);
+    persistDeck();
+    if (options.rebuild) refreshCanvas();
+    else refreshCanvasOnly();
+  };
+
+  const theme = currentTheme();
+  const colorChoices = Object.keys(theme || {})
+    .filter((key) => typeof theme[key] === 'string' && /^#/.test(theme[key]))
+    .map((key) => ({ value: key, label: key, color: theme[key] }));
+
+  /** Rows shared by anything that has lettering. */
+  const letteringRows = () => {
+    const fonts = (state.presets && state.presets.fonts) || [];
+    return [
+      propRow('Lettering', propSelect(
+        fonts.map((f) => ({ value: f.id, label: f.label })),
+        element.fontId,
+        (value) => apply({ fontId: value })
+      )),
+      /*
+        A size typed in pixels.
+
+        The named sizes stay as starting points (see elementFontPx), but the
+        number is what she can actually set. It shows the size in use, so opening
+        the panel on a preset tells her what that preset is worth.
+      */
+      propRow('TextSize', propNumber(
+        elementFontPx(element),
+        (value) => apply({ textPx: value }),
+        { min: textSizeBounds().min, max: textSizeBounds().max }
+      )),
+      propRow('TextAlign', propSelect(
+        [
+          { value: 'left', label: 'Left' },
+          { value: 'center', label: 'Centre' },
+          { value: 'right', label: 'Right' },
+        ],
+        element.align || 'left',
+        (value) => apply({ align: value })
+      )),
+      colorChoices.length
+        ? propRow('TextColor', propColor(colorChoices, element.color, (value) => apply({ color: value })))
+        : null,
+    ].filter(Boolean);
+  };
+
+  /** The box behind the words, shown or not, solid or see-through. */
+  const backgroundRows = (choices) => [
+    propRow('Background', propSelect(
+      [{ value: 'none', label: 'None' }].concat(choices),
+      element.background || 'none',
+      (value) => apply({ background: value })
+    )),
+    propRow('BgTransparency', propNumber(
+      element.backgroundTransparency || 0,
+      (value) => apply({ backgroundTransparency: value }),
+      { min: 0, max: 1, step: 0.05 }
+    )),
+  ];
+
+  const layoutRows = () => [
+    propRow('PositionX', propNumber(element.x, (v) => { element.x = v; clampElementInPlace(element); apply({}, { rebuild: true }); }, { min: 0 })),
+    propRow('PositionY', propNumber(element.y, (v) => { element.y = v; clampElementInPlace(element); apply({}, { rebuild: true }); }, { min: 0 })),
+    propRow('Width', propNumber(element.width, (v) => { element.width = v; clampElementInPlace(element); apply({}, { rebuild: true }); }, { min: MIN_ELEMENT_WIDTH })),
+    propRow('Height', propNumber(element.height, (v) => { element.height = v; if (element.kind === 'text') element.autoHeight = false; clampElementInPlace(element); apply({}, { rebuild: true }); }, { min: MIN_ELEMENT_HEIGHT })),
+    /*
+      Lower numbers sit in front. A button set to 1 covers one set to 2, which is
+      the way round she asked for. Zero is the default, so nothing that has never
+      been given a priority changes places.
+    */
+    propRow('Priority', propNumber(element.priority || 0, (value) => apply({ priority: Math.round(value) }, { rebuild: true }), { min: -99, max: 99 })),
+    // 0 is square. The drawing clamps it to half the shorter side, because a
+    // bigger radius than that has no meaning.
+    propRow('Roundness', propNumber(element.roundness || 0, (value) => apply({ roundness: Math.round(value) }, { rebuild: true }), { min: 0, max: 200 })),
+  ];
+
+  const groups = [];
+
+  if (element.kind === 'video') {
+    const ready = state.videos.filter((v) => v.probe || v.duration);
+    const appearance = [
+      propRow('Name', propText(element.label, (value) => apply({ label: value }))),
+      // Which film this tile shows and plays. Distinct from a button's target:
+      // a tile *is* the video, it does not point at one.
+      propRow('Plays', propSelect(
+        [{ value: '', label: 'Choose a video\u2026' }].concat(
+          ready.map((v) => ({ value: v.id, label: videoLabel(v) }))
+        ),
+        element.videoId || '',
+        (value) => {
+          const chosen = state.videos.find((v) => v.id === value);
+          if (!chosen) return apply({ videoId: null }, { rebuild: true });
+          apply({
+            videoId: chosen.id,
+            label: videoLabel(chosen),
+            sublabel: chosen.duration ? formatDuration(chosen.duration) : '',
+            src: chosen.poster || null,
+            posterMissing: !chosen.poster,
+          }, { rebuild: true });
+        }
+      )),
+      propRow('Picture', propSelect(
+        [
+          { value: 'fit', label: 'Whole frame' },
+          { value: 'fill', label: 'Fill the tile' },
+        ],
+        element.fit || 'fit',
+        (value) => apply({ fit: value })
+      )),
+      propRow('ShowName', propCheck(element.showLabel !== false, (checked) => apply({ showLabel: checked }))),
+      propRow('FitToSlide', el('button', {
+        class: 'btn btn-small btn-quiet',
+        type: 'button',
+        text: 'Reset size',
+        onclick: () => refitElement(element.id),
+      })),
+    ];
+    groups.push({ title: 'Appearance', rows: appearance });
+    groups.push({ title: 'Text', rows: letteringRows() });
+    groups.push({ title: 'Layout', rows: layoutRows() });
+  }
+
+  if (element.kind === 'text') {
+    groups.push({
+      title: 'Appearance',
+      rows: [
+        propRow('Text', propArea(element.text, (value) => apply({ text: value, edited: true }), { field: 'text' })),
+        ...letteringRows(),
+        ...backgroundRows(colorChoices),
+      ],
+    });
+    groups.push({ title: 'Layout', rows: layoutRows() });
+  }
+
+  if (element.kind === 'button') {
+    groups.push({
+      title: 'Appearance',
+      rows: [
+        propRow('Text', propText(
+          element.label,
+          (value) => apply({ label: value, labelEdited: true }),
+          { field: 'label' }
+        )),
+        propRow('Style', propSelect(
+          (((state.presets && state.presets.buttonStyles) || []).map((s) => ({ value: s.id, label: s.label }))),
+          element.buttonStyle || 'bar',
+          (value) => apply({ buttonStyle: value })
+        )),
+        propRow('ShowNumber', propCheck(element.showNumber, (checked) => {
+          const patch = { showNumber: checked };
+          if (checked && !element.number) {
+            const siblings = slide.elements.filter((e) => e.kind === 'button');
+            patch.number = siblings.indexOf(element) + 1;
+          }
+          apply(patch);
+        })),
+        ...letteringRows(),
+        propRow('BgTransparency', propNumber(
+          element.backgroundTransparency || 0,
+          (value) => apply({ backgroundTransparency: value }),
+          { min: 0, max: 1, step: 0.05 }
+        )),
+      ],
+    });
+    groups.push({
+      title: 'Behaviour',
+      rows: [
+        /*
+          Where the button goes. There is deliberately no "plays a video" row:
+          a button that should start a film points at the slide holding that
+          film, and arriving on that slide starts it. One idea instead of two
+          ways of saying the same thing.
+        */
+        propRow('GoToSlide', propSelect(
+          [{ value: '', label: 'Choose a slide\u2026' }].concat(
+            state.deck.slides
+              .filter((other) => other.id !== slide.id)
+              .map((other) => ({ value: other.id, label: other.title }))
+          ),
+          element.targetSlideId || '',
+          (value) => {
+            element.targetSlideId = value || null;
+            if (element.targetSlideId) element.videoId = null;
+            apply({}, { rebuild: true });
+          }
+        )),
+      ],
+    });
+    groups.push({ title: 'Layout', rows: layoutRows() });
+  }
+
+  if (element.kind === 'image') {
+    groups.push({
+      title: 'Appearance',
+      rows: [
+        propRow('File', propText(element.fileName || '', () => {}, {})),
+        propRow('Picture', propSelect(
+          [
+            { value: 'fit', label: 'Whole picture' },
+            { value: 'fill', label: 'Fill the frame' },
+          ],
+          element.fit || 'fit',
+          (value) => apply({ fit: value })
+        )),
+        propRow('Replace', el('button', {
+          class: 'btn btn-small btn-quiet',
+          type: 'button',
+          text: 'Choose\u2026',
+          onclick: async () => {
+            const result = await api.files.pickImage();
+            if (result.canceled) return;
+            element.src = await api.files.readImage(result.path);
+            element.fileName = basename(result.path);
+            imageCache.clear();
+            apply({}, { rebuild: true });
+          },
+        })),
+      ],
+    });
+    groups.push({ title: 'Layout', rows: layoutRows() });
+  }
+
+  if (element.kind === 'frame') {
+    groups.push({
+      title: 'Appearance',
+      rows: [
+        propRow('Fill', propSelect(colorChoices, element.fill || 'panel', (value) => apply({ fill: value }, { rebuild: true }))),
+        propRow('Outline', propCheck(element.outline !== false, (checked) => apply({ outline: checked }))),
+      ],
+    });
+    groups.push({ title: 'Layout', rows: layoutRows() });
+  }
+
+  if (element.posterMissing) {
+    panel.append(
+      el('p', {
+        class: 'hint hint-warn',
+        text:
+          'A picture could not be taken from this video, so the tile shows its name ' +
+          'only. It will still play correctly.',
+      })
+    );
+  }
+
+  // Filter, so a long list can be narrowed to the one property being looked for.
+  const filter = el('input', {
+    type: 'text',
+    placeholder: 'Filter properties',
+    'aria-label': 'Filter properties',
+  });
+
+  const table = propTable(groups);
+  filter.addEventListener('input', () => {
+    const query = filter.value.trim().toLowerCase();
+    for (const row of table.querySelectorAll('.prop-row')) {
+      row.style.display = !query || row.dataset.prop.includes(query) ? '' : 'none';
+    }
+  });
+
+  panel.append(el('div', { class: 'prop-filter' }, [filter]), table);
+
+  panel.append(
+    el('p', {
+      class: 'prop-hint',
+      text: 'Drag it on the slide to move it, or its handles to resize. It stays inside the safe area.',
+    })
+  );
+
+  if (element.kind === 'video') {
+    /*
+      The question this answers: "I scaled the tile down, so why does it still
+      play full-screen?" Because on a disc, the menu is a still picture and the
+      film is a separate thing the player switches to. The tile's size decides
+      how it looks on the menu, which is where you choose it; it cannot decide
+      how big the film plays, because no DVD player can do that.
+    */
+    panel.append(
+      el('p', {
+        class: 'prop-hint',
+        text:
+          'Size and position here are for the tile on the menu. Choosing it plays the ' +
+          'film full-screen, which is how every DVD player works.',
+      })
+    );
+  }
+
+  if (!element.generated) {
+    panel.append(
+      el('div', { class: 'btn-row', style: 'margin-top:10px' }, [
+        el('button', {
+          class: 'btn btn-small btn-danger',
+          type: 'button',
+          text: 'Delete',
+          onclick: () => deleteElement(element.id),
+        }),
+      ])
+    );
+  }
+
+  return panel;
+}
+
+/** The theme the active slide is drawn with, for the colour choices. */
+function currentTheme() {
+  const slide = activeSlide();
+  const themeId = (slide && slide.themeId) || (state.deck && state.deck.themeId) || 'charcoal';
+  const themes = (state.presets && state.presets.themes) || [];
+  return themes.find((t) => t.id === themeId) || themes[0] || null;
+}
+
+/** Bounds on a typed text size, from the deck that enforces them. */
+const TEXT_SIZE_MIN = 8;
+const TEXT_SIZE_MAX = 120;
+
+function textSizeBounds() {
+  const presets = state.presets || {};
+  return {
+    min: Number.isFinite(presets.textSizeMin) ? presets.textSizeMin : TEXT_SIZE_MIN,
+    max: Number.isFinite(presets.textSizeMax) ? presets.textSizeMax : TEXT_SIZE_MAX,
+  };
+}
+
+/**
+ * The size in pixels an element is drawn at right now.
+ *
+ * A typed size wins; otherwise the named size it was made with. Shown in the
+ * TextSize field, so opening the panel on a preset says what that preset is
+ * worth rather than leaving the number blank.
+ */
+function elementFontPx(element) {
+  const typed = Number(element && element.textPx);
+  const bounds = textSizeBounds();
+  if (Number.isFinite(typed) && typed > 0) {
+    return Math.max(bounds.min, Math.min(bounds.max, Math.round(typed)));
+  }
+  const sizes = (state.presets && state.presets.textSizes) || [];
+  const found = sizes.find((s) => s.id === (element && element.fontSize));
+  return found ? found.px : 22;
+}
+
+/** Put the caret into one of the inspector's fields, if it is on screen. */
+function focusInspectorField(name) {
+  const field = document.querySelector(`#inspector [data-field="${name}"]`);
+  if (!field) return false;
+  field.focus();
+  if (typeof field.select === 'function') field.select();
+  return true;
+}
+
+function textField(label, value, onInput) {
+  const input = el('input', { class: 'input', type: 'text', value: value || '', 'aria-label': label });
+  input.addEventListener('input', () => onInput(input.value));
+  return el('div', { class: 'field' }, [el('label', { class: 'label', text: label }), input]);
+}
+
+function textAreaField(label, value, onInput, options = {}) {
+  const area = el('textarea', { class: 'textarea', rows: '2', 'aria-label': label });
+  if (options.field) area.dataset.field = options.field;
+  area.value = value || '';
+  area.addEventListener('input', () => onInput(area.value));
+  return el('div', { class: 'field' }, [el('label', { class: 'label', text: label }), area]);
+}
+
+function numberField(label, value, onChange) {
+  const input = el('input', {
+    class: 'input',
+    type: 'number',
+    value: String(Math.round(value || 0)),
+    min: '24',
+    'aria-label': label,
+  });
+  input.addEventListener('change', () => onChange(Math.max(24, Number(input.value) || 24)));
+  return el('div', {}, [el('label', { class: 'label', text: label }), input]);
+}
+
+function switchRow({ checked, title, onChange }) {
+  const knob = el('button', {
+    class: 'switch',
+    type: 'button',
+    role: 'switch',
+    'aria-checked': String(Boolean(checked)),
+    'aria-label': title,
+  });
+  knob.addEventListener('click', () => {
+    const next = knob.getAttribute('aria-checked') !== 'true';
+    knob.setAttribute('aria-checked', String(next));
+    onChange(next);
+  });
+  return el('div', { class: 'switch-row' }, [
+    knob,
+    el('div', { class: 'switch-text' }, [el('div', { class: 'switch-title', text: title })]),
+  ]);
+}
+
+// --------------------------------------------------------- step: finish ---
+
+function renderFinishStep(stage) {
+  stage.className = 'stage';
+  document.body.classList.remove('wide-stage');
+  stage.append(
+    el('h1', { text: 'Make the disc' }),
+    el('p', {
+      class: 'lede',
+      text: 'Everything is ready. Nothing is written to a disc until you ask for it.',
+    })
+  );
+
+  if (!state.videos.length || !state.deck.slides.length) {
+    stage.append(
+      el('div', { class: 'panel' }, [
+        el('h2', { text: 'Not ready yet' }),
+        el('p', {
+          class: 'hint',
+          text: !state.videos.length
+            ? 'Add some videos first.'
+            : 'Your disc needs at least one slide with a button on it.',
+        }),
+        el('div', { class: 'btn-row', style: 'margin-top: 12px' }, [
+          el('button', {
+            class: 'btn',
+            type: 'button',
+            text: !state.videos.length ? 'Add Videos' : 'Back to Slides',
+            onclick: () =>
+              !state.videos.length
+                ? promptForVideos()
+                : goToStep('slides'),
+          }),
+        ]),
+      ])
+    );
+    return;
+  }
+
+  if (state.lastBuild) stage.append(buildDonePanel());
+  stage.append(buildBurnPanel());
+
+  stage.append(
+    el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [el('h2', { text: 'Other ways to keep it' })]),
+      el('p', {
+        class: 'hint',
+        style: 'margin-bottom: 12px',
+        text:
+          'A disc image is a single file holding the whole DVD. You can burn it later, ' +
+          'copy it to another computer, or keep it as a backup.',
+      }),
+      el('div', { class: 'btn-row' }, [
+        el('button', {
+          class: 'btn',
+          type: 'button',
+          id: 'btnSaveImage',
+          text: 'Save a Disc Image\u2026',
+          disabled: state.busy,
+        }),
+        el('button', {
+          class: 'btn',
+          type: 'button',
+          id: 'btnSaveFolder',
+          text: 'Save the Disc Files\u2026',
+          disabled: state.busy,
+        }),
+      ]),
+    ])
+  );
+}
+
+function buildDonePanel() {
+  const build = state.lastBuild;
+  const panel = el('div', { class: 'panel' });
+  panel.append(
+    el('div', { class: 'panel-head' }, [
+      el('h2', { text: 'The disc is built' }),
+      el('span', { class: 'panel-note', text: formatBytes(build.sizeBytes) }),
+    ]),
+    buildBanner({
+      kind: 'good',
+      title: `${build.videoCount} ${build.videoCount === 1 ? 'video' : 'videos'} ready to burn`,
+      body: `${build.slideCount} ${build.slideCount === 1 ? 'menu page' : 'menu pages'}, ${formatDuration(build.totalSeconds)} of video.`,
+    })
+  );
+
+  if (build.failed && build.failed.length) {
+    const list = el('ul', { class: 'checklist', style: 'color: #e6b3ac' });
+    for (const failure of build.failed) {
+      list.append(el('li', { text: `${failure.name}: ${failure.error}` }));
+    }
+    panel.append(
+      el('div', { style: 'margin-top: 12px' }, [
+        el('h2', { style: 'font-size: 13px', text: 'These were left off' }),
+        list,
+      ])
+    );
+  }
+
+  panel.append(
+    el('div', { class: 'btn-row', style: 'margin-top: 13px' }, [
+      el('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: 'Show the disc files',
+        onclick: () => api.files.reveal(build.videoTsDir).catch(() => {}),
+      }),
+    ])
+  );
+
+  return panel;
+}
+
+function buildBurnPanel() {
+  const panel = el('div', { class: 'panel' });
+  panel.append(
+    el('div', { class: 'panel-head' }, [
+      el('h2', { text: 'Write to a blank disc' }),
+      el('span', { class: 'panel-note', text: 'Use a DVD-R or DVD+R' }),
+    ])
+  );
+
+  const writers = state.driveSupported ? state.drives : [];
+  const hasWriter = writers.length > 0;
+
+  if (!state.driveSupported) {
+    panel.append(
+      buildBanner({
+        kind: 'info',
+        title: 'This computer cannot write discs',
+        body:
+          state.driveNote ||
+          'The disc can still be built here, then copied to a computer with a disc writer.',
+      })
+    );
+  } else if (!hasWriter) {
+    panel.append(
+      buildBanner({
+        kind: 'info',
+        title: 'No disc burner found',
+        body:
+          'Plug your DVD writer in, put in a blank disc, then press Check Again. ' +
+          'You can still build a disc image without a burner.',
+      })
+    );
+  } else {
+    const list = el('div', { class: 'drive-list' });
+    for (const drive of writers) {
+      const selected = state.selectedDevice === drive.device;
+      const hasMedia = Boolean(drive.media && drive.media.present);
+      const button = el('button', {
+        class: 'drive',
+        type: 'button',
+        'aria-pressed': String(selected),
+        onclick: () => {
+          state.selectedDevice = drive.device;
+          api.settings.set({ lastDevice: drive.device }).catch(() => {});
+          render();
+        },
+      });
+      button.append(
+        el('span', { class: 'drive-icon', text: '\u25ce' }),
+        el('div', { class: 'drive-main' }, [
+          el('div', { class: 'drive-name', text: drive.label || drive.device }),
+          el('div', {
+            class: 'drive-meta',
+            text: hasMedia
+              ? `${(drive.media && drive.media.type) || 'Disc'} \u00b7 ${(drive.media && drive.media.freeSpace) || 'capacity unknown'}`
+              : 'No disc in the drive',
+          }),
+        ]),
+        el('span', { class: `drive-state${hasMedia ? ' ready' : ''}`, text: hasMedia ? 'Ready' : 'Empty' })
+      );
+      list.append(button);
+    }
+    panel.append(list);
+    if (!state.selectedDevice) state.selectedDevice = writers[0].device;
+  }
+
+  /*
+    The burn button is always on the page, and says why it cannot be used.
+
+    It used to appear only once a writer was found, so the page rearranged itself
+    and there was nothing to look at to work out what was missing. Now it is
+    always in the same place: grey when there is no writer, red when there is,
+    with the reason written next to it.
+  */
+  const blocked = state.busy
+    ? 'Working\u2026'
+    : !state.driveSupported
+      ? 'Cannot write discs on this computer'
+      : !hasWriter
+        ? 'No writer connected'
+        : !state.selectedDevice
+          ? 'Choose a drive above'
+          : null;
+
+  const burn = el('button', {
+    class: 'btn-burn',
+    type: 'button',
+    id: 'btnBurn',
+    disabled: Boolean(blocked),
+    'aria-label': blocked ? `Burn the disc \u2014 ${blocked}` : 'Burn the disc',
+  });
+  burn.append(
+    el('span', { class: 'btn-burn-glyph' }),
+    el('span', { class: 'btn-burn-label', text: 'Burn' })
+  );
+
+  /*
+    The two things to do first, before the burn button.
+
+    They used to sit below it, which put the one-way action above the steps that
+    are meant to come before it. Reading down the page now goes: check it, build
+    it, then write it.
+  */
+  panel.append(
+    el('div', { class: 'rule', text: 'Before you burn' }),
+    el('div', { class: 'btn-row' }, [
+      el('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: 'Go to Testing',
+        disabled: state.busy,
+        onclick: () => goToStep('testing'),
+      }),
+    ]),
+    el('p', {
+      class: 'hint',
+      text:
+        'Step 2 plays the disc the way a DVD player will: the real menus, the real ' +
+        'buttons and the same arrow-key movement. Nothing is written to a disc.',
+    })
+  );
+
+  if (!state.lastBuild) {
+    panel.append(
+      el('div', { class: 'btn-row', style: 'margin-top: 14px' }, [
+        el('button', {
+          class: 'btn btn-primary',
+          type: 'button',
+          id: 'btnBuild',
+          text: 'Build the Disc',
+          disabled: state.busy,
+        }),
+      ]),
+      el('p', { class: 'hint', text: 'This prepares and lays out the disc. It does not touch your blank disc yet.' })
+    );
+  }
+
+  panel.append(
+    el('div', { class: 'burn-action' }, [
+      burn,
+      el('div', { class: 'burn-side' }, [
+        el('p', {
+          class: blocked ? 'hint burn-blocked' : 'hint',
+          text:
+            blocked ||
+            'Writing takes several minutes and the disc cannot be reused afterwards. ' +
+              'Leave the burner connected until it says it is finished.',
+        }),
+        el('button', {
+          class: 'btn btn-small btn-quiet',
+          type: 'button',
+          text: hasWriter ? 'Refresh the drive list' : 'Check Again',
+          onclick: refreshDrives,
+        }),
+      ]),
+    ])
+  );
+
+  return panel;
+}
+
+function renderFinishRail(rail) {
+  rail.append(buildFinishSummary());
+}
+
+/** What this disc is, in the context rail of the finish step. */
+function buildFinishSummary() {
+  const section = el('div', { class: 'rail-section' });
+  section.append(el('div', { class: 'rail-title', text: 'This disc' }));
+
+  const stats = el('div', { class: 'stats' });
+  const add = (key, value, tone) => {
+    stats.append(
+      el('div', { class: 'stat' }, [
+        el('span', { class: 'stat-key', text: key }),
+        el('span', { class: `stat-value${tone ? ` ${tone}` : ''}`, text: value }),
+      ])
+    );
+  };
+
+  const plan = state.plan;
+  add('Videos', state.videos.length ? String(state.videos.length) : '\u2014');
+  add('Total length', state.totalSeconds ? formatDuration(state.totalSeconds) : '\u2014');
+  add('Slides', String(state.deck.slides.length));
+  add('Disc size', plan ? formatBytes(plan.estimatedBytes) : '\u2014');
+  add('A blank disc', 'DVD-R or DVD+R');
+  add('A disc burner', state.drives.length ? 'Connected' : 'Not found', state.drives.length ? '' : 'dim');
+
+  section.append(stats);
+  return section;
+}
+
+// ------------------------------------------------------------- interaction ---
+
+function bindChrome() {
+  for (const button of document.querySelectorAll('.step')) {
+    button.addEventListener('click', () => goToStep(button.dataset.step));
+  }
+  const btnHome = $('btnProjectsHome');
+  if (btnHome) btnHome.addEventListener('click', () => closeProjectToHome());
+  const btnSave = $('btnSaveProject');
+  if (btnSave) btnSave.addEventListener('click', () => saveCurrentProject(true));
+
+  $('btnSetup').addEventListener('click', () => openSetup());
+  $('btnShare').addEventListener('click', () => openShare());
+  $('btnCancel').addEventListener('click', () => api.job.cancel().catch(() => {}));
+  $('btnLogToggle').addEventListener('click', () => {
+    const log = $('log');
+    log.hidden = !log.hidden;
+    $('btnLogToggle').textContent = log.hidden ? 'Details' : 'Hide Details';
+  });
+
+  for (const node of document.querySelectorAll('[data-close-overlay]')) {
+    node.addEventListener('click', () => {
+      node.closest('.overlay').hidden = true;
+    });
+  }
+  for (const overlay of document.querySelectorAll('.overlay')) {
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) overlay.hidden = true;
+    });
+  }
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      closeElementMenu();
+      for (const overlay of document.querySelectorAll('.overlay')) overlay.hidden = true;
+    }
+
+    /*
+      Project shortcuts (New / Open / Save / Save As) are owned by the native
+      application menu, which registers the accelerators with the OS. Handling
+      them here as well would run each one twice — and two open dialogs for a
+      single keypress is very visible. One authority, in the menu.
+    */
+    if (state.step !== 'slides') return;
+    const target = event.target;
+    if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+
+    if ((event.key === 'Backspace' || event.key === 'Delete') && state.selectedElementId) {
+      event.preventDefault();
+      deleteElement(state.selectedElementId);
+    }
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      const { element } = state.selectedElementId
+        ? findElement(state.selectedElementId)
+        : { element: null };
+      if (!element) return;
+      event.preventDefault();
+      const step = event.shiftKey ? 10 : 1;
+      if (event.key === 'ArrowLeft') element.x -= step;
+      if (event.key === 'ArrowRight') element.x += step;
+      if (event.key === 'ArrowUp') element.y -= step;
+      if (event.key === 'ArrowDown') element.y += step;
+      clampElementInPlace(element);
+      persistDeck();
+      refreshCanvas();
+    }
+  });
+
+  $('btnRecheck').addEventListener('click', recheckTools);
+}
+
+function goToStep(step) {
+  const next =
+    step === 'finish' ? 'finish' :
+    step === 'testing' ? 'testing' :
+    step === 'projects' ? 'projects' : 'slides';
+
+  // Leaving the player stops whatever it was playing; a film carrying on out of
+  // sight somewhere behind another page is not something to leave lying around.
+  if (state.step === 'testing' && next !== 'testing') closeSimulator();
+
+  state.step = next;
+  state.banner = null;
+  document.body.classList.toggle('wide-stage', state.step !== 'finish');
+  render();
+}
+
+function clampElementInPlace(element) {
+  const w = element.width;
+  const h = element.height;
+  const maxBottom = element.kind === 'video' ? 396 : (RASTER.height - SAFE_MARGIN);
+  element.x = Math.min(Math.max(SAFE_MARGIN, Math.round(element.x)), RASTER.width - SAFE_MARGIN - w);
+  element.y = Math.min(Math.max(SAFE_MARGIN, Math.round(element.y)), maxBottom - h);
+}
+
+/** The project the pipeline executes. */
+function projectPayload() {
+  return {
+    discTitle: state.discTitle || state.deck.discTitle || 'My DVD',
+    // The two settings that used to be questions. They are constants now.
+    audioMode: DISC_DEFAULTS.audioMode,
+    chaptersEnabled: DISC_DEFAULTS.chaptersEnabled,
+    chapterMinutes: DISC_DEFAULTS.chapterMinutes,
+    deck: state.deck,
+    videos: state.videos.map((v) => ({
+      id: v.id,
+      path: v.path,
+      name: v.name,
+      menuLabel: v.menuLabel,
+      duration: v.duration,
+    })),
+  };
+}
+
+function bindMenuEvents() {
+  document.addEventListener('click', (event) => {
+    // Any click that is not inside the menu dismisses it, the way every
+    // right-click menu behaves.
+    if (!(event.target.closest && event.target.closest('.context-menu'))) {
+      closeElementMenu();
+    }
+
+    const target = event.target.closest('button');
+    if (!target) return;
+    if (target.id === 'btnBuild') runBuild();
+    else if (target.id === 'btnBurn') runBurn();
+    else if (target.id === 'btnSaveImage') runSaveImage();
+    else if (target.id === 'btnSaveFolder') runSaveFolder();
+  });
+
+  // Menu bar commands.
+  api.onMenuEvent('menu:new-project', () => {
+    closeProjectToHome();
+  });
+  api.onMenuEvent('menu:open-project', () => openProjectDialog());
+  api.onMenuEvent('menu:save-project', () => saveCurrentProject(true));
+  api.onMenuEvent('menu:save-project-as', () => saveProjectAs());
+  api.onMenuEvent('menu:close-project', () => closeProjectToHome());
+  api.onMenuEvent('menu:setup', () => openSetup());
+  api.onMenuEvent('menu:help', () => openHelp());
+  api.onMenuEvent('menu:share', () => openShare());
+  api.onMenuEvent('menu:add-videos', () => promptForVideos());
+  api.onMenuEvent('menu:step', (step) => goToStep(step));
+  api.onMenuEvent('menu:log', () => {
+    $('jobbar').hidden = false;
+    $('log').hidden = false;
+  });
+  api.onMenuEvent('menu:build-image', () => runSaveImage());
+  api.onMenuEvent('menu:burn', () => runBurn());
+  api.onMenuEvent('menu:reveal-work', async () => {
+    if (state.lastBuild) await api.files.reveal(state.lastBuild.videoTsDir);
+    else await api.files.open((state.settings && state.settings.workDir) || '');
+  });
+}
+
+async function promptForVideos() {
+  try {
+    const result = await api.files.addVideos();
+    if (result.canceled) return;
+    await addVideoPaths(result.files);
+  } catch (err) {
+    setBanner('error', 'Could not open the file chooser', String(err.message || err));
+    render();
+  }
+}
+
+async function refreshDrives() {
+  try {
+    const result = await api.drives.list();
+    state.drives = result.drives || [];
+    state.driveSupported = result.supported !== false;
+    state.driveNote = result.note || null;
+    if (state.selectedDevice && !state.drives.some((d) => d.device === state.selectedDevice)) {
+      state.selectedDevice = state.drives.length ? state.drives[0].device : null;
+    }
+    if (!state.selectedDevice && state.drives.length) state.selectedDevice = state.drives[0].device;
+    if (state.step === 'finish') render();
+  } catch (err) {
+    state.drives = [];
+    state.driveSupported = false;
+    state.driveNote = String(err.message || err);
+  }
+}
+
+// ------------------------------------------------------------------ jobs ---
+
+function bindJobEvents() {
+  api.job.onState((status) => {
+    state.busy = Boolean(status.busy);
+    const bar = $('jobbar');
+    const label = $('jobLabel');
+    const progress = $('jobProgress');
+    const percent = $('jobPercent');
+    const cancel = $('btnCancel');
+
+    if (status.busy) {
+      bar.hidden = false;
+      label.textContent = status.message || 'Working\u2026';
+      const fraction = typeof status.fraction === 'number' ? status.fraction : 0;
+      const indeterminate = ['author', 'menu', 'inspect', 'starting'].includes(status.stage);
+      progress.classList.toggle('indeterminate', indeterminate);
+      if (!indeterminate) progress.style.width = `${Math.round(fraction * 100)}%`;
+      percent.textContent = indeterminate ? '' : `${Math.round(fraction * 100)}%`;
+      cancel.disabled = false;
+    } else {
+      cancel.disabled = true;
+      if (status.finished === 'cancelled') label.textContent = 'Stopped.';
+      else if (status.finished === 'ok') {
+        label.textContent = 'Finished.';
+        progress.classList.remove('indeterminate');
+        progress.style.width = '100%';
+        percent.textContent = '100%';
+        setTimeout(() => {
+          if (!state.busy) $('jobbar').hidden = true;
+        }, 2600);
+      }
+    }
+
+    if (status.log) {
+      const log = $('log');
+      log.textContent = status.log.join('\n');
+      log.scrollTop = log.scrollHeight;
+    }
+    renderChrome();
+    if (state.step === 'finish') render();
+  });
+
+  api.job.onLog((line) => {
+    const log = $('log');
+    log.textContent += `${log.textContent ? '\n' : ''}${line}`;
+    log.scrollTop = log.scrollHeight;
+  });
+}
+
+async function runBuild() {
+  setBanner(null);
+  try {
+    const result = await api.job.build({ project: projectPayload() });
+    state.lastBuild = result;
+    setBanner('good', 'The disc is built', [
+      `${result.videoCount} ${result.videoCount === 1 ? 'video' : 'videos'}, ` +
+        `${result.slideCount} ${result.slideCount === 1 ? 'menu page' : 'menu pages'}, ` +
+        `${formatDuration(result.totalSeconds)}.`,
+      result.failed && result.failed.length
+        ? `${result.failed.length} could not be prepared and were left off.`
+        : 'Put in a blank disc and press Burn when you are ready.',
+    ]);
+  } catch (err) {
+    if (err.aborted) setBanner('info', 'Stopped', 'Nothing was written to a disc.');
+    else setBanner('error', 'The disc could not be built', String(err.message || err));
+  }
+  render();
+}
+
+async function runBurn() {
+  if (!state.lastBuild) {
+    await runBuild();
+    if (!state.lastBuild) return;
+  }
+  setBanner(null);
+  try {
+    await api.job.burn({ device: state.selectedDevice });
+    setBanner('good', 'The disc was written successfully', [
+      'The disc has been checked and is ready to use.',
+      'Take it out and try it in a DVD player.',
+    ]);
+    $('jobbar').hidden = false;
+  } catch (err) {
+    if (err.aborted) setBanner('info', 'Stopped', 'The disc in the drive may not be usable. Use a fresh one.');
+    else setBanner('error', 'The disc could not be written', String(err.message || err));
+  }
+  refreshDrives();
+  render();
+}
+
+async function runSaveImage() {
+  try {
+    const label = state.lastBuild ? state.lastBuild.volumeLabel : 'MY_DVD';
+    const chosen = await api.files.saveImage(label);
+    if (chosen.canceled) return;
+    setBanner(null);
+    const result = await api.job.image({ path: chosen.path });
+    setBanner('good', 'The disc image was saved', [
+      `${result.isoPath} (${formatBytes(result.sizeBytes)})`,
+      'You can burn this later, or keep it as a backup.',
+    ]);
+    render();
+  } catch (err) {
+    if (!err.aborted) setBanner('error', 'The disc image could not be saved', String(err.message || err));
+    render();
+  }
+}
+
+async function runSaveFolder() {
+  try {
+    const chosen = await api.files.pickFolder({
+      title: 'Where should the disc files go?',
+      buttonLabel: 'Save Here',
+    });
+    if (chosen.canceled) return;
+    setBanner(null);
+    await api.job.saveFolder({ path: chosen.path });
+    setBanner('good', 'The disc files were saved', [
+      chosen.path,
+      'This folder holds a VIDEO_TS directory, which is the DVD itself.',
+    ]);
+    render();
+  } catch (err) {
+    setBanner('error', 'The disc files could not be saved', String(err.message || err));
+    render();
+  }
+}
+
+// --------------------------------------------------------------- dialogs ---
+
+async function openSetup() {
+  $('setupOverlay').hidden = false;
+  $('setupBody').replaceChildren(el('p', { class: 'dim', text: 'Checking\u2026' }));
+  await renderSetupDialog();
+}
+
+async function renderSetupDialog() {
+  const body = $('setupBody');
+  body.replaceChildren();
+
+  let detected = null;
+  try {
+    detected = await api.tools.detect();
+    state.tools = detected.tools;
+  } catch (err) {
+    body.append(buildBanner({ kind: 'error', title: 'Could not check', body: String(err.message || err) }));
+    return;
+  }
+
+  const { tools, versions, workDir } = detected;
+  const rows = [
+    ['Video conversion', tools.ffmpeg, versions.ffmpeg, true],
+    ['Video reading', tools.ffprobe, versions.ffprobe, true],
+    ['Disc building', tools.dvdauthor, versions.dvdauthor, true],
+    ['Menu buttons', tools.spumux, versions.spumux, true],
+    ['Disc writing (macOS)', tools.hdiutil, versions.hdiutil, false],
+  ];
+
+  const table = el('table', { class: 'diag-table' });
+  table.append(el('tr', {}, [el('th', { text: 'Part' }), el('th', { text: 'Status' }), el('th', { text: 'Location' })]));
+  for (const [label, path, version, required] of rows) {
+    table.append(
+      el('tr', {}, [
+        el('td', {}, [
+          el('div', { text: label }),
+          el('div', { class: 'dim', style: 'font-size:11px', text: version || (path ? '' : 'not found') }),
+        ]),
+        el('td', {
+          class: path ? 'diag-ok' : required ? 'diag-bad' : 'dim',
+          text: path ? 'Ready' : required ? 'Missing' : 'Not needed here',
+        }),
+        el('td', { class: 'path-cell', text: path || '\u2014' }),
+      ])
+    );
+  }
+
+  body.append(
+    el('div', { class: 'stats', style: 'margin-bottom: 16px' }, [
+      el('div', { class: 'stat' }, [
+        el('span', { class: 'stat-key', text: 'This computer' }),
+        el('span', { class: 'stat-value', text: `${tools.platform} ${tools.arch}` }),
+      ]),
+      el('div', { class: 'stat' }, [
+        el('span', { class: 'stat-key', text: 'Working folder' }),
+        el('span', { class: 'stat-value mono', text: workDir }),
+      ]),
+    ]),
+    table
+  );
+
+  /*
+    Say exactly what is missing and how to get it.
+
+    This used to tell Windows users the tools "cannot be installed", which is
+    wrong: they exist, they are just not in any Windows package manager. Burning
+    needs nothing installed on any platform — Windows writes discs through its
+    own IMAPI2 — so the only gap is the disc-building program, and that is worth
+    naming precisely rather than blaming the operating system.
+  */
+  if (!tools.canAuthor) {
+    const missing = !tools.ffmpeg ? 'ffmpeg' : 'dvdauthor';
+    const how = tools.platform === 'darwin'
+      ? 'Open Terminal and run:  brew install ffmpeg dvdauthor'
+      : 'dvdauthor has no Windows package, so it has to come from a program that ships it: ' +
+        '"GUI for dvdauthor" and DVD Styler both include dvdauthor.exe and spumux.exe. ' +
+        'Copy those two files into ' +
+        '%LOCALAPPDATA%\\Burnhouse\\bin, or leave them in that program\'s folder and ' +
+        'press Check Again.';
+
+    body.append(
+      el('div', { style: 'margin-top: 18px' }, [
+        buildBanner({
+          kind: 'info',
+          title: `Missing: ${missing}`,
+          body: how,
+        }),
+      ])
+    );
+  }
+
+  if (tools.canAuthor && !tools.canBurn) {
+    body.append(
+      el('div', { style: 'margin-top: 18px' }, [
+        buildBanner({
+          kind: 'info',
+          title: 'This computer cannot write discs',
+          body:
+            'The disc can be built and tested here, then the folder or image copied to a ' +
+            'computer with a disc writer.',
+        }),
+      ])
+    );
+  }
+
+  body.append(
+    el('div', { class: 'btn-row', style: 'margin-top: 16px' }, [
+      el('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: 'Change Working Folder\u2026',
+        onclick: async () => {
+          const chosen = await api.files.pickFolder({ title: 'Where should Burnhouse keep its working files?' });
+          if (chosen.canceled) return;
+          await api.settings.set({ workDir: chosen.path });
+          state.settings = await api.settings.get();
+          renderSetupDialog();
+        },
+      }),
+      el('button', {
+        class: 'btn btn-small btn-quiet',
+        type: 'button',
+        text: 'Open Working Folder',
+        onclick: () => api.files.open(workDir).catch(() => {}),
+      }),
+    ])
+  );
+}
+
+async function recheckTools() {
+  $('setupBody').replaceChildren(el('p', { class: 'dim', text: 'Checking\u2026' }));
+  await renderSetupDialog();
+  updateBrandTag();
+  render();
+}
+
+async function openShare() {
+  $('shareOverlay').hidden = false;
+  const body = $('shareBody');
+  body.replaceChildren(el('p', { class: 'dim', text: 'Starting\u2026' }));
+
+  try {
+    const info = await api.server.start({});
+    body.replaceChildren();
+    body.append(
+      buildBanner({
+        kind: 'info',
+        title: 'Sharing is on',
+        body: 'Another computer on this network can send videos here and download the app.',
+      })
+    );
+
+    const rows = el('div', { class: 'stats' });
+    for (const address of info.addresses || []) {
+      rows.append(
+        el('div', { class: 'stat' }, [
+          el('span', { class: 'stat-key', text: address.label || 'Address' }),
+          el('span', { class: 'stat-value mono', text: address.url }),
+        ])
+      );
+    }
+    body.append(rows);
+
+    body.append(el('div', { class: 'rule', text: 'Ready to download' }));
+    if (info.downloads && info.downloads.length) {
+      body.append(
+        el('ul', { class: 'checklist' }, info.downloads.map((d) =>
+          el('li', { text: `${d.name} (${formatBytes(d.sizeBytes)})` })
+        ))
+      );
+    } else {
+      body.append(
+        el('p', {
+          class: 'hint',
+          text: 'No built app was found yet. Once the Mac build finishes, the .dmg appears here.',
+        })
+      );
+    }
+
+    body.append(
+      el('div', { class: 'btn-row', style: 'margin-top: 16px' }, [
+        el('button', {
+          class: 'btn btn-small btn-danger',
+          type: 'button',
+          text: 'Turn Sharing Off',
+          onclick: async () => {
+            await api.server.stop();
+            body.replaceChildren(el('p', { class: 'dim', text: 'Sharing is off.' }));
+          },
+        }),
+      ])
+    );
+  } catch (err) {
+    body.replaceChildren(
+      buildBanner({ kind: 'error', title: 'Sharing could not start', body: String(err.message || err) })
+    );
+  }
+}
+
+function openHelp() {
+  $('helpOverlay').hidden = false;
+  $('helpBody').replaceChildren(
+    el('h2', { text: 'Three steps' }),
+    el('ol', { class: 'checklist', style: 'margin-bottom: 18px' }, [
+      el('li', { text: 'Open the Videos tab and add your videos. They appear on the menu slide straight away.' }),
+      el('li', { text: 'Arrange the slides. The first one is the menu; the rest are yours to fill.' }),
+      el('li', { text: 'Press Finish, put a blank DVD-R in the burner, and press Burn.' }),
+    ]),
+    el('h2', { text: 'What a slide is' }),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 18px',
+      text:
+        'A slide is one page of the disc menu \u2014 what appears on screen when the ' +
+        'disc starts. Make as many as you like. Add one with "Add blank slide", or ' +
+        'press "Add menu slide" for a page that lists every video.',
+    }),
+    el('h2', { text: 'Putting a video on a slide' }),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 18px',
+      text:
+        'Open the Videos tab on the right, then drag a video from that list onto a ' +
+        'slide. That puts a tile showing the video itself, with its name and ' +
+        'length \u2014 sized to fit, in the video\u2019s own shape. Choosing it on the ' +
+        'disc plays the video. Drop it on the slide list on the left instead and ' +
+        'it makes a whole new slide for that video.',
+    }),
+    el('h2', { text: 'Moving things around' }),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 18px',
+      text:
+        'Drag anything on the slide to move it, or use the arrow keys. Click it once and ' +
+        'little square handles appear on its edges and corners \u2014 drag those to make it ' +
+        'bigger or smaller. Videos and pictures keep their shape while you do, so nothing ' +
+        'gets stretched; hold Shift if you really do want to stretch one. Nothing can be ' +
+        'dragged outside the safe area, because some televisions crop the edge of the picture.',
+    }),
+    el('h2', { text: 'Right-clicking' }),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 18px',
+      text:
+        'Right-click anything on a slide for a menu: delete it, duplicate it, put it in ' +
+        'front of or behind the other things, swap a video between filling the frame and ' +
+        'showing the whole picture, or put it back to its automatic size. Right-clicking ' +
+        'empty space offers to add something new.',
+    }),
+    el('h2', { text: 'Checking it before you burn' }),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 18px',
+      text:
+        'Step 2, Testing, plays the disc through a pretend DVD player. The menus, the ' +
+        'button positions and the arrow-key movement are the disc\u2019s own, so the ' +
+        'highlight moves exactly where your remote will move it. Arrow keys move, Enter ' +
+        'chooses, Menu goes back, Escape returns to the slides. The film plays your ' +
+        'original file, so the burned copy will look the same but a little softer.',
+    }),
+    el('h2', { text: 'If something goes wrong' }),
+    el('ul', { class: 'checklist', style: 'margin-bottom: 18px' }, [
+      el('li', { text: 'The disc will not play: use a fresh DVD-R, and keep the burner plugged in.' }),
+      el('li', { text: 'A video was left off: it may be damaged, or in a format that cannot be read.' }),
+      el('li', { text: 'Anything else: press Details at the bottom to see exactly what happened.' }),
+    ]),
+    el('h2', { text: 'Your videos are never changed' }),
+    el('p', {
+      class: 'hint',
+      text:
+        'Burnhouse only ever reads your original files. Everything it makes goes in ' +
+        'its own folder, so nothing you already have can be altered or lost.',
+    })
+  );
+}
+
+// ------------------------------------------------------------ canvas input ---
+
+function bindCanvas() {
+  // Bound once, on the document, because the canvas is recreated on each
+  // render. Handlers check whether the event is on the canvas.
+  let drag = null;
+
+  document.addEventListener('pointerdown', (event) => {
+    const canvas = event.target.closest && event.target.closest('#slideCanvas');
+    if (!canvas) return;
+    if (event.button === 2) return; // right-click is the context menu's job
+    const layout = activeSlideLayout();
+    if (!layout) return;
+
+    closeElementMenu();
+
+    const point = canvasPoint(event);
+
+    /*
+      A handle wins over whatever is underneath it.
+
+      The handles sit on the element's own border, so without this a press on a
+      corner would be read as a press on the element and would start a move
+      instead of a resize.
+    */
+    const current = state.selectedElementId
+      ? layout.elements.find((e) => e.id === state.selectedElementId)
+      : null;
+    if (current && !current.generated) {
+      const handle = handleAt(current.box, point);
+      if (handle) {
+        drag = {
+          mode: 'resize',
+          handle,
+          id: current.id,
+          startX: point.x,
+          startY: point.y,
+          origin: {
+            x: current.x,
+            y: current.y,
+            width: current.width,
+            height: current.height,
+          },
+          lockShape: SHAPE_LOCKED_KINDS.has(current.kind),
+          moved: false,
+        };
+        canvas.setPointerCapture(event.pointerId);
+        drawCanvas();
+        return;
+      }
+    }
+
+    const hit = hitTest(layout, point);
+    state.selectedElementId = hit ? hit.id : null;
+    renderInspector();
+
+    if (hit && !hit.generated) {
+      drag = {
+        mode: 'move',
+        id: hit.id,
+        startX: point.x,
+        startY: point.y,
+        originX: hit.x,
+        originY: hit.y,
+        moved: false,
+      };
+      canvas.setPointerCapture(event.pointerId);
+      drawCanvas();
+    } else {
+      drawCanvas();
+    }
+  });
+
+  document.addEventListener('pointermove', (event) => {
+    if (!drag) {
+      // Show the resize cursor before the press, so the border reads as grabbable.
+      const canvas = event.target.closest && event.target.closest('#slideCanvas');
+      if (!canvas) return;
+      const current = state.selectedElementId
+        ? (activeSlideLayout() || { elements: [] }).elements.find(
+            (e) => e.id === state.selectedElementId
+          )
+        : null;
+      const handle = current && !current.generated ? handleAt(current.box, canvasPoint(event)) : null;
+      canvas.style.cursor = handle ? HANDLE_CURSORS[handle] : 'default';
+      return;
+    }
+    const canvas = $('slideCanvas');
+    if (!canvas) return;
+    const point = canvasPoint(event);
+    const dx = point.x - drag.startX;
+    const dy = point.y - drag.startY;
+    if (!drag.moved && Math.abs(dx) < 2 && Math.abs(dy) < 2) return;
+    drag.moved = true;
+
+    const { element } = findElement(drag.id);
+    if (!element) return;
+
+    // The laid-out slide, for the things there are to line up with. Only the
+    // element being dragged moves during a drag, and it is excluded by id, so
+    // the other boxes stay good even as the layout is refreshed.
+    const layout = activeSlideLayout();
+
+    if (drag.mode === 'resize') {
+      // Shift frees the shape, for the rare case she wants it stretched.
+      const lock = drag.lockShape && !event.shiftKey;
+      const box = resizeBox(drag.handle, drag.origin, dx, dy, lock);
+      element.x = box.x;
+      element.y = box.y;
+      element.width = box.width;
+      element.height = box.height;
+      // A text box that has been sized by hand keeps that size, rather than
+      // snapping back to however tall its words happen to be. This is what makes
+      // its background box usable as a panel.
+      if (element.kind === 'text') element.autoHeight = false;
+      clampElementInPlace(element);
+      state.snapGuides = [];
+    } else if (layout) {
+      // Line it up with the safe area and with everything else on the slide.
+      const snapped = snapBox(
+        {
+          x: drag.originX + dx,
+          y: drag.originY + dy,
+          width: element.width,
+          height: element.height,
+        },
+        layout,
+        element.id,
+        element.kind
+      );
+      element.x = snapped.x;
+      element.y = snapped.y;
+      state.snapGuides = snapped.guides;
+      clampElementInPlace(element);
+    } else {
+      element.x = drag.originX + dx;
+      element.y = drag.originY + dy;
+      clampElementInPlace(element);
+    }
+
+    // A real layout, once a frame, so what is on screen is the element where it
+    // actually is — including the caption and play mark a video tile re-derives
+    // from its new size.
+    redrawDuringDrag();
+  });
+
+  document.addEventListener('pointerup', () => {
+    if (!drag) return;
+    if (drag.moved) {
+      // A full refresh now, so the filmstrip and the inspector numbers catch up.
+      persistDeck();
+      refreshCanvas();
+      // The guides are part of the drag, not of the slide.
+      state.snapGuides = [];
+      drawCanvas();
+    }
+    drag = null;
+  });
+
+  /*
+    Double-clicking an element to change its words.
+
+    Nobody expects to have to find the panel and then find the right field in it
+    to type into something they can see. Double-clicking is what everybody tries
+    first, so it puts the caret in the field for them.
+  */
+  document.addEventListener('dblclick', (event) => {
+    const canvas = event.target.closest && event.target.closest('#slideCanvas');
+    if (!canvas) return;
+    const layout = activeSlideLayout();
+    if (!layout) return;
+
+    const hit = hitTest(layout, canvasPoint(event));
+    if (!hit) return;
+
+    state.selectedElementId = hit.id;
+    renderInspector();
+    drawCanvas();
+
+    if (hit.kind === 'text') focusInspectorField('text');
+    else if (hit.kind === 'button') focusInspectorField('label');
+  });
+
+  /*
+    Right-click an element for the things she would otherwise have to hunt for.
+    Anything that can be done to the thing under the pointer is here, including
+    the one operation everybody expects and no menu ever shows: deleting it.
+  */
+  document.addEventListener('contextmenu', (event) => {
+    const canvas = event.target.closest && event.target.closest('#slideCanvas');
+    if (!canvas) return;
+    const layout = activeSlideLayout();
+    if (!layout) return;
+
+    event.preventDefault();
+    const point = canvasPoint(event);
+    const hit = hitTest(layout, point);
+
+    if (hit) {
+      state.selectedElementId = hit.id;
+      renderInspector();
+      drawCanvas();
+      openElementMenu(event, hit, layout);
+    } else {
+      state.selectedElementId = null;
+      renderInspector();
+      drawCanvas();
+      openCanvasMenu(event);
+    }
+  });
+
+  /*
+    Single unified drop router for the whole window.
+  */
+  window.addEventListener('dragover', (event) => {
+    // A slide being reordered is not a file arriving. Styling it as one, and
+    // offering a "copy" cursor for a move, would both be wrong.
+    if (hasSlideDrag(event)) {
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+      return;
+    }
+    event.preventDefault();
+    if (!hasVideoDrag(event)) {
+      document.body.classList.add('dropping-files');
+    }
+    event.dataTransfer.dropEffect = 'copy';
+  });
+
+  window.addEventListener('dragleave', (event) => {
+    if (event.relatedTarget) return;
+    document.body.classList.remove('dropping-files');
+  });
+
+  window.addEventListener('drop', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    document.body.classList.remove('dropping-files');
+
+    const overFilmstrip = event.target.closest && event.target.closest('.editor-filmstrip');
+
+    // Case 1: Dragging a video from the Videos tab inside the app
+    const videoId = dragVideoId(event);
+    if (videoId) {
+      const video = state.videos.find((v) => v.id === videoId);
+      if (!video) return;
+
+      if (overFilmstrip) {
+        dropVideoOnFilmstrip(video);
+      } else {
+        dropVideoOnCanvas(video);
+      }
+      return;
+    }
+
+    // Case 2: Dragging video files from Finder or Windows Explorer
+    const files = Array.from((event.dataTransfer && event.dataTransfer.files) || []);
+    if (!files.length) return;
+
+    if (overFilmstrip) {
+      importFilesOntoFilmstrip(files);
+    } else {
+      importFilesOntoSlide(files);
+    }
+  });
+}
+
+/**
+ * The id of the video being dragged, or null.
+ */
+function dragVideoId(event) {
+  if (!event.dataTransfer) return null;
+  return event.dataTransfer.getData('application/x-burnhouse-video') || null;
+}
+
+// ------------------------------------------------------------ context menu ---
+
+/** Close any open right-click menu. Cheap enough to call defensively. */
+function closeElementMenu() {
+  for (const node of document.querySelectorAll('.context-menu')) node.remove();
+}
+
+/** Place a menu at the pointer, nudged so it never hangs off the window. */
+function placeMenu(menu, event) {
+  document.body.append(menu);
+  const rect = menu.getBoundingClientRect();
+  const margin = 8;
+  const x = Math.min(event.clientX, window.innerWidth - rect.width - margin);
+  const y = Math.min(event.clientY, window.innerHeight - rect.height - margin);
+  menu.style.left = `${Math.max(margin, x)}px`;
+  menu.style.top = `${Math.max(margin, y)}px`;
+  const first = menu.querySelector('.context-item:not(:disabled)');
+  if (first) first.focus();
+}
+
+function buildContextMenu(entries) {
+  const menu = el('div', { class: 'context-menu', role: 'menu' });
+  for (const entry of entries) {
+    if (entry.separator) {
+      menu.append(el('div', { class: 'context-sep' }));
+      continue;
+    }
+    const button = el('button', {
+      class: `context-item${entry.danger ? ' context-danger' : ''}`,
+      type: 'button',
+      role: 'menuitem',
+      text: entry.label,
+      disabled: Boolean(entry.disabled),
+      onclick: () => {
+        closeElementMenu();
+        entry.action();
+      },
+    });
+    if (entry.hint) button.append(el('span', { class: 'context-hint', text: entry.hint }));
+    menu.append(button);
+  }
+  return menu;
+}
+
+/**
+ * What can be done to the element that was right-clicked.
+ *
+ * Everything here is also reachable some other way, but this is where a person
+ * looks first — and deleting is the one nobody can find otherwise.
+ */
+function openElementMenu(event, element, layout) {
+  closeElementMenu();
+
+  const { slide } = findElement(element.id);
+  const entries = [];
+
+  if (element.kind === 'text') {
+    entries.push({
+      label: 'Edit the words',
+      action: () => {
+        if (!focusInspectorField('text')) openInspectorTextPrompt(element.id);
+      },
+    });
+  } else if (element.kind === 'button') {
+    entries.push({
+      label: 'Edit the words',
+      action: () => {
+        if (!focusInspectorField('label')) openInspectorTextPrompt(element.id);
+      },
+    });
+  }
+
+  if (element.kind === 'video' || element.kind === 'image') {
+    const isFill = element.fit === 'fill';
+    entries.push({
+      label: isFill ? 'Show the whole picture' : 'Fill the frame',
+      hint: isFill ? '' : 'may crop',
+      action: () => {
+        updateElement(element.id, { fit: isFill ? 'fit' : 'fill' });
+      },
+    });
+    entries.push({
+      label: 'Fit to the slide again',
+      action: () => refitElement(element.id),
+    });
+  }
+
+  if (element.videoId) {
+    const video = state.videos.find((v) => v.id === element.videoId);
+    if (video) {
+      entries.push({
+        label: 'Preview on the DVD player',
+        action: async () => {
+          // Starts that film, then shows the Testing step, which is where the
+          // player lives.
+          await openSimulator({ startTitleVideoId: video.id });
+        },
+      });
+    }
+  }
+
+  if (entries.length) entries.push({ separator: true });
+
+  entries.push(
+    {
+      label: 'Duplicate',
+      action: () => duplicateElement(element.id),
+    },
+    {
+      label: 'Bring to the front',
+      action: () => reorderElement(element.id, 'front'),
+    },
+    {
+      label: 'Send to the back',
+      action: () => reorderElement(element.id, 'back'),
+    }
+  );
+
+  entries.push({ separator: true });
+
+  if (element.generated) {
+    entries.push({
+      label: element.generated === 'back' ? 'Remove the Back button' : 'Remove the Next button',
+      disabled: true,
+      hint: 'placed automatically',
+      action: () => {},
+    });
+  } else {
+    entries.push({
+      label: 'Delete',
+      danger: true,
+      hint: 'Del',
+      action: () => deleteElement(element.id),
+    });
+  }
+
+  void layout;
+  void slide;
+  placeMenu(buildContextMenu(entries), event);
+}
+
+/** Right-clicking bare canvas: put something new here. */
+function openCanvasMenu(event) {
+  closeElementMenu();
+  placeMenu(
+    buildContextMenu([
+      { label: 'Add a text box', action: () => addElement('text', { x: 120, y: 160 }) },
+      { label: 'Add a picture\u2026', action: () => pickPicture() },
+      { label: 'Add a panel', action: () => addElement('frame', { x: 140, y: 150 }) },
+      { separator: true },
+      { label: 'Add a blank slide', action: () => addSlide({ title: 'New slide' }) },
+      {
+        label: 'Test the disc on the DVD player',
+        action: () => goToStep('testing'),
+      },
+    ]),
+    event
+  );
+}
+
+/**
+ * Right-clicking a slide in the list.
+ *
+ * The same idea as the element menu, for the other thing on screen. Deleting a
+ * slide had no home at all before this: it could only be reached by selecting
+ * the slide and finding a button somewhere else, which is not where anybody
+ * looks for "get rid of this one".
+ *
+ * Moving a slide lives here too, because the order is not cosmetic — it decides
+ * which menu page is which and which film plays after which.
+ */
+function openSlideMenu(event, slide) {
+  closeElementMenu();
+
+  const index = state.deck.slides.findIndex((s) => s.id === slide.id);
+  const entries = [
+    {
+      label: 'Rename',
+      action: () => {
+        if (!focusInspectorField('slide-title')) openInspectorTextPrompt(slide.id);
+      },
+    },
+    { label: 'Duplicate', action: () => duplicateSlide(slide.id) },
+    { separator: true },
+    {
+      label: 'Move up',
+      disabled: index <= 0,
+      action: () => moveSlide(slide.id, -1),
+    },
+    {
+      label: 'Move down',
+      disabled: index === state.deck.slides.length - 1,
+      action: () => moveSlide(slide.id, 1),
+    },
+    {
+      label: 'Add a blank slide after',
+      action: () => addSlide({ at: index + 1 }),
+    },
+    { separator: true },
+    {
+      label: 'Delete this slide',
+      danger: true,
+      disabled: state.deck.slides.length <= 1,
+      hint: state.deck.slides.length <= 1 ? 'the last one' : '',
+      action: () => deleteSlide(slide.id),
+    },
+  ];
+
+  placeMenu(buildContextMenu(entries), event);
+}
+
+/** Put a copy of an element on the same slide, offset so it is visibly a copy. */
+function duplicateElement(elementId) {
+  const { slide, element } = findElement(elementId);
+  if (!slide || !element) return;
+  const copy = JSON.parse(JSON.stringify(element));
+  copy.id = newId(element.kind);
+  copy.x = element.x + 16;
+  copy.y = element.y + 16;
+  copy.generated = undefined;
+  slide.elements.push(copy);
+  clampElementInPlace(copy);
+  state.selectedElementId = copy.id;
+  persistDeck();
+  render();
+}
+
+/**
+ * Move an element in front of everything else on its slide, or behind it.
+ *
+ * This changes the element's priority rather than only its place in the array,
+ * because priority is what decides stacking now. The array is reordered as well
+ * so that elements which share a priority keep a stable order between them.
+ */
+function reorderElement(elementId, where) {
+  const { slide, element } = findElement(elementId);
+  if (!slide) return;
+
+  const others = slide.elements.filter((e) => e.id !== elementId);
+  const priorities = others.map((e) => Number(e.priority) || 0);
+
+  // Lower is nearer the front, so coming forward means going below everything
+  // else and going back means going above it.
+  if (priorities.length) {
+    element.priority =
+      where === 'front' ? Math.min(...priorities) - 1 : Math.max(...priorities) + 1;
+  }
+
+  slide.elements = others;
+  if (where === 'front') slide.elements.push(element);
+  else slide.elements.unshift(element);
+
+  persistDeck();
+  render();
+}
+
+/** Give a video tile or picture its automatic size and place back. */
+function refitElement(elementId) {
+  const { element } = findElement(elementId);
+  if (!element) return;
+
+  if (element.kind === 'video') {
+    const video = state.videos.find((v) => v.id === element.videoId);
+    const geom = fitTileToSlide(video || { probe: null });
+    Object.assign(element, geom, { fit: 'fill' });
+  } else if (element.kind === 'image') {
+    // A picture keeps its own shape; only its footprint is reset.
+    const width = RASTER.width - SAFE_MARGIN * 2;
+    const box = resizeBox('se', { x: 0, y: 0, width, height: width }, 0, 0, true);
+    element.width = width;
+    element.height = Math.max(MIN_ELEMENT_HEIGHT, Math.round(box.height));
+    element.x = SAFE_MARGIN;
+    element.y = SAFE_MARGIN;
+    element.fit = 'fit';
+  } else {
+    return;
+  }
+
+  clampElementInPlace(element);
+  persistDeck();
+  render();
+}
+
+/** Fallback for editing text when the inspector has nothing to focus. */
+function openInspectorTextPrompt(elementId) {
+  const { element } = findElement(elementId);
+  if (!element) return;
+  const next = window.prompt('The words on this slide:', element.text || '');
+  if (next === null) return;
+  updateElement(elementId, { text: next, edited: true });
+}
+
+// ---------------------------------------------------------- dvd simulator ---
+
+/**
+ * The simulator's state. One object, so the whole of the pretend player can be
+ * reasoned about at once.
+ */
+const sim = {
+  open: false,
+  model: null,
+  /** 'menu' or 'title' — the two domains a real player switches between. */
+  domain: 'menu',
+  page: 1,
+  title: null,
+  focus: null,
+  /** Which menu page the Menu key returns to. */
+  rootPage: 1,
+  showsHighlight: true,
+  message: null,
+  messageUntil: 0,
+};
+
+/**
+ * The keys the pretend player answers to.
+ *
+ * Chosen so every one of them exists on both a Mac and a Windows keyboard, and
+ * so none of them needs a modifier — a laptop with no numeric keypad still has
+ * all of these. Digits pick a title directly, which is what a real remote's
+ * number buttons do.
+ */
+const SIM_KEY_LEGEND = [
+  { keys: '\u2190 \u2191 \u2193 \u2192', what: 'move' },
+  { keys: 'Enter', what: 'choose' },
+  { keys: 'M', what: 'menu' },
+  { keys: 'Backspace', what: 'back' },
+  { keys: 'Space', what: 'play / pause' },
+  { keys: '1\u20139', what: 'title' },
+  { keys: ', .', what: 'previous / next' },
+  { keys: 'S', what: 'stop' },
+  { keys: 'Esc', what: 'exit' },
+];
+
+/** Back to the previous menu page, the way a remote's Return does. */
+function simulateBack() {
+  if (!sim.model || !sim.model.menus.length) return;
+  if (sim.domain === 'title') {
+    simulateMenuKey();
+    return;
+  }
+  const current = sim.page;
+  const earlier = sim.model.menus.filter((m) => m.page < current);
+  enterMenu(earlier.length ? earlier[earlier.length - 1].page : sim.rootPage);
+  renderSimulator();
+}
+
+/** Play or pause the film, if one is playing. */
+function simulatePlayPause() {
+  const player = simVideoElement();
+  if (!player || sim.domain !== 'title') return;
+  if (player.paused) {
+    const attempt = player.play();
+    if (attempt && attempt.catch) attempt.catch(() => {});
+  } else {
+    player.pause();
+  }
+  updateSimClock();
+}
+
+/** Stop the film and go back to the menu, like a player's Stop button. */
+function simulateStop() {
+  if (sim.domain === 'title') {
+    simulateMenuKey();
+    return;
+  }
+  // On a menu, Stop restarts whatever a player would: the first-play item.
+  if (sim.model && sim.model.firstPlay.type === 'menu') enterMenu(sim.model.firstPlay.number);
+  else if (sim.model && sim.model.titles.length) enterTitle(1);
+  renderSimulator();
+}
+
+/** Step to the next or previous film, as the skip keys do. */
+function simulateSkip(delta) {
+  if (!sim.model || !sim.model.titles.length) return;
+  const current = sim.domain === 'title' ? sim.title : 0;
+  const wanted = current + delta;
+  if (wanted < 1) {
+    simulateMenuKey();
+    return;
+  }
+  const target = sim.model.titles.find((t) => t.number === wanted);
+  if (target) enterTitle(target.number);
+  else simulateMenuKey();
+}
+
+/** A digit key: play that title by number, as a remote's number pad does. */
+function simulateTitleNumber(digit) {
+  if (!sim.model) return;
+  const target = sim.model.titles.find((t) => t.number === digit);
+  if (target) enterTitle(target.number);
+}
+
+/**
+ * Play the disc the way a DVD player would.
+ *
+ * This is not a mock-up of the design: it runs the disc's actual navigation
+ * graph — the same table that gets written into the spumux file as explicit
+ * up/down/left/right button names — over the same menu pictures the burn
+ * renders. So arrow keys move the highlight exactly where the remote will move
+ * it, Enter runs the same jump command, and a finished title returns to the
+ * menu because the disc's post-command says so.
+ *
+ * Expected differences from the real thing, stated plainly because a preview
+ * that quietly lies is worse than none:
+ *   - the film plays the original file, not the MPEG-2 on the disc, so it looks
+ *     the same but cleaner than the burned copy will;
+ *   - a player decodes its highlight in a four-colour subpicture, so the real
+ *     one is slightly flatter than the rectangle drawn here.
+ * Everything about the menu — position, shape, which button, where the arrows
+ * go — is the disc's own data.
+ */
+async function openSimulator(options = {}) {
+  closeElementMenu();
+
+  let model;
+  try {
+    model = await api.deck.discModel({
+      deck: state.deck,
+      videos: state.videos.map((v) => ({ id: v.id, name: v.name, menuLabel: v.menuLabel, duration: v.duration })),
+      aspect: (state.deck && state.deck.aspect) || '16:9',
+    });
+  } catch (err) {
+    setBanner('error', 'The DVD player could not start', String(err.message || err));
+    render();
+    return;
+  }
+
+  sim.model = model;
+  sim.open = true;
+  sim.rootPage = model.firstPlay.type === 'menu' ? model.firstPlay.number : 1;
+  sim.message = null;
+
+  // Resolve every film's URL up front, so pressing OK starts playback at once.
+  simUrlCache.clear();
+  try {
+    const paths = state.videos.map((v) => v.path).filter(Boolean);
+    const urls = await api.files.mediaUrls(paths);
+    for (const [key, value] of Object.entries(urls || {})) simUrlCache.set(key, value);
+  } catch {
+    /* a film that cannot be resolved reports itself when it is chosen */
+  }
+
+  if (options.startTitleVideoId) {
+    const title = model.titles.find((t) => t.videoId === options.startTitleVideoId);
+    if (title) {
+      enterTitle(title.number);
+    } else {
+      enterMenu(sim.rootPage);
+    }
+  } else {
+    // A disc starts on its first-play item: the first menu page, or the film if
+    // there is no menu at all.
+    if (model.firstPlay.type === 'menu' && model.menus.length) enterMenu(model.firstPlay.number);
+    else if (model.titles.length) enterTitle(1);
+    else enterMenu(1);
+  }
+
+  bindSimulatorKeysOnce();
+
+  /*
+    Where the player should appear.
+
+    Opening it takes a moment, because the disc's navigation comes from the main
+    process. When the Testing step asks for it, that step owns the container and
+    mounts it — and this must NOT navigate afterwards, or a request that was made
+    while the Testing step was open would drag her back to it after she had
+    already moved on. That is exactly what used to happen: leave Testing quickly
+    and you would be returned to it a moment later.
+  */
+  if (options.navigate === false) {
+    const wrap = $('testingPlayer');
+    if (wrap && state.step === 'testing') mountSimulator(wrap);
+    return true;
+  }
+
+  if (state.step !== 'testing') {
+    goToStep('testing');
+    return true;
+  }
+
+  const wrap = $('testingPlayer');
+  if (wrap) mountSimulator(wrap);
+  return true;
+}
+
+function closeSimulator() {
+  sim.open = false;
+  sim.model = null;
+  sim.title = null;
+
+  // The video element lives inside the player, so it goes with it; pause first
+  // so a film does not keep playing invisibly.
+  if (sim.dom) {
+    try {
+      sim.dom.video.pause();
+      sim.dom.video.removeAttribute('src');
+    } catch {
+      /* nothing worth reporting */
+    }
+    sim.dom.root.remove();
+    sim.dom = null;
+  }
+}
+
+/**
+ * The Testing step: the disc, playing, in the page.
+ *
+ * It is the second step rather than a button somewhere, because trying the disc
+ * is something to do between designing it and writing it — and burning is
+ * one-way, so it is the step that matters most.
+ */
+async function renderTestingStep(stage) {
+  const wrap = el('div', { class: 'testing-step', id: 'testingPlayer' });
+  stage.append(wrap);
+
+  if (sim.open && sim.model) {
+    mountSimulator(wrap);
+    return;
+  }
+
+  // Opening asks the main process for the disc's navigation, so it is async. It
+  // is told not to navigate, because this step is already where it belongs — and
+  // by the time the answer arrives she may have left.
+  await openSimulator({ navigate: false });
+  if (state.step !== 'testing') return;
+  if (sim.open && sim.model) mountSimulator(wrap);
+}
+
+/** Switch to a menu page, focusing its first button the way a player does. */
+function enterMenu(pageNumber) {
+  if (!sim.model || !sim.model.menus.length) return;
+  const page = sim.model.menus.find((m) => m.page === pageNumber) || sim.model.menus[0];
+  if (!page) return;
+  pauseSimVideo();
+  sim.domain = 'menu';
+  sim.page = page.page;
+  sim.title = null;
+  sim.focus = page.buttons.length ? page.buttons[0].name : null;
+  sim.showsHighlight = true;
+}
+
+/**
+ * What the screen shows when the disc has no menu pages.
+ *
+ * A slide with no buttons is not a menu page — on a real disc it would be a page
+ * with no way off it, so it is left out. But that left the simulator showing a
+ * black rectangle, which reads as a broken preview rather than an empty project.
+ * Showing the slide she actually designed, with an explanation, is both more
+ * useful and more honest about why nothing can be chosen.
+ */
+function simFallbackSlide() {
+  const slides = (state.deck && state.deck.slides) || [];
+  return slides.length ? slides[0] : null;
+}
+
+function enterTitle(titleNumber) {
+  if (!sim.model) return;
+  const title = sim.model.titles.find((t) => t.number === titleNumber);
+  if (!title) return;
+  sim.domain = 'title';
+  sim.title = title.number;
+  sim.focus = null;
+  sim.showsHighlight = false;
+  playSimVideo(title.videoId);
+}
+
+/** The menu page currently on screen. */
+function currentSimPage() {
+  if (!sim.model) return null;
+  return sim.model.menus.find((m) => m.page === sim.page) || null;
+}
+
+/** The button the highlight is on. */
+function currentSimButton() {
+  const page = currentSimPage();
+  if (!page || !sim.focus) return null;
+  return page.buttons.find((b) => b.name === sim.focus) || null;
+}
+
+/** Move the highlight the way the disc's own navigation table says. */
+function simulateArrow(direction) {
+  if (!sim.open || sim.domain !== 'menu') return;
+  const page = currentSimPage();
+  if (!page) return;
+  const moves = page.navigation[sim.focus];
+  if (!moves) return;
+  const next = moves[direction];
+  if (next && next !== sim.focus) {
+    sim.focus = next;
+    renderSimulator();
+  }
+}
+
+/** Press Enter: run the button's command. */
+function simulateEnter() {
+  if (!sim.open || sim.domain !== 'menu') return;
+  const button = currentSimButton();
+  if (!button) return;
+
+  // A player shows the "selected" state briefly before acting.
+  sim.showsSelect = true;
+  renderSimulator();
+
+  window.setTimeout(() => {
+    sim.showsSelect = false;
+    if (!sim.open) return;
+    if (button.action.type === 'title') enterTitle(button.action.number);
+    else if (button.action.type === 'menu') enterMenu(button.action.number);
+    renderSimulator();
+  }, 180);
+}
+
+/** The Menu key, and returning from a finished film. */
+function simulateMenuKey() {
+  if (!sim.open || !sim.model || !sim.model.menus.length) return;
+  enterMenu(sim.rootPage);
+  renderSimulator();
+}
+
+function simVideoElement() {
+  return $('simVideo');
+}
+
+function playSimVideo(videoId) {
+  const video = state.videos.find((v) => v.id === videoId);
+  const player = simVideoElement();
+  if (!player || !video) return;
+
+  // The URL was resolved when the simulator opened, so playback can start in
+  // the same beat as the key press rather than waiting on the main process.
+  const url = simUrlCache.get(video.path);
+  if (!url) {
+    sim.message = `Cannot play "${videoLabel(video)}" — the file could not be opened.`;
+    renderSimulator();
+    return;
+  }
+
+  sim.message = null;
+  player.hidden = false;
+  player.src = url;
+  player.currentTime = 0;
+  const attempt = player.play();
+  if (attempt && attempt.catch) attempt.catch(() => {});
+  renderSimulator();
+}
+
+function pauseSimVideo() {
+  const player = simVideoElement();
+  if (player) player.pause();
+}
+
+/** Path to playable URL, filled in by openSimulator before anything plays. */
+const simUrlCache = new Map();
+
+/**
+ * Build the pretend player's DOM once.
+ *
+ * Every render used to rebuild the whole thing, which threw away the <video>
+ * element: choosing a film set its source and started it playing, and then the
+ * next render replaced it with a fresh, empty one. The result was a black
+ * screen and silence. A media element has to survive from one render to the
+ * next, so the skeleton is created here and only its contents are updated.
+ */
+function buildSimulatorDom() {
+  const canvas = el('canvas', { class: 'sim-canvas', id: 'simCanvas' });
+
+  const highlight = el('div', { class: 'sim-highlight', id: 'simHighlight', hidden: true });
+
+  const video = el('video', { class: 'sim-video', id: 'simVideo', playsinline: 'true', hidden: true });
+  video.addEventListener('ended', () => {
+    /*
+      What happens when a film finishes, which is whatever the disc's own
+      post-command does: on to the next film in slide order, or back to the menu
+      if there is not one. Both come from the same model, so the preview cannot
+      promise something the burned disc will not do.
+    */
+    const next = sim.model && sim.model.nextTitleByNumber
+      ? sim.model.nextTitleByNumber[sim.title]
+      : null;
+    if (next) {
+      enterTitle(next);
+      renderSimulator();
+      return;
+    }
+    if (sim.model && sim.model.menus.length) simulateMenuKey();
+  });
+  video.addEventListener('timeupdate', () => updateSimClock());
+  video.addEventListener('error', () => {
+    sim.message = 'This film could not be played.';
+    renderSimulator();
+  });
+
+  const osdBadge = el('span', { class: 'sim-osd-badge' });
+  const osdName = el('span', { class: 'sim-osd-name' });
+  const osdClock = el('span', { class: 'sim-osd-clock', id: 'simClock' });
+  const osd = el('div', { class: 'sim-osd' }, [osdBadge, osdName, osdClock]);
+
+  const empty = el('div', { class: 'sim-empty', hidden: true }, [
+    el('strong', { text: 'Nothing to choose yet' }),
+    el('span', {
+      text:
+        'A slide with no buttons cannot be a menu page, so this disc has no menus. ' +
+        'Add a video and its buttons appear here.',
+    }),
+  ]);
+
+  const message = el('div', { class: 'sim-message', hidden: true });
+
+  const keys = el(
+    'div',
+    { class: 'sim-keys' },
+    SIM_KEY_LEGEND.map((entry) =>
+      el('span', { class: 'sim-key-hint' }, [
+        el('kbd', { text: entry.keys }),
+        el('span', { text: entry.what }),
+      ])
+    )
+  );
+
+  const screen = el('div', { class: 'sim-screen' }, [
+    canvas,
+    highlight,
+    video,
+    osd,
+    empty,
+    message,
+    keys,
+  ]);
+
+  const root = el('div', { class: 'sim-root sim-embedded' });
+  root.append(screen);
+
+  return { root, screen, canvas, highlight, video, osdBadge, osdName, empty, message };
+}
+
+/**
+ * Put the player on screen.
+ *
+ * There is one player and one place it appears — the Testing step. It used to
+ * have a second life as a full-screen overlay, which meant two containers and a
+ * flag to say which one was in use; leaving that flag unstuck was how Escape
+ * could close the player and leave the Testing page empty behind it. One
+ * container means there is no flag to get wrong.
+ */
+function mountSimulator(container) {
+  if (!sim.dom) sim.dom = buildSimulatorDom();
+  const { root } = sim.dom;
+  if (root.parentNode !== container) container.replaceChildren(root);
+  renderSimulator();
+}
+
+function renderSimulator() {
+  if (!sim.open || !sim.model) return;
+  if (!sim.dom) sim.dom = buildSimulatorDom();
+
+  const { canvas, highlight, video, osdBadge, osdName, empty, message } = sim.dom;
+
+  const page = currentSimPage();
+  const button = currentSimButton();
+  const title = sim.model.titles.find((t) => t.number === sim.title) || null;
+
+  // With no menu pages there is nothing to choose, but the design is still worth
+  // showing: a black rectangle looks like the preview is broken.
+  const emptyDisc = !sim.model.menus.length;
+  const fallbackSlide = emptyDisc ? simFallbackSlide() : null;
+  const showingFilm = sim.domain === 'title';
+
+  function layoutForSlideId(slideId) {
+    if (!state.layout) return null;
+    return state.layout.slides.find((s) => s.slide && s.slide.id === slideId) || null;
+  }
+
+  // The menu picture, drawn by the same code that renders the disc's menu, so
+  // the layout cannot differ from what gets burned.
+  if (!showingFilm) {
+    const layout = page
+      ? layoutForSlideId(page.slideId)
+      : fallbackSlide
+        ? layoutForSlideId(fallbackSlide.id)
+        : null;
+    if (layout) drawSimCanvas(canvas, layout);
+  }
+
+  // Hidden while a film plays, or the menu shows through the letterbox bars.
+  canvas.hidden = showingFilm;
+
+  // The highlight, positioned from the disc's own button rectangle. The screen
+  // box is the same 16:9 stretch a television applies to the raster, so a
+  // percentage of the raster is a percentage of the screen.
+  const showHighlight = Boolean(button) && !showingFilm && sim.showsHighlight !== false;
+  highlight.hidden = !showHighlight;
+  if (showHighlight) {
+    highlight.classList.toggle('sim-highlight-selected', Boolean(sim.showsSelect));
+    highlight.style.left = `${(button.x0 / RASTER.width) * 100}%`;
+    highlight.style.top = `${(button.y0 / RASTER.height) * 100}%`;
+    highlight.style.width = `${((button.x1 - button.x0) / RASTER.width) * 100}%`;
+    highlight.style.height = `${((button.y1 - button.y0) / RASTER.height) * 100}%`;
+  }
+
+  video.hidden = !showingFilm;
+
+  osdBadge.textContent = showingFilm
+    ? `Title ${sim.title}`
+    : emptyDisc
+      ? 'No menus'
+      : `Menu ${sim.page}`;
+  osdName.textContent = showingFilm
+    ? (title ? title.name : '')
+    : page
+      ? page.title
+      : fallbackSlide
+        ? fallbackSlide.title
+        : '';
+
+  empty.hidden = !(emptyDisc && sim.domain === 'menu');
+  message.hidden = !sim.message;
+  if (sim.message) message.textContent = sim.message;
+
+  updateSimClock();
+}
+
+/**
+ * A plain snapshot of the pretend player, for tests and for anything that wants
+ * to know where the highlight is without re-deriving it.
+ */
+function simState() {
+  const page = currentSimPage();
+  const button = currentSimButton();
+  return {
+    open: sim.open,
+    domain: sim.domain,
+    page: sim.page,
+    title: sim.title,
+    focus: sim.focus,
+    focusLabel: button ? button.label : null,
+    focusRect: button
+      ? { x0: button.x0, y0: button.y0, x1: button.x1, y1: button.y1 }
+      : null,
+    command: button ? button.command : null,
+    moves: page && button && page.navigation[button.name] ? page.navigation[button.name] : null,
+    menus: sim.model ? sim.model.menus.length : 0,
+    titles: sim.model ? sim.model.titles.length : 0,
+    rootPage: sim.rootPage,
+  };
+}
+
+function updateSimClock() {
+  const clock = $('simClock');
+  if (!clock) return;
+  const player = $('simVideo');
+  if (sim.domain !== 'title' || !player) {
+    clock.textContent = '';
+    return;
+  }
+  const position = Number.isFinite(player.currentTime) ? player.currentTime : 0;
+  const total = Number.isFinite(player.duration) ? player.duration : 0;
+  clock.textContent = total ? `${formatDuration(position)} / ${formatDuration(total)}` : formatDuration(position);
+}
+
+/** Draw one menu page exactly as the disc renders it, with no editor furniture. */
+async function drawSimCanvas(canvas, layout) {
+  if (!canvas || !layout) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = layout.width * dpr;
+  canvas.height = layout.height * dpr;
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  const images = await loadSlideImages(layout);
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  draw.drawSlide(ctx, layout, images);
+}
+
+let simKeysBound = false;
+function bindSimulatorKeysOnce() {
+  if (simKeysBound) return;
+  simKeysBound = true;
+
+  document.addEventListener('keydown', (event) => {
+    if (!sim.open) return;
+    // The simulator owns the keyboard while it is up, or an arrow key would
+    // nudge whichever element happened to be selected behind it.
+    const keys = {
+      ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
+    };
+    if (keys[event.key]) {
+      event.preventDefault();
+      event.stopPropagation();
+      simulateArrow(keys[event.key]);
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      event.stopPropagation();
+      simulateEnter();
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      // Back to the slides. The player is the Testing step, so there is nothing
+      // to close — leaving the step is what closing it used to be.
+      goToStep('slides');
+      return;
+    }
+    if (event.key === 'Backspace') {
+      event.preventDefault();
+      event.stopPropagation();
+      simulateBack();
+      return;
+    }
+    if (event.key === ' ') {
+      event.preventDefault();
+      event.stopPropagation();
+      simulatePlayPause();
+      return;
+    }
+    if (event.key === 'm' || event.key === 'M') {
+      event.preventDefault();
+      event.stopPropagation();
+      simulateMenuKey();
+      return;
+    }
+    if (event.key === 's' || event.key === 'S') {
+      event.preventDefault();
+      event.stopPropagation();
+      simulateStop();
+      return;
+    }
+    if (event.key === '.' || event.key === '>') {
+      event.preventDefault();
+      event.stopPropagation();
+      simulateSkip(1);
+      return;
+    }
+    if (event.key === ',' || event.key === '<') {
+      event.preventDefault();
+      event.stopPropagation();
+      simulateSkip(-1);
+      return;
+    }
+    // The number pad, as a remote has.
+    if (/^[1-9]$/.test(event.key)) {
+      event.preventDefault();
+      event.stopPropagation();
+      simulateTitleNumber(Number(event.key));
+    }
+  }, true);
+}
+
+/**
+ * Dropping a video onto the slide puts the video itself there.
+ *
+ * It is automatically sized full-screen and centered perfectly in the television-safe
+ * viewing area, leaving clean space for the navigation bar below it.
+ * "I don't want to have to position or scale anything myself."
+ *
+ * If she is on Slide 1 (the master menu), it automatically creates a new slide for the
+ * video so the menu is never cluttered with video tiles.
+ */
+function dropVideoOnCanvas(video) {
+  let targetSlide = activeSlide();
+
+  // Videos do not go on the first slide, which is the menu hub.
+  if (!targetSlide || targetSlide.role === 'menu' || state.deck.slides.indexOf(targetSlide) === 0) {
+    let found = state.deck.slides.find((s) => s.role !== 'menu' && s.elements.filter((e) => e.kind === 'video').length === 0);
+    if (!found) {
+      found = addSlideAtEnd();
+    }
+    targetSlide = found;
+    state.activeSlideId = targetSlide.id;
+  }
+
+  // Clear any existing video tile or unedited text so the slide is a clean episode slide
+  targetSlide.elements = targetSlide.elements.filter((e) => e.kind !== 'video' && !(e.kind === 'text' && !e.edited));
+
+  /*
+    The slide keeps the name it had.
+
+    Dropping a video used to rename the slide after it, which quietly replaced a
+    name she may have chosen and left a title that was a lie the moment the video
+    was swapped or the slide moved. A slide is named "Slide 4" for where it is,
+    or whatever she types.
+  */
+
+  const geom = fitTileToSlide(video);
+  addElement('video', {
+    videoId: video.id,
+    label: videoLabel(video),
+    sublabel: video.duration ? formatDuration(video.duration) : '',
+    src: video.poster || null,
+    posterMissing: !video.poster,
+    width: geom.width,
+    height: geom.height,
+    x: geom.x,
+    y: geom.y,
+    fit: 'fill',
+  });
+}
+
+/**
+ * The size and centered position a video tile should be.
+ *
+ * The menu raster is anamorphic: a player stretches 720x480 to fill a
+ * widescreen television. So the tile is computed in that stretched space — a
+ * video that should look 16:9 on screen is 3:2 in raster units. Sizing it 16:9
+ * in raster units instead makes it about 19% too wide on the television, which
+ * is invisible here and obvious there.
+ *
+ * It fills the available space: the full safe height, then as wide as that
+ * allows, exactly centred, with clean clearance above the navigation row so
+ * nothing ever overlaps. Nothing to position or scale by hand.
+ */
+function fitTileToSlide(video) {
+  const margin = SAFE_MARGIN;
+  const maxAvailWidth = RASTER.width - margin * 2;
+  // The navigation row (< Menu / Next >) occupies y = 408..440, so the tile
+  // stops at 396 to keep a clear gap above it.
+  const maxAvailHeight = 396 - margin;
+
+  const probe = (video && video.probe) || {};
+  let displayAspect = probe.width && probe.height ? probe.width / probe.height : 16 / 9;
+  if (!Number.isFinite(displayAspect) || displayAspect <= 0) displayAspect = 16 / 9;
+
+  // Convert the shape it should *look* like into the raster shape to draw.
+  const aspect = displayAspectToRaster(displayAspect);
+
+  let width = maxAvailWidth;
+  let height = Math.round(width / aspect);
+
+  if (height > maxAvailHeight) {
+    height = maxAvailHeight;
+    width = Math.round(height * aspect);
+  }
+  if (width > maxAvailWidth) {
+    width = maxAvailWidth;
+    height = Math.round(width / aspect);
+  }
+
+  // Even dimensions, so the button rectangle lands on clean subpicture pixels.
+  width = width % 2 === 0 ? width : width - 1;
+  height = height % 2 === 0 ? height : height - 1;
+
+  const x = Math.round((RASTER.width - width) / 2);
+  const y = margin + Math.round((maxAvailHeight - height) / 2);
+
+  return { width, height, x, y };
+}
+
+/**
+ * Resolve dropped files to filesystem paths.
+ */
+function pathsFromFiles(files) {
+  return Array.from(files || [])
+    .map((f) => {
+      try {
+        return api.files.pathFor(f);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Files dropped straight from Finder / Windows Explorer.
+ *
+ * Drops directly onto the slide: adds the video to the disc and puts it on the slide
+ * in one single gesture. No second drag! Boom done.
+ */
+async function importFilesOntoSlide(files) {
+  const paths = pathsFromFiles(files);
+  if (!paths.length) {
+    setBanner(
+      'info',
+      'Use the Add Videos button instead',
+      'Dragging from outside the window did not provide a file location. ' +
+        'Open the Videos tab and press Add Videos.'
+    );
+    render();
+    return;
+  }
+  const added = await addVideoPaths(paths);
+  if (!added.length) return;
+
+  for (let i = 0; i < added.length; i++) {
+    const video = added[i];
+    if (i === 0) {
+      const current = activeSlide();
+      if (current && current.role !== 'menu' && state.deck.slides.indexOf(current) !== 0 && current.elements.filter((e) => e.kind === 'video').length === 0) {
+        state.activeSlideId = current.id;
+      } else {
+        const newSlide = addSlideAtEnd();
+        state.activeSlideId = newSlide.id;
+      }
+    } else {
+      const newSlide = addSlideAtEnd();
+      state.activeSlideId = newSlide.id;
+    }
+    dropVideoOnCanvas(video);
+  }
+
+  syncMenuSlides();
+  persistDeck();
+  render();
+}
+
+/** Files dropped onto the slide list: one new slide per file, showing it. */
+async function importFilesOntoFilmstrip(files) {
+  const paths = pathsFromFiles(files);
+  if (!paths.length) return;
+  const added = await addVideoPaths(paths);
+  if (!added.length) return;
+  for (const video of added) dropVideoOnFilmstrip(video);
+}
+
+/**
+ * Dropping a video onto the slide list makes a new slide at the end, showing it.
+ *
+ * The slide is named for where it landed — "Slide 4" when there are three
+ * already — rather than after the video. A name taken from the file reads like
+ * a title somebody chose, and stops being true the moment the video is swapped.
+ */
+function dropVideoOnFilmstrip(video) {
+  const slide = addSlideAtEnd();
+  state.activeSlideId = slide.id;
+  dropVideoOnCanvas(video);
+}
+
+// ------------------------------------------------------------ test hooks ---
+
+function installTestHooks() {
+  if (!state.settings || state.settings.testHooks !== true) return;
+  window.__burnhouseTest = {
+    addVideos: (paths) => addVideoPaths(paths),
+    goToStep: (step) => goToStep(step),
+    getState: () => ({
+      step: state.step,
+      videos: state.videos.map((v) => ({
+        id: v.id,
+        name: v.name,
+        duration: v.duration,
+        hasPoster: Boolean(v.poster),
+      })),
+      slides: state.deck.slides.map((s) => ({
+        id: s.id,
+        title: s.title,
+        role: s.role,
+        elements: s.elements.map((e) => ({
+          id: e.id,
+          kind: e.kind,
+          label: e.label,
+          text: e.text,
+          videoId: e.videoId,
+          targetSlideId: e.targetSlideId,
+          source: e.source,
+          number: e.number,
+          x: e.x,
+          y: e.y,
+          width: e.width,
+          height: e.height,
+          fit: e.fit,
+          generated: e.generated,
+          hasPoster: Boolean(e.src),
+        })),
+      })),
+      activeSlideId: state.activeSlideId,
+      selectedElementId: state.selectedElementId,
+      hasPlan: Boolean(state.plan),
+      layout: state.layout
+        ? {
+            problems: state.layout.problems,
+            slides: state.layout.slides.map((s) => ({
+              id: s.slide.id,
+              buttons: s.buttons.length,
+              elements: s.elements.map((e) => ({
+                id: e.id,
+                kind: e.kind,
+                box: e.box,
+                labelText: e.labelText,
+              })),
+            })),
+          }
+        : null,
+    }),
+    addSlide: (options) => addSlide(options),
+    addElement: (kind, patch) => addElement(kind, patch),
+    // The slide list's right-click menu, so its contents can be checked without
+    // a person at the mouse.
+    openSlideMenuFor: (slideId) => {
+      const slide = state.deck.slides.find((s) => s.id === slideId);
+      if (!slide) return null;
+      openSlideMenu({ clientX: 40, clientY: 60, preventDefault() {}, stopPropagation() {} }, slide);
+      return [...document.querySelectorAll('.context-menu .context-item')].map((b) => b.textContent.trim());
+    },
+    moveSlideBy: (slideId, delta) => {
+      moveSlide(slideId, delta);
+      return state.deck.slides.map((s) => s.id);
+    },
+    deleteSlide: (slideId) => {
+      deleteSlide(slideId);
+      return state.deck.slides.map((s) => s.id);
+    },
+    addMenuSlide: () => {
+      const slide = makeMenuSlide(state.discTitle || 'Main menu');
+      state.deck.slides.push(slide);
+      state.activeSlideId = slide.id;
+      syncMenuSlides();
+      persistDeck();
+      render();
+      return slide.id;
+    },
+    syncMenu: () => {
+      syncMenuSlides();
+      return true;
+    },
+    activeSlide: () => state.activeSlideId,
+    openProject: (idOrPath) => openProject(idOrPath),
+    createNewProject: (name, themeId) => createNewProject(name, themeId),
+    closeProject: () => closeProjectToHome(),
+    saveProject: () => saveCurrentProject(false),
+    getRecentProjects: () => state.recentProjects,
+    // The simulator, so its accuracy can be checked without a person at the
+    // keyboard. Returning the state is the point: a test can assert where the
+    // highlight moved, not just that a window appeared.
+    openSimulator: (options) => openSimulator(options || {}),
+    closeSimulator: () => closeSimulator(),
+    simulateArrow: (direction) => {
+      simulateArrow(direction);
+      return simState();
+    },
+    simulateEnter: () => {
+      simulateEnter();
+      return simState();
+    },
+    simulateMenuKey: () => {
+      simulateMenuKey();
+      return simState();
+    },
+    simulatorState: () => simState(),
+    // Forces a redraw, to prove a playing film survives one. Rebuilding the DOM
+    // on every render used to throw the <video> element away mid-playback.
+    redrawSimulator: () => {
+      renderSimulator();
+      return simState();
+    },
+    simulatorVideo: () => {
+      const video = document.getElementById('simVideo');
+      if (!video) return null;
+      return {
+        src: video.currentSrc || video.getAttribute('src') || '',
+        paused: video.paused,
+        time: Number.isFinite(video.currentTime) ? video.currentTime : 0,
+        readyState: video.readyState,
+        error: video.error ? video.error.code : null,
+        marker: video.dataset.marker || null,
+      };
+    },
+    markSimulatorVideo: (value) => {
+      const video = document.getElementById('simVideo');
+      if (!video) return false;
+      video.dataset.marker = value;
+      return true;
+    },
+    resizeElement: (id, handle, dx, dy) => {
+      // Exercises the same geometry the mouse drag uses.
+      const { element } = findElement(id);
+      if (!element) return null;
+      const box = resizeBox(
+        handle,
+        { x: element.x, y: element.y, width: element.width, height: element.height },
+        dx,
+        dy,
+        SHAPE_LOCKED_KINDS.has(element.kind)
+      );
+      Object.assign(element, box);
+      clampElementInPlace(element);
+      persistDeck();
+      render();
+      return { x: element.x, y: element.y, width: element.width, height: element.height };
+    },
+    handleAt: (id, x, y) => {
+      const { element } = findElement(id);
+      if (!element) return null;
+      return handleAt({ x: element.x, y: element.y, width: element.width, height: element.height }, { x, y });
+    },
+    openElementMenuFor: (id) => {
+      const { element } = findElement(id);
+      if (!element) return null;
+      const layout = activeSlideLayout();
+      if (!layout) return null;
+      const resolved = layout.elements.find((e) => e.id === id) || element;
+      openElementMenu({ clientX: 40, clientY: 60, preventDefault() {} }, resolved, layout);
+      return [...document.querySelectorAll('.context-menu .context-item')].map((b) => b.textContent.trim());
+    },
+    contextMenuLabels: () =>
+      [...document.querySelectorAll('.context-menu .context-item')].map((b) => b.textContent.trim()),
+    clickContextItem: (label) => {
+      const item = [...document.querySelectorAll('.context-menu .context-item')].find(
+        (b) => b.textContent.trim().startsWith(label)
+      );
+      if (!item) return false;
+      item.click();
+      return true;
+    },
+    closeElementMenu: () => closeElementMenu(),
+    selectElement: (id) => {
+      state.selectedElementId = id;
+      drawCanvas();
+      renderInspector();
+    },
+    setActiveSlide: (id) => {
+      state.activeSlideId = id;
+      render();
+    },
+    project: () => projectPayload(),
+  };
+}
+
+// -------------------------------------------------------------------- go ---
+
+bindCanvas();
+boot();

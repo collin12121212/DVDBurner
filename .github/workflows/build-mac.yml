@@ -1,0 +1,215 @@
+name: Build Burnhouse for macOS
+
+# Produces a universal .dmg. Everything the app needs — ffmpeg, dvdauthor and
+# their libraries — is fetched and made relocatable here, so the Mac it is
+# installed on needs nothing installed beforehand.
+#
+# This workflow is also the only place the disc-authoring pipeline is tested
+# against a real dvdauthor, so the test step gates the build: if authoring
+# breaks, no artifact is produced.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests (emergency only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test the pipeline
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install the tools
+        run: |
+          brew update
+          brew install ffmpeg dvdauthor
+          echo "--- versions ---"
+          ffmpeg -version | head -1
+          dvdauthor --version 2>&1 | head -1
+          which dvdauthor spumux ffmpeg ffprobe
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Core pipeline tests
+        run: npm run test:core
+
+      - name: Sharing server tests
+        run: npm run test:server
+
+      - name: Menu rendering tests
+        run: npx electron test/menu.js
+
+      - name: Upload menu samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: menu-samples
+          path: test/menu-samples/
+          if-no-files-found: ignore
+
+  build:
+    name: Build the app
+    needs: test
+    if: ${{ github.event_name != 'pull_request' || needs.test.result == 'success' }}
+    runs-on: macos-14
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install the tools
+        run: |
+          brew update
+          brew install ffmpeg dvdauthor
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Collect and relocate the tools
+        run: |
+          set -euo pipefail
+          chmod +x scripts/bundle-deps.sh
+
+          mkdir -p vendor/bin
+
+          FFMPEG="$(command -v ffmpeg)"
+          FFPROBE="$(command -v ffprobe)"
+          DVDAUTHOR="$(command -v dvdauthor)"
+          SPUMUX="$(command -v spumux)"
+
+          echo "Found: $FFMPEG $FFPROBE $DVDAUTHOR $SPUMUX"
+
+          ./scripts/bundle-deps.sh vendor/bin \
+            "$FFMPEG" "$FFPROBE" "$DVDAUTHOR" "$SPUMUX"
+
+          echo "--- bundled ---"
+          ls -la vendor/bin
+          ls -la vendor/bin/lib | head -40
+
+      - name: Verify the bundled tools run from a different directory
+        run: |
+          set -euo pipefail
+          # Moving the bundle proves nothing depends on Homebrew still being on
+          # the path. This is the check that catches a missed dylib.
+          mkdir -p /tmp/relocated
+          cp -R vendor/bin /tmp/relocated/bin
+          cd /tmp
+          env -i PATH=/usr/bin:/bin /tmp/relocated/bin/ffmpeg -version | head -1
+          env -i PATH=/usr/bin:/bin /tmp/relocated/bin/ffprobe -version | head -1
+          env -i PATH=/usr/bin:/bin /tmp/relocated/bin/dvdauthor --version 2>&1 | head -1 || true
+          echo "All bundled tools ran without Homebrew present."
+
+      - name: Confirm the bundled tools are present before packaging
+        run: |
+          set -euo pipefail
+          # Packaging an app with no tools inside it would produce a .dmg that
+          # installs cleanly and then cannot burn anything. Fail here instead.
+          for tool in ffmpeg ffprobe dvdauthor spumux; do
+            if [ ! -x "vendor/bin/${tool}" ]; then
+              echo "ERROR: vendor/bin/${tool} is missing; the app would ship without it." >&2
+              exit 1
+            fi
+          done
+          if [ ! -d "vendor/bin/lib" ]; then
+            echo "ERROR: vendor/bin/lib is missing; the tools would not run on another Mac." >&2
+            exit 1
+          fi
+          echo "All four tools and $(ls vendor/bin/lib | wc -l | tr -d ' ') libraries are present."
+
+      - name: Package version
+        id: package
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Packaging ${VERSION}"
+
+      - name: Build the universal app
+        env:
+          # Ad-hoc signing. There is no Developer ID here, and there does not
+          # need to be one: this build is handed to a person, not distributed.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          npx electron-builder --mac --x64 --arm64 --publish never
+
+      - name: Confirm the app bundle holds its tools
+        run: |
+          set -euo pipefail
+          APP="$(find dist -maxdepth 3 -name '*.app' -type d | head -1)"
+          echo "App bundle: ${APP}"
+          test -n "${APP}"
+          BIN="${APP}/Contents/Resources/bin"
+          echo "--- bundled tools in the app ---"
+          ls -la "${BIN}"
+          test -x "${BIN}/ffmpeg"
+          test -x "${BIN}/ffprobe"
+          test -x "${BIN}/dvdauthor"
+          test -x "${BIN}/spumux"
+          echo "--- running ffmpeg from inside the app bundle ---"
+          env -i PATH=/usr/bin:/bin "${BIN}/ffmpeg" -version | head -1
+
+      - name: Confirm the app is universal
+        run: |
+          set -euo pipefail
+          APP="$(find dist -maxdepth 3 -name '*.app' -type d | head -1)"
+          lipo -info "${APP}/Contents/MacOS/"* || true
+          echo "--- bundled binary architectures ---"
+          for tool in ffmpeg dvdauthor; do
+            echo -n "${tool}: "
+            lipo -info "${APP}/Contents/Resources/bin/${tool}" || true
+          done
+
+      - name: List what was produced
+        run: ls -la dist/
+
+      - name: Upload the disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: Burnhouse-dmg
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+
+      - name: Publish a release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Burnhouse ${{ steps.package.outputs.version }}
+          body: |
+            ## Burnhouse ${{ steps.package.outputs.version }}
+
+            A stable DVD maker for macOS. Everything needed to build and burn a
+            disc is inside the app — nothing else to install.
+
+            **To install:** open the `.dmg`, drag Burnhouse to Applications, then
+            right-click Burnhouse in Applications and choose **Open** the first
+            time. macOS shows a warning because the app is not notarised; the
+            right-click is how you tell it you trust it.
+
+            **What it does:** add videos, design a menu, burn a DVD that plays in
+            a normal DVD player.
+          files: |
+            dist/*.dmg
+            dist/*.zip
+          draft: false
+          prerelease: false
