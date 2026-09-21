@@ -1,12 +1,22 @@
 name: Build Burnhouse for macOS
 
-# Produces a universal .dmg. Everything the app needs — ffmpeg, dvdauthor and
-# their libraries — is fetched and made relocatable here, so the Mac it is
-# installed on needs nothing installed beforehand.
+# Produces the .dmg. Everything the app needs — ffmpeg, dvdauthor and their
+# libraries — is fetched and made relocatable here, so the Mac it is installed on
+# needs nothing installed beforehand.
+#
+# THE RUNNER MUST BE INTEL. The Mac this is for is a 2017 MacBook Air, which is
+# x86_64. On an Apple Silicon runner Homebrew installs arm64 tools, and an arm64
+# binary cannot run on an Intel Mac at all: the app would install, launch, and
+# then fail the moment a video was added. Hence `macos-15-intel`, which is what
+# replaced the retired `macos-13`.
+#
+# The build is x86_64 only. That is not a limitation — an Intel build runs
+# natively on her Mac and under Rosetta on any Apple Silicon Mac, so one build
+# covers both, and it is the only option that also gets working tools.
 #
 # This workflow is also the only place the disc-authoring pipeline is tested
-# against a real dvdauthor, so the test step gates the build: if authoring
-# breaks, no artifact is produced.
+# against a real dvdauthor on macOS, so the test step gates the build: if
+# authoring breaks, no artifact is produced.
 
 on:
   push:
@@ -26,7 +36,7 @@ permissions:
 jobs:
   test:
     name: Test the pipeline
-    runs-on: macos-14
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
@@ -67,7 +77,7 @@ jobs:
     name: Build the app
     needs: test
     if: ${{ github.event_name != 'pull_request' || needs.test.result == 'success' }}
-    runs-on: macos-14
+    runs-on: macos-15-intel
     outputs:
       version: ${{ steps.package.outputs.version }}
     steps:
@@ -119,6 +129,52 @@ jobs:
           env -i PATH=/usr/bin:/bin /tmp/relocated/bin/dvdauthor --version 2>&1 | head -1 || true
           echo "All bundled tools ran without Homebrew present."
 
+      - name: Confirm the bundled tools are Intel and will run on macOS 12
+        run: |
+          set -euo pipefail
+          # Two ways this build can produce a .dmg that installs and then cannot
+          # make a disc, and neither is visible from the app launching:
+          #
+          #   1. the tools are the wrong architecture, so they will not execute;
+          #   2. the tools need a newer macOS than the Mac they are for.
+          #
+          # Both are checked here rather than discovered on somebody's laptop.
+          echo "--- architectures ---"
+          for tool in ffmpeg ffprobe dvdauthor spumux; do
+            ARCHS="$(lipo -archs "vendor/bin/${tool}")"
+            echo "${tool}: ${ARCHS}"
+            case "${ARCHS}" in
+              *x86_64*) ;;
+              *) echo "ERROR: ${tool} is ${ARCHS}, not x86_64. On an Apple Silicon" >&2
+                 echo "       runner Homebrew installs arm64 tools, which cannot" >&2
+                 echo "       run on an Intel Mac. Check the runner label." >&2
+                 exit 1 ;;
+            esac
+          done
+
+          echo "--- minimum macOS each tool needs ---"
+          FAILED=0
+          for tool in ffmpeg ffprobe dvdauthor spumux; do
+            MINOS="$(vtool -show-build "vendor/bin/${tool}" 2>/dev/null \
+                     | awk '/minos/ {print $2; exit}')"
+            echo "${tool}: minos ${MINOS:-unknown}"
+            if [ -n "${MINOS}" ]; then
+              # Anything above 12 cannot run on macOS 12.7.6.
+              MAJOR="${MINOS%%.*}"
+              if [ "${MAJOR}" -gt 12 ]; then
+                echo "ERROR: ${tool} needs macOS ${MINOS}, but the target Mac runs 12.7.6." >&2
+                FAILED=1
+              fi
+            fi
+          done
+          if [ "${FAILED}" -ne 0 ]; then
+            echo "" >&2
+            echo "The Homebrew bottles are too new for this Mac. Replace them with" >&2
+            echo "builds that target macOS 12 — a static ffmpeg for x86_64, and" >&2
+            echo "dvdauthor compiled with -mmacosx-version-min=12.0." >&2
+            exit 1
+          fi
+
       - name: Confirm the bundled tools are present before packaging
         run: |
           set -euo pipefail
@@ -143,13 +199,13 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Packaging ${VERSION}"
 
-      - name: Build the universal app
+      - name: Build the app
         env:
           # Ad-hoc signing. There is no Developer ID here, and there does not
           # need to be one: this build is handed to a person, not distributed.
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: |
-          npx electron-builder --mac --x64 --arm64 --publish never
+          npx electron-builder --mac --x64 --publish never
 
       - name: Confirm the app bundle holds its tools
         run: |
@@ -167,15 +223,22 @@ jobs:
           echo "--- running ffmpeg from inside the app bundle ---"
           env -i PATH=/usr/bin:/bin "${BIN}/ffmpeg" -version | head -1
 
-      - name: Confirm the app is universal
+      - name: Confirm the app is Intel, like the Mac it is for
         run: |
           set -euo pipefail
           APP="$(find dist -maxdepth 3 -name '*.app' -type d | head -1)"
-          lipo -info "${APP}/Contents/MacOS/"* || true
-          echo "--- bundled binary architectures ---"
-          for tool in ffmpeg dvdauthor; do
+          MAIN="$(find "${APP}/Contents/MacOS" -type f -perm +111 | head -1)"
+          echo "--- the app itself ---"
+          lipo -archs "${MAIN}"
+          case "$(lipo -archs "${MAIN}")" in
+            *x86_64*) ;;
+            *) echo "ERROR: the app is not x86_64 and will not run on an Intel Mac." >&2
+               exit 1 ;;
+          esac
+          echo "--- bundled tool architectures ---"
+          for tool in ffmpeg ffprobe dvdauthor spumux; do
             echo -n "${tool}: "
-            lipo -info "${APP}/Contents/Resources/bin/${tool}" || true
+            lipo -archs "${APP}/Contents/Resources/bin/${tool}"
           done
 
       - name: List what was produced
