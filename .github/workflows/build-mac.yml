@@ -46,7 +46,8 @@ jobs:
 
       - name: Install the tools
         run: |
-          brew update
+          # No `brew update`. The runner images ship with a current Homebrew, and
+          # updating it costs minutes of nothing on every build.
           brew install ffmpeg dvdauthor
           echo "--- versions ---"
           ffmpeg -version | head -1
@@ -89,11 +90,21 @@ jobs:
 
       - name: Install the tools
         run: |
-          brew update
+          # No `brew update`; the runner image is already current.
           brew install ffmpeg dvdauthor
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
+
+      - name: Show what the tools link against
+        run: |
+          # Printed before any rewriting, so a bundling failure can be read
+          # straight off the log. Working out what a relocator tripped over from
+          # its error message alone is guesswork.
+          for tool in ffmpeg ffprobe dvdauthor spumux; do
+            echo "=== ${tool} ($(command -v ${tool})) ==="
+            otool -L "$(command -v ${tool})" | tail -n +2
+          done
 
       - name: Collect and relocate the tools
         run: |
@@ -154,17 +165,28 @@ jobs:
 
           echo "--- minimum macOS each tool needs ---"
           FAILED=0
+          UNKNOWN=0
           for tool in ffmpeg ffprobe dvdauthor spumux; do
-            MINOS="$(vtool -show-build "vendor/bin/${tool}" 2>/dev/null \
-                     | awk '/minos/ {print $2; exit}')"
-            echo "${tool}: minos ${MINOS:-unknown}"
-            if [ -n "${MINOS}" ]; then
-              # Anything above 12 cannot run on macOS 12.7.6.
-              MAJOR="${MINOS%%.*}"
-              if [ "${MAJOR}" -gt 12 ]; then
-                echo "ERROR: ${tool} needs macOS ${MINOS}, but the target Mac runs 12.7.6." >&2
-                FAILED=1
-              fi
+            # Two load commands carry this, and which one is used depends on the
+            # toolchain that built the binary:
+            #   LC_BUILD_VERSION       prints "minos 12.0"
+            #   LC_VERSION_MIN_MACOSX  prints "version 10.13"
+            # Looking only for "minos" silently skipped every older binary and
+            # reported the check as satisfied, which is the worst way to fail.
+            MINOS="$(otool -l "vendor/bin/${tool}" 2>/dev/null \
+                     | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' \
+                     | grep -E '^ *(minos|version) ' \
+                     | head -1 | awk '{print $2}')"
+            echo "${tool}: minimum macOS ${MINOS:-could not be read}"
+            if [ -z "${MINOS}" ]; then
+              UNKNOWN=1
+              continue
+            fi
+            # Anything above 12 cannot run on macOS 12.7.6.
+            MAJOR="${MINOS%%.*}"
+            if [ "${MAJOR}" -gt 12 ]; then
+              echo "ERROR: ${tool} needs macOS ${MINOS}, but the target Mac runs 12.7.6." >&2
+              FAILED=1
             fi
           done
           if [ "${FAILED}" -ne 0 ]; then
@@ -173,6 +195,9 @@ jobs:
             echo "builds that target macOS 12 — a static ffmpeg for x86_64, and" >&2
             echo "dvdauthor compiled with -mmacosx-version-min=12.0." >&2
             exit 1
+          fi
+          if [ "${UNKNOWN}" -ne 0 ]; then
+            echo "::warning::The minimum macOS of at least one tool could not be read, so its compatibility with macOS 12.7.6 is unverified."
           fi
 
       - name: Confirm the bundled tools are present before packaging

@@ -209,6 +209,17 @@ while IFS= read -r file; do
   if otool -L "${file}" 2>/dev/null | tail -n +2 | grep -qE '/opt/homebrew|/usr/local'; then
     echo "ERROR: ${file} still references a Homebrew path:" >&2
     otool -L "${file}" | tail -n +2 | grep -E '/opt/homebrew|/usr/local' >&2 || true
+    # Say whether the reference is simply not on disk (nothing we could have
+    # copied) or whether it exists and the rewrite failed. Those have different
+    # causes and the difference is invisible from the path alone.
+    while IFS= read -r still; do
+      [ -z "${still}" ] && continue
+      if [ -e "${still}" ]; then
+        echo "         (the file exists; install_name_tool did not rewrite it)" >&2
+      else
+        echo "         (the file does not exist on this machine)" >&2
+      fi
+    done < <(otool -L "${file}" 2>/dev/null | tail -n +2 | grep -E '/opt/homebrew|/usr/local' | awk '{print $1}' || true)
     failures=$((failures + 1))
   fi
 done < <(find "${OUT_DIR}" -type f \( -perm -u+x -o -name '*.dylib' \))
