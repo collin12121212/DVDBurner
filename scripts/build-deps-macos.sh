@@ -49,6 +49,9 @@ mkdir -p "${PREFIX}" "${WORK}/src"
 LIBPNG_VERSION="1.6.44"
 ZLIB_VERSION="1.3.1"
 ZLIB_SHA256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+FREETYPE_VERSION="2.13.3"
+FREETYPE_URL="https://download.savannah.gnu.org/releases/freetype/freetype-${FREETYPE_VERSION}.tar.gz"
+FREETYPE_SHA256="5c3a8e78f7b24c20b25b54ee575d6daa40007a5f4eea2845861c3409b3021747"
 DVDAUTHOR_VERSION="0.7.2"
 # MacPorts mirrors the upstream tarball byte for byte, which is why the checksum
 # below -- the one Homebrew publishes -- matches it.
@@ -144,6 +147,50 @@ make -j"$(sysctl -n hw.ncpu)" >/dev/null 2>&1
 make install >/dev/null 2>&1
 echo "    installed into ${PREFIX}"
 
+# --------------------------------------------------------------- freetype ---
+# Not optional, whatever this script used to claim. dvdauthor's configure stops
+# with "configure: error: freetype not found", and it is a custom check with no
+# --without flag to turn it off. freetype draws text into subpictures, which
+# this app does not do, but the build will not proceed without it.
+#
+# dvdauthor looks specifically for `freetype-config`, so the prefix's bin has to
+# be on PATH later or it will not be found even once built.
+echo ""
+echo "==> freetype ${FREETYPE_VERSION}: building (static, macOS ${MACOSX_DEPLOYMENT_TARGET})"
+cd "${WORK}/src"
+curl -fsSL --retry 3 --retry-delay 2 -o freetype.tar.gz "${FREETYPE_URL}"
+
+FREETYPE_ACTUAL="$(shasum -a 256 freetype.tar.gz | awk '{print $1}')"
+if [ "${FREETYPE_ACTUAL}" != "${FREETYPE_SHA256}" ]; then
+  echo "ERROR: the freetype tarball is not the one expected." >&2
+  echo "  expected ${FREETYPE_SHA256}" >&2
+  echo "  got      ${FREETYPE_ACTUAL}" >&2
+  exit 1
+fi
+echo "    checksum matches"
+
+mkdir -p freetype && tar xzf freetype.tar.gz -C freetype --strip-components=1
+cd freetype
+if ! PKG_CONFIG_LIBDIR="${PREFIX}/lib/pkgconfig" \
+     CPPFLAGS="-I${PREFIX}/include" \
+     LDFLAGS="-L${PREFIX}/lib" \
+     ./configure --prefix="${PREFIX}" --disable-shared --enable-static \
+     >"${WORK}/freetype-configure.log" 2>&1; then
+  echo "ERROR: freetype's configure failed. Its output:" >&2
+  tail -40 "${WORK}/freetype-configure.log" >&2
+  exit 1
+fi
+make -j"$(sysctl -n hw.ncpu)" >/dev/null 2>&1
+make install >/dev/null 2>&1
+
+if [ ! -x "${PREFIX}/bin/freetype-config" ]; then
+  echo "ERROR: freetype built but produced no freetype-config, which is what" >&2
+  echo "       dvdauthor looks for. It cannot be located without it." >&2
+  ls -la "${PREFIX}/bin" >&2 || true
+  exit 1
+fi
+echo "    installed into ${PREFIX}, with freetype-config"
+
 # --------------------------------------------------------------- dvdauthor ---
 echo ""
 echo "==> dvdauthor ${DVDAUTHOR_VERSION}: building (macOS ${MACOSX_DEPLOYMENT_TARGET})"
@@ -174,7 +221,9 @@ cd dvdauthor
 #   PKG_CONFIG_LIBDIR  overrides pkg-config's search path entirely, so the only
 #                      library it can see is the libpng built above.
 #   PATH               trimmed so `freetype-config` in /usr/local/bin is not
-#                      found. freetype is only used for text subtitles.
+#                      found -- but the prefix's own bin is put back in front,
+#                      because that is where the freetype-config just built
+#                      lives, and dvdauthor will not use freetype without it.
 #
 # pkg-config has to come from Homebrew and is resolved by absolute path first,
 # because after trimming PATH there is no pkg-config left to find.
@@ -184,7 +233,7 @@ if [ -z "${PKG_CONFIG_BIN}" ]; then
   exit 1
 fi
 
-export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="${PREFIX}/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PKG_CONFIG="${PKG_CONFIG_BIN}"
 export PKG_CONFIG_LIBDIR="${PREFIX}/lib/pkgconfig"
 
