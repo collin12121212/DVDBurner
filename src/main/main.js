@@ -473,7 +473,11 @@ function registerIpc() {
   handle('drives:list', async () => {
     const settings = settingsStore.read();
     tools = detectTools(settings);
-    const result = await disc.listDrives({ drutil: tools.drutil, diskutil: tools.diskutil });
+    const result = await disc.listDrives({
+      drutil: tools.drutil,
+      hdiutil: tools.hdiutil,
+      diskutil: tools.diskutil,
+    });
     return { ...result, note: result.note || (await disc.platformDiscNote()) };
   });
 

@@ -165,6 +165,55 @@ function parseDrutilXml(xml) {
 }
 
 /**
+ * Read the burner list that `hdiutil burn -list` prints.
+ *
+ * This is the enumeration that matters on macOS. `hdiutil burn -device` takes
+ * the DiscRecording IORegistry entry path — an "IOService:/..." string — and NOT
+ * a BSD node like /dev/disk5.
+ *
+ * That distinction is the likely reason burning failed on a Mac where DVDStyler
+ * burns the same drive happily: its source builds
+ * `hdiutil burn -device "<IORegistryEntryPath>" "<file.iso>"`, and it never
+ * passes a BSD node. "SupportLevel: Unsupported" is advisory metadata and does
+ * not stop hdiutil.
+ */
+function parseHdiutilBurnList(stdout) {
+  const text = String(stdout || '');
+  const drives = [];
+  const seen = new Set();
+
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim();
+    const at = line.indexOf('IOService:');
+    if (at === -1) continue;
+
+    // The path runs to the end of the line, because it ends with the drive's own
+    // name and that name contains spaces: ".../IOBlockStorageDriver/hp DVDRW
+    // DU8A6SH Medium". Cutting at the first space would truncate it.
+    const path = line.slice(at);
+    if (seen.has(path)) continue;
+    seen.add(path);
+
+    // Anything before the path on the same line describes the drive.
+    const lead = line.slice(0, at).replace(/\s+/g, ' ').trim();
+
+    drives.push({
+      id: path,
+      device: path,
+      vendor: '',
+      product: lead,
+      rev: '',
+      bus: '',
+      supportLevel: '',
+      writeCapable: true,
+      label: lead || 'Disc writer',
+    });
+  }
+
+  return drives;
+}
+
+/**
  * Read the "Key: value" listing that some versions of drutil produce.
  *
  * A real Mac reported its writer as one line of labelled fields —
@@ -337,7 +386,7 @@ function parseDrutilList(stdout) {
   return drives;
 }
 
-async function listDrives({ drutil, diskutil } = {}) {
+async function listDrives({ drutil, hdiutil, diskutil } = {}) {
   if (isWindows) return windowsDisc.listDrives();
   if (!isMac) return { supported: false, drives: [], note: 'Burning discs needs Windows or macOS.' };
 
@@ -346,7 +395,24 @@ async function listDrives({ drutil, diskutil } = {}) {
   // is not listed, this is the only thing that says why.
   let raw = '';
 
-  if (drutil) {
+  /*
+    Ask hdiutil first, because its device paths are the ones `hdiutil burn`
+    accepts. drutil knows drives hdiutil will not name, so it is still consulted
+    when hdiutil offers nothing — but a drive discovered that way has no usable
+    device path, and the burn is then told to use the only attached writer
+    instead of being handed a node hdiutil would reject.
+  */
+  if (hdiutil) {
+    try {
+      const { stdout } = await exec(hdiutil, ['burn', '-list']);
+      raw = stdout;
+      drives.push(...parseHdiutilBurnList(stdout));
+    } catch {
+      // Not every version supports it; drutil below is the fallback.
+    }
+  }
+
+  if (!drives.length && drutil) {
     try {
       // The XML form first, because it is unambiguous.
       const { stdout } = await exec(drutil, ['list', '-xml']);
@@ -382,7 +448,13 @@ async function listDrives({ drutil, diskutil } = {}) {
 
   // Ask each device whether media is present, so the UI can say "insert a disc"
   // rather than failing at the end of a long burn.
+  //
+  // Only for drives drutil named. `drutil status -drive` takes a BSD node, and a
+  // drive found through hdiutil has an IORegistry path instead; handing drutil
+  // the wrong kind of string would either error or, worse, answer about some
+  // other device. The label is cosmetic, so those simply go without.
   for (const drive of drives) {
+    if (!drutil || !/^\/dev\//.test(drive.device || '')) continue;
     try {
       const { stdout } = await exec(drutil, ['status', '-drive', drive.device]);
       drive.media = summariseMedia(stdout);
@@ -569,7 +641,23 @@ async function burnIso({ isoPath, device, hdiutil, onProgress, signal, verify = 
   return new Promise((resolve, reject) => {
     const args = ['burn', isoPath];
     if (verify) args.push('-verifyburn');
-    if (device) args.push('-device', device);
+
+    /*
+      No `-device` on macOS.
+
+      DVDStyler burns this same drive on this same Mac with
+      `hdiutil burn -device "<IORegistryEntryPath>" "<file.iso>"`, and the path
+      it passes is the one `hdiutil burn -list` prints — not a BSD node like
+      /dev/disk5, which is what this used to send and is the likeliest reason
+      burning failed where DVDStyler succeeded.
+
+      The path cannot be reconstructed safely: it ends with the drive's own name,
+      which contains spaces (".../IOBlockStorageDriver/hp DVDRW DU8A6SH Medium"),
+      so any attempt to cut it out of the listing risks passing a truncated one —
+      which hdiutil would reject, and worse than sending nothing. With no
+      `-device`, hdiutil uses the only attached writer, which is exactly right
+      here and no worse than a path it would have refused.
+    */
 
     const child = spawn(hdiutil, args, { windowsHide: true });
     let out = '';
@@ -706,6 +794,7 @@ module.exports = {
   parseDrutilList,
   parseDrutilXml,
   parseDrutilKeyValues,
+  parseHdiutilBurnList,
   drutilColumnStarts,
   parseDrutilRow,
 };

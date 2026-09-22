@@ -675,10 +675,48 @@ test('non-XML output is not mistaken for drives', () => {
 });
 
 /*
-  A real Mac reported its writer as one line of labelled fields rather than the
-  table, in this shape. Neither of the other two parsers could read it, so the
-  app said no burner was attached while DVDStyler was burning to it happily.
+  On macOS the device hdiutil wants is the DiscRecording IORegistry entry path
+  that `hdiutil burn -list` prints, not a BSD node. DVDStyler burns the drive in
+  question with exactly that form, which is the whole reason this exists.
 */
+test('an IORegistry path keeps the spaces in the drive name', () => {
+  // The path ENDS with the drive's name, and that name contains spaces. Cutting
+  // at the first space truncates it, and a truncated path is worse than none.
+  const line =
+    'IOService:/AppleUSBHost/AppleUSBDevice/IOUSBHostInterface/' +
+    'IOBlockStorageDriver/hp DVDRW DU8A6SH Medium';
+
+  const drives = disc.parseHdiutilBurnList(line);
+  assertEqual(drives.length, 1, 'one drive');
+  assertEqual(drives[0].device, line, 'the whole path, spaces and all');
+  assert(drives[0].id, 'with an id to select it by');
+});
+
+test('several burners from hdiutil are all listed once each', () => {
+  const out = [
+    'IOService:/AppleACPIPlatformExpert/PCI0@0/IOBlockStorageDriver/HL-DT-ST DVDRAM GP65NB60 Medium',
+    'IOService:/AppleUSBHost/AppleUSBDevice/IOBlockStorageDriver/hp DVDRW DU8A6SH Medium',
+    'IOService:/AppleUSBHost/AppleUSBDevice/IOBlockStorageDriver/hp DVDRW DU8A6SH Medium',
+  ].join('\n');
+
+  const drives = disc.parseHdiutilBurnList(out);
+  assertEqual(drives.length, 2, 'two drives, not three');
+  assert(drives[0].device.includes('HL-DT-ST'), 'the first');
+  assert(drives[1].device.includes('DU8A6SH'), 'the second');
+});
+
+test('output with no IORegistry path yields no drives', () => {
+  // So the caller falls through to drutil rather than inventing a burner.
+  assertEqual(disc.parseHdiutilBurnList('').length, 0, 'empty');
+  assertEqual(disc.parseHdiutilBurnList('hdiutil: burn: no devices').length, 0, 'a message');
+  assertEqual(
+    disc.parseHdiutilBurnList('   Vendor   Product   DeviceNode\n   hp  DVDRW  /dev/disk5').length,
+    0,
+    'a drutil table'
+  );
+});
+
+
 test('the labelled listing is read, device node or not', () => {
   const line =
     '   Vendor: 1   Product: hp DVDRW DU8A6SH   Rev: DH61   Bus: USB   ' +
