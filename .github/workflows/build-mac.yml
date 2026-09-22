@@ -127,6 +127,14 @@ jobs:
           ls -la vendor/bin
           ls -la vendor/bin/lib | head -40
 
+          # The rebuilt binaries must still be x86_64. Rewriting load commands
+          # has never changed an architecture, but this is the one place where a
+          # surprise would be silent until somebody's Mac refused to run it.
+          for tool in ffmpeg ffprobe dvdauthor spumux; do
+            echo -n "${tool} arch after relocation: "
+            lipo -archs "vendor/bin/${tool}"
+          done
+
       - name: Verify the bundled tools run from a different directory
         run: |
           set -euo pipefail

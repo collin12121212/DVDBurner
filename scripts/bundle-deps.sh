@@ -23,6 +23,17 @@
 
 set -euo pipefail
 
+# Say where it stopped, not just that it did.
+#
+# Under `set -e` the script dies on the first command that returns non-zero, and
+# prints nothing about which one. From the outside that is a failed step with no
+# explanation, which is impossible to act on: the exit status says the walk
+# stopped, but not whether it was a missing tool, a missing library, a `find`
+# that did not understand an argument, or a rewrite that did not take.
+trap 'status=$?; if [ "${status}" -ne 0 ]; then
+        echo "ERROR: bundle-deps.sh stopped at line ${LINENO} (exit ${status})" >&2
+      fi' ERR
+
 OUT_DIR="${1:?usage: bundle-deps.sh <output-dir> <binary> [binary...]}"
 shift
 
@@ -121,7 +132,8 @@ stage_library() {
 patch_file() {
   local target="$1"
   local mode
-  mode="$(stat -f '%p' "${target}")"
+  mode="$(stat -f '%p' "${target}" 2>/dev/null || echo '')"
+  [ -n "${mode}" ] || mode='755'
   chmod u+w "${target}"
 
   local deps dep resolved staged new_ref
@@ -146,7 +158,7 @@ patch_file() {
     fi
   done <<< "${deps}"
 
-  chmod "${mode}" "${target}"
+  chmod "${mode}" "${target}" 2>/dev/null || true
 }
 
 resign() {
@@ -204,8 +216,16 @@ for binary in "$@"; do
 done
 
 # Anything still pointing at a Homebrew path would fail on the user's machine.
+echo "Verifying nothing still points at Homebrew..."
 failures=0
 while IFS= read -r file; do
+  # Which files to check is decided here rather than by `find -perm`, because
+  # -perm with a symbolic mode is a GNU extension and this runs on BSD find.
+  case "${file}" in
+    *.dylib) ;;
+    *) [ -x "${file}" ] || continue ;;
+  esac
+
   if otool -L "${file}" 2>/dev/null | tail -n +2 | grep -qE '/opt/homebrew|/usr/local'; then
     echo "ERROR: ${file} still references a Homebrew path:" >&2
     otool -L "${file}" | tail -n +2 | grep -E '/opt/homebrew|/usr/local' >&2 || true
@@ -222,7 +242,7 @@ while IFS= read -r file; do
     done < <(otool -L "${file}" 2>/dev/null | tail -n +2 | grep -E '/opt/homebrew|/usr/local' | awk '{print $1}' || true)
     failures=$((failures + 1))
   fi
-done < <(find "${OUT_DIR}" -type f \( -perm -u+x -o -name '*.dylib' \))
+done < <(find "${OUT_DIR}" -type f)
 
 if [ "${failures}" -gt 0 ]; then
   echo "Bundling failed: ${failures} file(s) are not relocatable." >&2
