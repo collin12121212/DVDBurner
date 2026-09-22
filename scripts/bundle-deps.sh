@@ -140,8 +140,28 @@ patch_file() {
   [ -n "${mode}" ] || mode='755'
   chmod u+w "${target}"
 
+  # A library's own install name is the second line of `otool -L`, and it has to
+  # become relocatable as well: it is what dyld records when something loads this
+  # library, so leaving it pointing into a Homebrew cellar that exists on this
+  # machine and nowhere else is the very thing this script is here to prevent.
+  #
+  # `install_name_tool -change` cannot alter it -- that needs `-id`. Feeding the
+  # install name to -change is what used to happen, because only the header line
+  # was being skipped, and -change quietly did nothing to it. Every library kept a
+  # Homebrew path and the final check failed with 21 of them listed. Executables
+  # were fine, which is the clue: they have no install name to confuse it.
+  local is_lib=0
+  case "${target}" in *.dylib) is_lib=1 ;; esac
+
+  if [ "${is_lib}" -eq 1 ]; then
+    install_name_tool -id "@loader_path/$(basename "${target}")" "${target}" 2>/dev/null || \
+      echo "  warning: could not set the install name of ${target}" >&2
+  fi
+
   local deps dep resolved staged new_ref
-  deps="$(otool -L "${target}" 2>/dev/null | tail -n +2 | awk '{print $1}' || true)"
+  # Skip the header, and for a library its install name too, so only real
+  # dependencies are rewritten.
+  deps="$(otool -L "${target}" 2>/dev/null | tail -n +$((is_lib + 2)) | awk '{print $1}' || true)"
 
   while IFS= read -r dep; do
     [ -z "${dep}" ] && continue
@@ -154,7 +174,10 @@ patch_file() {
 
     # The new reference depends on where the *referencing* file lives.
     new_ref="$(ref_for "${target}" "${resolved}")"
-    install_name_tool -change "${dep}" "${new_ref}" "${target}" 2>/dev/null || true
+    # Not silenced: a rewrite that does not take is the failure this whole script
+    # exists to catch, and hiding the reason for it costs a build cycle to find.
+    install_name_tool -change "${dep}" "${new_ref}" "${target}" 2>/tmp/install_name_tool.err || \
+      echo "  warning: could not repoint ${dep} in ${target}: $(cat /tmp/install_name_tool.err 2>/dev/null)" >&2
 
     # Stage any newly discovered library for its own dependencies to be walked.
     if [ -n "${staged}" ]; then
