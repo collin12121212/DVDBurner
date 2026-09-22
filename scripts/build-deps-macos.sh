@@ -47,6 +47,8 @@ PREFIX="${WORK}/local"
 mkdir -p "${PREFIX}" "${WORK}/src"
 
 LIBPNG_VERSION="1.6.44"
+ZLIB_VERSION="1.3.1"
+ZLIB_SHA256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
 DVDAUTHOR_VERSION="0.7.2"
 # MacPorts mirrors the upstream tarball byte for byte, which is why the checksum
 # below -- the one Homebrew publishes -- matches it.
@@ -93,6 +95,35 @@ fetch_static() {
 fetch_static ffmpeg
 fetch_static ffprobe
 
+# ------------------------------------------------------------------- zlib ---
+# libpng's pkg-config file lists zlib, and macOS ships the library but no
+# zlib.pc at all — which is why the lookup fails with "Package 'zlib', required
+# by 'libpng', not found". Building it here keeps everything self-contained
+# rather than reaching for the system copy, whose version is not ours to choose.
+echo ""
+echo "==> zlib ${ZLIB_VERSION}: building (static, macOS ${MACOSX_DEPLOYMENT_TARGET})"
+cd "${WORK}/src"
+curl -fsSL --retry 3 --retry-delay 2 -o zlib.tar.gz \
+  "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"
+
+# Checked for the same reason as dvdauthor's: a download that is not the file it
+# claims to be should fail here, not be compiled and shipped.
+ZLIB_ACTUAL="$(shasum -a 256 zlib.tar.gz | awk '{print $1}')"
+if [ "${ZLIB_ACTUAL}" != "${ZLIB_SHA256}" ]; then
+  echo "ERROR: the zlib tarball is not the one expected." >&2
+  echo "  expected ${ZLIB_SHA256}" >&2
+  echo "  got      ${ZLIB_ACTUAL}" >&2
+  exit 1
+fi
+echo "    checksum matches"
+
+mkdir -p zlib && tar xzf zlib.tar.gz -C zlib --strip-components=1
+cd zlib
+./configure --prefix="${PREFIX}" --static >/dev/null
+make -j"$(sysctl -n hw.ncpu)" >/dev/null 2>&1
+make install >/dev/null 2>&1
+echo "    installed into ${PREFIX}"
+
 # ------------------------------------------------------------------ libpng ---
 # Needed by spumux to read the button highlight images, which are PNGs.
 echo ""
@@ -105,7 +136,10 @@ curl -fsSL --retry 3 --retry-delay 2 -o libpng.tar.gz \
 
 mkdir -p libpng && tar xzf libpng.tar.gz -C libpng --strip-components=1
 cd libpng
-./configure --prefix="${PREFIX}" --disable-shared --enable-static >/dev/null
+# PKG_CONFIG_LIBDIR points only at this prefix, so zlib has to be visible to
+# libpng's own configure for the same reason dvdauthor needs it to be.
+PKG_CONFIG_LIBDIR="${PREFIX}/lib/pkgconfig" \
+  ./configure --prefix="${PREFIX}" --disable-shared --enable-static >/dev/null
 make -j"$(sysctl -n hw.ncpu)" >/dev/null 2>&1
 make install >/dev/null 2>&1
 echo "    installed into ${PREFIX}"
