@@ -20,6 +20,7 @@ const dvdNav = require('../src/core/dvd_nav');
 const dvdModel = require('../src/core/dvd_model');
 const author = require('../src/core/author');
 const deckModel = require('../src/core/deck');
+const disc = require('../src/core/disc');
 
 let passed = 0;
 let failed = 0;
@@ -495,6 +496,91 @@ test('a slide with a film and its own buttons still plays the film', () => {
   // the page rather than jumping somewhere unrelated.
   const pageForWords = model.menus.find((m) => m.slideId === 'ep-2');
   assert(pageForWords, 'The slide with buttons is a menu page of its own');
+});
+
+// ------------------------------------------------- the disc writer on macOS ---
+
+section('Finding a disc writer');
+
+/*
+  `drutil list` is what macOS gives us, and every column in it can contain a
+  space. Reading the fields by counting back from the end of the line got the bus
+  as "Apple" and the support level as the wrong word, and then refused the drive
+  because of it — so the app said no burner was attached while one sat there
+  plugged in. These are the shapes that have to survive.
+*/
+test('a USB writer with a two-word support level is found', () => {
+  const out = [
+    '   Vendor   Product           Rev   Bus           SupportLevel             DeviceNode',
+    '   hp       DVDRW  DU8A6SH    DH61  USB           Apple Supported          /dev/disk5',
+  ].join('\n');
+
+  const drives = disc.parseDrutilList(out);
+  assertEqual(drives.length, 1, 'one drive');
+  assertEqual(drives[0].device, '/dev/disk5', 'the device node');
+  assertEqual(drives[0].vendor, 'hp', 'the vendor');
+  assertEqual(drives[0].bus, 'USB', 'the bus, not the first word of the support level');
+  assertEqual(drives[0].rev, 'DH61', 'the revision');
+  assertEqual(drives[0].supportLevel, 'Apple Supported', 'the whole support level');
+  assertEqual(drives[0].writeCapable, true, 'and it can write');
+});
+
+test('a product name containing spaces stays in one piece', () => {
+  const out = [
+    '   Vendor   Product           Rev   Bus           SupportLevel             DeviceNode',
+    '   HL-DT-ST DVDRAM GP65NB60   PF00  USB           Apple Shipping           /dev/disk4',
+  ].join('\n');
+
+  const drives = disc.parseDrutilList(out);
+  assertEqual(drives[0].product, 'DVDRAM GP65NB60', 'the product keeps its second word');
+  assertEqual(drives[0].vendor, 'HL-DT-ST', 'and the vendor is not swallowed');
+  assertEqual(drives[0].label, 'HL-DT-ST DVDRAM GP65NB60', 'the label reads naturally');
+});
+
+test('an unrecognised support level still counts as writable', () => {
+  // Being strict here hid working burners. Only an explicit "Unsupported" is
+  // taken at its word.
+  const out = [
+    '   Vendor   Product           Rev   Bus           SupportLevel             DeviceNode',
+    '   hp       DVDRW  DU8A6SH    DH61  USB           Vendor Specific          /dev/disk5',
+    '   bogus    Not A Burner      X1    USB           Unsupported              /dev/disk9',
+  ].join('\n');
+
+  const drives = disc.parseDrutilList(out);
+  assertEqual(drives.length, 2, 'both rows are parsed');
+  assertEqual(drives[0].writeCapable, true, 'an unfamiliar level is not a refusal');
+  assertEqual(drives[1].writeCapable, false, 'but "Unsupported" is believed');
+});
+
+test('several writers are all listed, and nothing else is', () => {
+  const out = [
+    '   Vendor   Product           Rev   Bus           SupportLevel             DeviceNode',
+    '   HL-DT-ST DVDRAM GP65NB60   PF00  USB           Apple Shipping           /dev/disk4',
+    '   hp       DVDRW  DU8A6SH    DH61  USB           Apple Supported          /dev/disk5',
+    '',
+    'No media inserted',
+  ].join('\n');
+
+  assertEqual(disc.parseDrutilList(out).length, 2, 'exactly the two device rows');
+});
+
+test('output with no usable header still yields the drive', () => {
+  // An unfamiliar layout must not mean "no burner", which is the failure this
+  // whole section exists to prevent.
+  const out = [
+    'Vendor Product Rev Bus SupportLevel DeviceNode',
+    'hp DVDRW_8A6SH DH61 USB Apple Supported /dev/disk5',
+  ].join('\n');
+
+  const drives = disc.parseDrutilList(out);
+  assertEqual(drives.length, 1, 'the drive is still found');
+  assertEqual(drives[0].device, '/dev/disk5', 'with its device node');
+  assertEqual(drives[0].writeCapable, true, 'and it is usable');
+});
+
+test('empty output is no drives, not an error', () => {
+  assertEqual(disc.parseDrutilList('').length, 0, 'nothing in, nothing out');
+  assertEqual(disc.parseDrutilList('No drives found').length, 0, 'so is a plain message');
 });
 
 // ------------------------------------------------------- the disc's shape ---

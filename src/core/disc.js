@@ -35,59 +35,143 @@ const exec = (file, args, opts = {}) =>
  *
  * `drutil list` output looks like:
  *
- *   Vendor   Product           Rev   Bus   SupportLevel  DeviceNode
- *   HL-DT-ST DVDRAM GP65NB60   PF00  USB   Apple Shipping /dev/disk4
+ *   Vendor   Product           Rev   Bus           SupportLevel             DeviceNode
+ *   HL-DT-ST DVDRAM GP65NB60   PF00  USB   Apple Shipping                 /dev/disk4
  *
  * The SupportLevel column is what tells us whether it can actually write.
  * An external USB writer on a 2017 MacBook Air lands here; the machine has no
  * internal drive at all.
+ *
+ * The columns are read by position, taken from the header line, because every
+ * field can contain spaces — "DVDRAM GP65NB60" is one product name, and
+ * "Apple Supported" is one support level. Splitting on whitespace and counting
+ * back from the end gets both wrong: it reported the bus as "Apple" and the
+ * product as "DVDRAM GP65NB60 DH61 USB", and then refused the drive because the
+ * support level it compared against was the wrong word entirely.
  */
+const DRUTIL_COLUMNS = ['Vendor', 'Product', 'Rev', 'Bus', 'SupportLevel', 'DeviceNode'];
+
+function drutilColumnStarts(headerLine) {
+  const starts = [];
+  for (const name of DRUTIL_COLUMNS) {
+    const at = headerLine.indexOf(name);
+    if (at === -1) return null;
+    starts.push({ name, at });
+  }
+  // The columns have to be in the order drutil prints them, or the slices below
+  // would cut across fields.
+  for (let i = 1; i < starts.length; i += 1) {
+    if (starts[i].at <= starts[i - 1].at) return null;
+  }
+  return starts;
+}
+
+/** One `drutil list` row, cut into its columns by the header's own positions. */
+function parseDrutilRow(line, starts) {
+  const field = {};
+  for (let i = 0; i < starts.length; i += 1) {
+    const from = starts[i].at;
+    const to = i + 1 < starts.length ? starts[i + 1].at : line.length;
+    field[starts[i].name] = line.slice(from, to).trim();
+  }
+  return field;
+}
+
+/**
+ * Turn the raw output of `drutil list` into drive records.
+ *
+ * Separated out so it can be tested against real output from a Mac without a
+ * Mac and without a drive attached.
+ */
+function parseDrutilList(stdout) {
+  const drives = [];
+  const lines = String(stdout || '').split('\n');
+  const headerLine = lines.find((l) => /Vendor\s+Product/i.test(l)) || '';
+  // Null when the header is not the shape we know, in which case the row
+  // parser below reads the fields by position from the end instead.
+  const starts = drutilColumnStarts(headerLine);
+
+  for (const line of lines) {
+    if (!/\/dev\/disk\d+/.test(line)) continue;
+    if (/^\s*Vendor\s+Product/i.test(line)) continue;
+
+    const nodeMatch = /(\/dev\/disk\d+)/.exec(line);
+    if (!nodeMatch) continue;
+
+    let vendor = '';
+    let product = '';
+    let rev = '';
+    let bus = '';
+    let support = '';
+
+    if (starts) {
+      const field = parseDrutilRow(line, starts);
+      vendor = field.Vendor || '';
+      product = field.Product || '';
+      rev = field.Rev || '';
+      bus = field.Bus || '';
+      support = field.SupportLevel || '';
+    } else {
+      // No usable header: take the device node off, and the four fields before
+      // it are vendor, product, rev and bus, with the product being everything
+      // between the first token and the last three.
+      const beforeNode = line.slice(0, nodeMatch.index).trim();
+      const supportMatch = /(Apple Shipping|Apple Supported|Unsupported)\s*$/i.exec(beforeNode);
+      support = supportMatch ? supportMatch[1] : '';
+      const head = supportMatch ? beforeNode.slice(0, supportMatch.index).trim() : beforeNode;
+      const parts = head.split(/\s+/);
+      vendor = parts[0] || '';
+      bus = parts.length >= 2 ? parts[parts.length - 1] : '';
+      rev = parts.length >= 3 ? parts[parts.length - 2] : '';
+      product = parts.length >= 4 ? parts.slice(1, parts.length - 2).join(' ') : '';
+    }
+
+    /*
+      A drive drutil lists is a drive it can write to, unless it says otherwise.
+
+      This used to require the support level to read "Apple Shipping" or "Apple
+      Supported" before the drive counted as usable. Anything else — including a
+      level this does not recognise, or none at all — silently made a perfectly
+      good burner invisible, which is a bad failure for a button whose whole job
+      is to write a disc. Only an explicit "Unsupported" is taken at its word.
+    */
+    const unsupported = /Unsupported/i.test(support);
+
+    drives.push({
+      id: nodeMatch[1],
+      device: nodeMatch[1],
+      vendor,
+      product,
+      rev,
+      bus,
+      supportLevel: support,
+      writeCapable: !unsupported,
+      label: [vendor, product].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() || nodeMatch[1],
+    });
+  }
+
+  return drives;
+}
+
 async function listDrives({ drutil, diskutil } = {}) {
   if (isWindows) return windowsDisc.listDrives();
   if (!isMac) return { supported: false, drives: [], note: 'Burning discs needs Windows or macOS.' };
 
   const drives = [];
+  // Kept and returned so Setup can show it. If a burner is plugged in and still
+  // is not listed, this is the only thing that says why.
+  let raw = '';
 
   if (drutil) {
     try {
       const { stdout } = await exec(drutil, ['list']);
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        // Skip the header and anything that is not a device row.
-        if (!/\/dev\/disk/.test(line)) continue;
-        if (/^\s*Vendor\s+Product/i.test(line)) continue;
-
-        const nodeMatch = /(\/dev\/disk\d+)/.exec(line);
-        if (!nodeMatch) continue;
-
-        const beforeNode = line.slice(0, nodeMatch.index);
-        const supportMatch = beforeNode.match(/(Apple Shipping|Apple Supported|Apple Supported\/Third Party|Unsupported|\S+)\s*$/);
-        const support = supportMatch ? supportMatch[1] : '';
-
-        // The fixed columns are vendor, product, rev, bus; the rest is support
-        // level. Splitting conservatively keeps product names with spaces intact.
-        const parts = beforeNode.trim().split(/\s{1,}/);
-        const bus = parts.length >= 4 ? parts[parts.length - 2] : '';
-        const rev = parts.length >= 3 ? parts[parts.length - 3] : '';
-        const product = parts.length >= 3 ? parts.slice(1, parts.length - 2).join(' ') : beforeNode.trim();
-        const vendor = parts[0] || '';
-
-        drives.push({
-          id: nodeMatch[1],
-          device: nodeMatch[1],
-          vendor,
-          product,
-          rev,
-          bus,
-          supportLevel: support,
-          writeCapable: !/Unsupported/i.test(support) && /Apple (Shipping|Supported)/i.test(support),
-          label: [vendor, product].filter(Boolean).join(' ').trim() || nodeMatch[1],
-        });
-      }
+      raw = stdout;
+      drives.push(...parseDrutilList(stdout));
     } catch (err) {
       return {
         supported: true,
         drives: [],
+        raw,
         note: 'The drive list could not be read. Connect the burner and try again.',
         error: String(err.message || err),
       };
@@ -105,7 +189,7 @@ async function listDrives({ drutil, diskutil } = {}) {
     }
   }
 
-  return { supported: true, drives, note: null };
+  return { supported: true, drives, raw, note: null };
 }
 
 function summariseMedia(output) {
@@ -415,4 +499,9 @@ module.exports = {
   summariseMedia,
   describeBurnFailure,
   describeIsoFailure,
+  // Exported so the drive listing can be tested against real `drutil list`
+  // output without a Mac and without a drive attached.
+  parseDrutilList,
+  drutilColumnStarts,
+  parseDrutilRow,
 };

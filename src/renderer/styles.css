@@ -100,6 +100,46 @@ textarea {
   padding-left: 18px;
 }
 
+/*
+  Anything clickable in the drag strip has to opt out of it.
+
+  `-webkit-app-region: drag` turns every press inside the element into a window
+  drag, so a button in there never receives its click -- the whole window moves
+  instead. Only the step navigation was opted out, which is why Save, Share,
+  Setup and the Projects button all did nothing on macOS while looking perfectly
+  normal: the click was going to the window, not to them.
+
+  Matched by element rather than by class so a control added later cannot
+  silently reintroduce the same bug.
+*/
+.titlebar button,
+.titlebar a,
+.titlebar input,
+.titlebar select,
+.titlebar textarea,
+.titlebar label,
+.titlebar [role='button'],
+.titlebar [tabindex] {
+  -webkit-app-region: no-drag;
+}
+
+/* The system's own words about the disc writer, kept monospaced so the columns
+   line up and can be compared with what the drive tool actually printed. */
+.diag-raw {
+  margin: 10px 0 0;
+  padding: 12px 14px;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--ink-sunken);
+  border: 1px solid var(--ink-line);
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--paper-dim);
+  white-space: pre;
+}
+
 .brand {
   display: flex;
   align-items: baseline;

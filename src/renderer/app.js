@@ -4002,6 +4002,63 @@ async function renderSetupDialog() {
   );
 
   /*
+    What the disc writer check found, verbatim.
+
+    A burner that is plugged in and still not listed is the one failure with no
+    useful symptom: the page simply says none was found. The raw output of the
+    system's own drive listing is included because an unfamiliar layout is the
+    likeliest reason, and reading it back is the only way to tell.
+  */
+  try {
+    const driveInfo = await api.drives.list();
+    const found = (driveInfo && driveInfo.drives) || [];
+    const section = el('div', { style: 'margin-top: 18px' }, [
+      el('div', { class: 'rule', text: 'Disc writer' }),
+      el('p', {
+        class: 'hint',
+        style: 'margin-bottom: 10px',
+        text: found.length
+          ? `${found.length} ${found.length === 1 ? 'writer' : 'writers'} found.`
+          : driveInfo && driveInfo.note
+            ? driveInfo.note
+            : 'No disc writer was found. Plug the burner in and press Refresh.',
+      }),
+    ]);
+
+    for (const drive of found) {
+      section.append(
+        el('div', { class: 'stat', style: 'margin-bottom: 4px' }, [
+          el('span', { class: 'stat-key', text: drive.device }),
+          el('span', {
+            class: 'stat-value',
+            text: `${drive.label || 'unknown'}  \u00b7  ${drive.supportLevel || 'no support level'}${
+              drive.media && drive.media.present ? '  \u00b7  disc in drive' : '  \u00b7  no disc'
+            }`,
+          }),
+        ])
+      );
+    }
+
+    if (driveInfo && driveInfo.raw) {
+      section.append(
+        el('details', { style: 'margin-top: 10px' }, [
+          el('summary', { class: 'hint', text: 'What the system reported' }),
+          el('pre', { class: 'diag-raw', text: String(driveInfo.raw).trim() || '(nothing)' }),
+        ])
+      );
+    }
+    if (driveInfo && driveInfo.error) {
+      section.append(el('p', { class: 'hint', text: `Error: ${driveInfo.error}` }));
+    }
+
+    body.append(section);
+  } catch (err) {
+    body.append(
+      el('p', { class: 'hint', style: 'margin-top: 14px', text: `Disc writer check failed: ${String(err.message || err)}` })
+    );
+  }
+
+  /*
     Say exactly what is missing and how to get it.
 
     This used to tell Windows users the tools "cannot be installed", which is
