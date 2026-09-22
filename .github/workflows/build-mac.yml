@@ -137,38 +137,6 @@ jobs:
             lipo -archs "vendor/bin/${tool}"
           done
 
-      - name: Publish the bundling output where it can be read
-        if: failure()
-        run: |
-          # Reading a failed step's log through the API needs a token, which
-          # this repository does not have. Publishing the output to a branch
-          # makes a failure readable with nothing but a clone, instead of
-          # somebody having to copy it out of the web interface by hand.
-          {
-            echo "=== bundle-deps output ==="
-            cat /tmp/bundle.log 2>/dev/null || echo "(nothing was captured)"
-            echo
-            echo "=== run context ==="
-            echo "runner: $(uname -m) $(sw_vers -productVersion 2>/dev/null)"
-            echo "brew prefix: $(brew --prefix 2>/dev/null)"
-            echo
-            echo "=== what each tool links against ==="
-            for tool in ffmpeg ffprobe dvdauthor spumux; do
-              echo "--- ${tool}"
-              otool -L "$(command -v ${tool} 2>/dev/null)" 2>/dev/null | tail -n +2 || true
-            done
-            echo
-            echo "=== anything that came out of the bundling ==="
-            find vendor -type f 2>/dev/null | head -60 || true
-          } > ci-diagnostics.txt 2>&1 || true
-
-          git config user.name 'github-actions'
-          git config user.email 'github-actions@users.noreply.github.com'
-          git checkout -B ci-diagnostics
-          git add -f ci-diagnostics.txt
-          git commit -m "Bundling diagnostics for ${GITHUB_SHA}" || true
-          git push -f origin ci-diagnostics || true
-
       - name: Verify the bundled tools run from a different directory
         run: |
           set -euo pipefail
@@ -319,6 +287,60 @@ jobs:
             dist/*.dmg
             dist/*.zip
           if-no-files-found: error
+
+      - name: Publish diagnostics if anything failed
+        if: failure()
+        run: |
+          # Reading a failed step's log through the API needs a token this
+          # repository does not have, so a failure is otherwise invisible except
+          # by copying it out of the web interface by hand. This runs last and on
+          # any failure, and gathers everything needed to explain one, so that a
+          # failing build does not also mean a round trip.
+          {
+            echo "=== runner ==="
+            uname -m
+            sw_vers 2>/dev/null || true
+            echo "brew prefix: $(brew --prefix 2>/dev/null || echo unknown)"
+            echo
+            echo "=== bundle-deps output ==="
+            cat /tmp/bundle.log 2>/dev/null || echo "(nothing was captured)"
+            echo
+            echo "=== the bundled tools as built ==="
+            for tool in ffmpeg ffprobe dvdauthor spumux; do
+              echo "--- ${tool}"
+              if [ -e "vendor/bin/${tool}" ]; then
+                echo -n "architectures: "; lipo -archs "vendor/bin/${tool}" 2>&1 || true
+                echo "minimum macOS: $(otool -l "vendor/bin/${tool}" 2>/dev/null \
+                  | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' \
+                  | grep -E '^ *(minos|version) ' | head -1 | awk '{print $2}')"
+                echo "linked against:"
+                otool -L "vendor/bin/${tool}" 2>/dev/null | tail -n +2 || true
+              else
+                echo "(not present)"
+              fi
+            done
+            echo
+            echo "=== the same for what Homebrew installed ==="
+            for tool in ffmpeg ffprobe dvdauthor spumux; do
+              P="$(command -v ${tool} 2>/dev/null || true)"
+              [ -n "${P}" ] || continue
+              echo "--- ${tool} (${P})"
+              echo "minimum macOS: $(otool -l "${P}" 2>/dev/null \
+                | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' \
+                | grep -E '^ *(minos|version) ' | head -1 | awk '{print $2}')"
+            done
+            echo
+            echo "=== what was produced ==="
+            find vendor -type f 2>/dev/null | head -60 || true
+            ls -la dist 2>/dev/null || echo "(no dist)"
+          } > ci-diagnostics.txt 2>&1 || true
+
+          git config user.name 'github-actions'
+          git config user.email 'github-actions@users.noreply.github.com'
+          git checkout -B ci-diagnostics
+          git add -f ci-diagnostics.txt
+          git commit -m "Build diagnostics for ${GITHUB_SHA}" || true
+          git push -f origin ci-diagnostics || true
 
       - name: Publish a release
         if: startsWith(github.ref, 'refs/tags/v')
