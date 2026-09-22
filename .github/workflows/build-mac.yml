@@ -88,67 +88,33 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install the tools
+      - name: Build the tools for macOS 12
         run: |
-          # No `brew update`; the runner image is already current.
-          brew install ffmpeg dvdauthor
+          set -euo pipefail
+          chmod +x scripts/build-deps-macos.sh
+          # No Homebrew: on this runner every bottle needs macOS 14, and the Mac
+          # this app is for cannot run anything newer than 12.7.6.
+          ./scripts/build-deps-macos.sh vendor/bin 2>&1 | tee /tmp/bundle.log
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Show what the tools link against
-        run: |
-          # Printed before any rewriting, so a bundling failure can be read
-          # straight off the log. Working out what a relocator tripped over from
-          # its error message alone is guesswork.
-          for tool in ffmpeg ffprobe dvdauthor spumux; do
-            echo "=== ${tool} ($(command -v ${tool})) ==="
-            otool -L "$(command -v ${tool})" | tail -n +2
-          done
-
-      - name: Collect and relocate the tools
+      - name: Verify the bundled tools run with nothing else on the machine
         run: |
           set -euo pipefail
-          chmod +x scripts/bundle-deps.sh
-
-          mkdir -p vendor/bin
-
-          FFMPEG="$(command -v ffmpeg)"
-          FFPROBE="$(command -v ffprobe)"
-          DVDAUTHOR="$(command -v dvdauthor)"
-          SPUMUX="$(command -v spumux)"
-
-          echo "Found: $FFMPEG $FFPROBE $DVDAUTHOR $SPUMUX"
-
-          # Tee to a file as well as the log. `pipefail` is set above, so a
-          # failure here still fails the step.
-          ./scripts/bundle-deps.sh vendor/bin \
-            "$FFMPEG" "$FFPROBE" "$DVDAUTHOR" "$SPUMUX" 2>&1 | tee /tmp/bundle.log
-
-          echo "--- bundled ---"
-          ls -la vendor/bin
-          ls -la vendor/bin/lib | head -40
-
-          # The rebuilt binaries must still be x86_64. Rewriting load commands
-          # has never changed an architecture, but this is the one place where a
-          # surprise would be silent until somebody's Mac refused to run it.
-          for tool in ffmpeg ffprobe dvdauthor spumux; do
-            echo -n "${tool} arch after relocation: "
-            lipo -archs "vendor/bin/${tool}"
-          done
-
-      - name: Verify the bundled tools run from a different directory
-        run: |
-          set -euo pipefail
-          # Moving the bundle proves nothing depends on Homebrew still being on
-          # the path. This is the check that catches a missed dylib.
+          # Moving them somewhere else and emptying the environment proves they
+          # are self-contained: a tool still reaching for a build-machine library
+          # dies here with a dyld error rather than on somebody's laptop.
           mkdir -p /tmp/relocated
           cp -R vendor/bin /tmp/relocated/bin
           cd /tmp
-          env -i PATH=/usr/bin:/bin /tmp/relocated/bin/ffmpeg -version | head -1
-          env -i PATH=/usr/bin:/bin /tmp/relocated/bin/ffprobe -version | head -1
+          for tool in ffmpeg ffprobe; do
+            env -i PATH=/usr/bin:/bin "/tmp/relocated/bin/${tool}" -version | head -1
+          done
+          # dvdauthor prints its version and exits non-zero, which is its choice.
           env -i PATH=/usr/bin:/bin /tmp/relocated/bin/dvdauthor --version 2>&1 | head -1 || true
-          echo "All bundled tools ran without Homebrew present."
+          env -i PATH=/usr/bin:/bin /tmp/relocated/bin/spumux 2>&1 | head -1 || true
+          echo "All four ran from a directory with nothing but the system on PATH."
 
       - name: Confirm the bundled tools are Intel and will run on macOS 12
         run: |
@@ -220,12 +186,33 @@ jobs:
               echo "ERROR: vendor/bin/${tool} is missing; the app would ship without it." >&2
               exit 1
             fi
+            # And each one has to be on its own: there is no lib directory to
+            # carry, because every tool is built to run against macOS alone.
+            if otool -L "vendor/bin/${tool}" | tail -n +2 \
+                 | grep -qvE '^\s*(/usr/lib/|/System/Library/)'; then
+              echo "ERROR: vendor/bin/${tool} depends on something that is not part of macOS:" >&2
+              otool -L "vendor/bin/${tool}" | tail -n +2 \
+                | grep -vE '^\s*(/usr/lib/|/System/Library/)' >&2
+              exit 1
+            fi
           done
-          if [ ! -d "vendor/bin/lib" ]; then
-            echo "ERROR: vendor/bin/lib is missing; the tools would not run on another Mac." >&2
-            exit 1
-          fi
-          echo "All four tools and $(ls vendor/bin/lib | wc -l | tr -d ' ') libraries are present."
+          echo "All four tools are present and depend only on macOS itself."
+
+      - name: Build a real disc with the tools that will ship
+        run: |
+          set -euo pipefail
+          # The test job runs the pipeline against Homebrew's tools, which target
+          # a newer macOS than this app does. This runs it against the exact
+          # binaries going into the .dmg: vendor/bin is found before anything on
+          # PATH, so these are the ones used.
+          #
+          # That turns "the tools are present and labelled correctly" into "the
+          # tools can actually author a disc", which is the claim that matters.
+          node -e "
+            const t = require('./src/core/tools').detectTools({});
+            for (const k of ['ffmpeg', 'ffprobe', 'dvdauthor', 'spumux']) console.log(k, '->', t[k]);
+          "
+          npm run test:core
 
       - name: Package version
         id: package
