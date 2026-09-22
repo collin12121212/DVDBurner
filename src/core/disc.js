@@ -462,6 +462,16 @@ async function listDrives({ drutil, hdiutil, diskutil } = {}) {
     try {
       const { stdout } = await exec(drutil, ['status', '-drive', target]);
       drive.media = summariseMedia(stdout);
+
+      // drutil often omits the capacity, which left the page saying "capacity
+      // unknown" for a disc sitting right there. diskutil knows.
+      if (drive.media.present && !drive.media.capacity) {
+        const extra = await capacityFromDiskutil(diskutil, drive.media.node);
+        if (extra) {
+          drive.media.capacity = drive.media.capacity || extra.capacity;
+          drive.media.freeSpace = drive.media.freeSpace || extra.freeSpace;
+        }
+      }
     } catch {
       drive.media = { present: false, raw: '' };
     }
@@ -476,8 +486,23 @@ function summariseMedia(output) {
   const typeMatch = /Type:\s*(.+)/i.exec(text);
   const erasable = /Erasable:\s*(Yes|No|TRUE|FALSE)/i.exec(text);
   const appendable = /Appendable:\s*(Yes|No|TRUE|FALSE)/i.exec(text);
-  const overWritable = /Overwritable:\s*(Yes|No|TRUE|FALSE)/i.exec(text);
-  const freeMatch = /Free Space:\s*(.+)/i.exec(text);
+  const overWritable = /Overwritable:\s*(Yes|No|TRUE|FALSE)/i.test(text)
+    ? /Overwritable:\s*(Yes|No|TRUE|FALSE)/i.exec(text)
+    : null;
+  // Several spellings, because drutil has used more than one and the capacity
+  // is the number most worth having.
+  const freeMatch =
+    /Free Space:\s*(.+)/i.exec(text) ||
+    /Volume Free Space:\s*(.+)/i.exec(text) ||
+    /Available:\s*(.+)/i.exec(text);
+  const capacityMatch =
+    /Media Capacity:\s*(.+)/i.exec(text) ||
+    /Capacity:\s*(.+)/i.exec(text) ||
+    /Total Size:\s*(.+)/i.exec(text) ||
+    /Disk Size:\s*(.+)/i.exec(text);
+  // drutil names the disc's device node on a line of its own, which is how a
+  // capacity can be looked up when drutil itself does not report one.
+  const nodeMatch = /(?:^|\n)\s*Name:\s*(\/dev\/\w+)/i.exec(text);
 
   return {
     present,
@@ -486,8 +511,35 @@ function summariseMedia(output) {
     appendable: appendable ? /yes|true/i.test(appendable[1]) : null,
     overWritable: overWritable ? /yes|true/i.test(overWritable[1]) : null,
     freeSpace: freeMatch ? freeMatch[1].trim() : null,
+    capacity: capacityMatch ? capacityMatch[1].trim() : null,
+    node: nodeMatch ? nodeMatch[1].trim() : null,
     raw: text,
   };
+}
+
+/**
+ * How much room is on the disc, according to the system's own disk utility.
+ *
+ * `drutil status` does not always report a capacity, and the Finish page showed
+ * "capacity unknown" for a disc that was plainly in the drive. diskutil knows
+ * the size of any inserted disc, so it is asked directly.
+ */
+async function capacityFromDiskutil(diskutil, node) {
+  if (!diskutil || !node) return null;
+  try {
+    const { stdout } = await exec(diskutil, ['info', node]);
+    const size =
+      /Volume Free Space:\s*(.+)/i.exec(stdout) ||
+      /Disk Size:\s*(.+)/i.exec(stdout) ||
+      /Total Size:\s*(.+)/i.exec(stdout);
+    const free = /Volume Free Space:\s*(.+)/i.exec(stdout);
+    return {
+      freeSpace: free ? free[1].trim() : null,
+      capacity: size ? size[1].trim() : null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**

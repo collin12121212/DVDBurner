@@ -3649,21 +3649,14 @@ function buildBurnPanel() {
     })
   );
 
-  if (!state.lastBuild) {
-    panel.append(
-      el('div', { class: 'btn-row', style: 'margin-top: 14px' }, [
-        el('button', {
-          class: 'btn btn-primary',
-          type: 'button',
-          id: 'btnBuild',
-          text: 'Build the Disc',
-          disabled: state.busy,
-        }),
-      ]),
-      el('p', { class: 'hint', text: 'This prepares and lays out the disc. It does not touch your blank disc yet.' })
-    );
-  }
+  /*
+    There is no separate "build" step to press any more.
 
+    Preparing the disc is not something anybody wants to do on purpose — it is
+    work the burn needs doing first. Burning now prepares only when it has to:
+    from the cached folder when the project has not changed, and afresh when it
+    has. Two buttons for one intention was one too many.
+  */
   panel.append(
     el('div', { class: 'burn-action' }, [
       burn,
