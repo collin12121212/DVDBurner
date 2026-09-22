@@ -227,7 +227,49 @@ jobs:
           # need to be one: this build is handed to a person, not distributed.
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: |
-          npx electron-builder --mac --x64 --publish never
+          set -euo pipefail
+
+          # Building a DMG means mounting a temporary image, putting the app
+          # inside it, and ejecting it again. hdiutil intermittently refuses that
+          # eject -- "couldn't eject disk5 - Resource busy" -- and fails an
+          # otherwise good build. It is a known race in electron-builder, fixed
+          # there by forcing the unmount after a delay (v26), and the accepted
+          # workaround meanwhile is to let the machine settle and try again.
+          #
+          # Spotlight begins indexing a newly mounted volume the moment it
+          # appears and is a plausible thing holding it, so it is turned off
+          # first. Failure is not fatal; it may already be off.
+          sudo mdutil -i off -a >/dev/null 2>&1 || true
+
+          attempt=1
+          while true; do
+            echo ""
+            echo "--- packaging, attempt ${attempt} ---"
+            if npx electron-builder --mac --x64 --publish never; then
+              echo "packaging succeeded on attempt ${attempt}"
+              break
+            fi
+
+            if [ "${attempt}" -ge 3 ]; then
+              echo "ERROR: packaging failed ${attempt} times." >&2
+              echo "If it failed with 'Resource busy', that is the hdiutil race." >&2
+              exit 1
+            fi
+
+            attempt=$((attempt + 1))
+            echo ""
+            echo "Attempt failed. Clearing any image this app left mounted, waiting,"
+            echo "then trying again."
+            # Only images belonging to this app, identified by the volume name.
+            # Nothing else on the machine is touched.
+            hdiutil info 2>/dev/null \
+              | awk '/\/dev\/disk/ && /Burnhouse/ {print $1}' \
+              | while read -r dev; do
+                  echo "  detaching ${dev}"
+                  hdiutil detach -force "${dev}" >/dev/null 2>&1 || true
+                done
+            sleep 20
+          done
 
       - name: Confirm the app bundle holds its tools
         run: |

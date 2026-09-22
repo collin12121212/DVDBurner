@@ -21,7 +21,7 @@
     "verify": "node test/verify.js",
     "serve": "node src/server/serve.js",
     "vendor:fetch": "node scripts/fetch-vendor.js",
-    "dist:mac": "electron-builder --mac --x64 --arm64",
+    "dist:mac": "electron-builder --mac --x64",
     "dist:dir": "electron-builder --dir"
   },
   "devDependencies": {
@@ -56,15 +56,13 @@
         {
           "target": "dmg",
           "arch": [
-            "x64",
-            "arm64"
+            "x64"
           ]
         },
         {
           "target": "zip",
           "arch": [
-            "x64",
-            "arm64"
+            "x64"
           ]
         }
       ],
