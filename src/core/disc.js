@@ -78,10 +78,98 @@ function parseDrutilRow(line, starts) {
 }
 
 /**
+ * Pull the drive records out of `drutil list -xml`.
+ *
+ * This is the form to use. The plain output is a fixed-width table whose
+ * columns move between macOS versions and whose fields can each contain spaces,
+ * so parsing it means guessing — and guessing wrong meant a burner that was
+ * plugged in and working was reported as absent.
+ *
+ * The man page documents `-xml` for list, info, status, discinfo and trackinfo
+ * for exactly this reason. Each drive arrives as a <dict> of key/value pairs,
+ * which is unambiguous.
+ */
+/**
+ * Pull a BSD device node out of whatever a plist field happens to contain.
+ *
+ * The node has appeared as "/dev/disk5", as a bare "disk5", and inside a longer
+ * IOKit path. Anything that names a disk is taken, and normalised to the /dev
+ * form the burn command wants.
+ */
+function bsdDeviceNode(value) {
+  const text = String(value || '');
+  const direct = /\/dev\/(?:r)?(disk\d+)/.exec(text);
+  if (direct) return `/dev/${direct[1]}`;
+  const bare = /(?:^|[^A-Za-z0-9])(disk\d+)(?![0-9])/.exec(text);
+  if (bare) return `/dev/${bare[1]}`;
+  return '';
+}
+
+function parseDrutilXml(xml) {
+  const text = String(xml || '');
+  if (!/<plist|<dict/i.test(text)) return [];
+
+  const drives = [];
+  const dictRe = /<dict>([\s\S]*?)<\/dict>/g;
+  let dictMatch;
+
+  while ((dictMatch = dictRe.exec(text))) {
+    const fields = {};
+    const pairRe = /<key>([^<]*)<\/key>\s*<([a-zA-Z][a-zA-Z0-9]*)(?:\s[^>]*)?>([\s\S]*?)<\/\2>/g;
+    let pair;
+    while ((pair = pairRe.exec(dictMatch[1]))) {
+      fields[pair[1].trim()] = pair[3].trim();
+    }
+    if (!Object.keys(fields).length) continue;
+
+    // Key names are matched loosely: macOS has used Vendor/Product/Revision for
+    // years, but the device node in particular has appeared under several names.
+    const pick = (...names) => {
+      for (const name of names) {
+        const key = Object.keys(fields).find((k) => k.toLowerCase() === name.toLowerCase());
+        if (key && fields[key]) return fields[key];
+      }
+      return '';
+    };
+
+    let node = bsdDeviceNode(pick('DeviceNode', 'BSDName', 'IOBSDName', 'Device'));
+    if (!node) {
+      // Last resort: any value anywhere in the record that names a disk.
+      for (const value of Object.values(fields)) {
+        node = bsdDeviceNode(value);
+        if (node) break;
+      }
+    }
+
+    const vendor = pick('Vendor', 'VendorName');
+    const product = pick('Product', 'ProductName');
+    const support = pick('SupportLevel', 'Support');
+
+    drives.push({
+      // With no node we still list the drive: hdiutil picks the only attached
+      // writer itself when it is not told which to use, so a missing node costs
+      // nothing and hiding the drive would cost everything.
+      id: node || `drutil-${drives.length + 1}`,
+      device: node,
+      vendor,
+      product,
+      rev: pick('Revision', 'Rev', 'ProductRevision'),
+      bus: pick('Bus', 'Protocol', 'PhysicalInterconnect'),
+      supportLevel: support,
+      writeCapable: true,
+      label: [vendor, product].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() || 'Disc writer',
+    });
+  }
+
+  return drives;
+}
+
+/**
  * Turn the raw output of `drutil list` into drive records.
  *
- * Separated out so it can be tested against real output from a Mac without a
- * Mac and without a drive attached.
+ * Kept as the fallback for when the XML form is unavailable, and separated out
+ * so it can be tested against real output from a Mac without a Mac and without
+ * a drive attached.
  */
 function parseDrutilList(stdout) {
   const drives = [];
@@ -164,17 +252,35 @@ async function listDrives({ drutil, diskutil } = {}) {
 
   if (drutil) {
     try {
-      const { stdout } = await exec(drutil, ['list']);
+      // The XML form first, because it is unambiguous.
+      const { stdout } = await exec(drutil, ['list', '-xml']);
       raw = stdout;
-      drives.push(...parseDrutilList(stdout));
+      drives.push(...parseDrutilXml(stdout));
+
+      if (!drives.length) {
+        // Either this drutil does not know -xml, or it found no drives. Ask for
+        // the plain listing too, and keep whichever is more informative.
+        const plain = await exec(drutil, ['list']);
+        if (plain.stdout.trim()) {
+          raw = `${raw}\n\n--- drutil list ---\n${plain.stdout}`;
+          drives.push(...parseDrutilList(plain.stdout));
+        }
+      }
     } catch (err) {
-      return {
-        supported: true,
-        drives: [],
-        raw,
-        note: 'The drive list could not be read. Connect the burner and try again.',
-        error: String(err.message || err),
-      };
+      // -xml refused: fall back to the text listing rather than giving up.
+      try {
+        const { stdout } = await exec(drutil, ['list']);
+        raw = stdout;
+        drives.push(...parseDrutilList(stdout));
+      } catch (inner) {
+        return {
+          supported: true,
+          drives: [],
+          raw,
+          note: 'The drive list could not be read. Connect the burner and try again.',
+          error: String(inner.message || inner),
+        };
+      }
     }
   }
 
@@ -502,6 +608,7 @@ module.exports = {
   // Exported so the drive listing can be tested against real `drutil list`
   // output without a Mac and without a drive attached.
   parseDrutilList,
+  parseDrutilXml,
   drutilColumnStarts,
   parseDrutilRow,
 };

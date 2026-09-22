@@ -583,6 +583,97 @@ test('empty output is no drives, not an error', () => {
   assertEqual(disc.parseDrutilList('No drives found').length, 0, 'so is a plain message');
 });
 
+/*
+  The XML form is what the app asks for, because the plain listing is a
+  fixed-width table whose columns move between macOS versions and whose fields
+  can each contain spaces. A real Mac reported its working USB writer in a shape
+  the text parser could not read at all, and the app said no burner was attached.
+*/
+const DRUTIL_XML = [
+  '<?xml version="1.0" encoding="UTF-8"?>',
+  '<plist version="1.0">',
+  '<array>',
+  '  <dict>',
+  '    <key>Vendor</key><string>hp</string>',
+  '    <key>Product</key><string>DVDRW  DU8A6SH</string>',
+  '    <key>Revision</key><string>DH61</string>',
+  '    <key>Bus</key><string>USB</string>',
+  '    <key>SupportLevel</key><string>Unsupported</string>',
+  '    <key>DeviceNode</key><string>/dev/disk5</string>',
+  '  </dict>',
+  '</array>',
+  '</plist>',
+].join('\n');
+
+test('a drive is read out of the XML listing', () => {
+  const drives = disc.parseDrutilXml(DRUTIL_XML);
+  assertEqual(drives.length, 1, 'one drive');
+  assertEqual(drives[0].vendor, 'hp', 'the vendor');
+  assertEqual(drives[0].product, 'DVDRW  DU8A6SH', 'the product, spaces and all');
+  assertEqual(drives[0].rev, 'DH61', 'the revision');
+  assertEqual(drives[0].bus, 'USB', 'the bus');
+  assertEqual(drives[0].device, '/dev/disk5', 'the device node');
+});
+
+test('a drive macOS calls Unsupported is still offered', () => {
+  // hdiutil picks the only attached writer itself when not told which to use,
+  // so refusing to list the drive costs the whole feature and gains nothing.
+  // The burn attempt is what decides, and it fails before writing if it must.
+  const drives = disc.parseDrutilXml(DRUTIL_XML);
+  assertEqual(drives[0].supportLevel, 'Unsupported', 'the level is reported');
+  assertEqual(drives[0].writeCapable, true, 'but the drive is still usable');
+  assertEqual(drives[0].label, 'hp DVDRW DU8A6SH', 'and it reads sensibly');
+});
+
+test('a drive with no device node is still listed', () => {
+  const withoutNode = DRUTIL_XML.replace(
+    '<key>DeviceNode</key><string>/dev/disk5</string>',
+    ''
+  );
+  const drives = disc.parseDrutilXml(withoutNode);
+  assertEqual(drives.length, 1, 'the drive survives');
+  assertEqual(drives[0].device, '', 'with no device node');
+  assert(drives[0].id, 'and some identifier to select it by');
+});
+
+test('a device node under an unexpected key is still found', () => {
+  const renamed = DRUTIL_XML.replace(
+    '<key>DeviceNode</key><string>/dev/disk5</string>',
+    '<key>IOKitPath</key><string>IOService:/USB/disk5</string>'
+  );
+  const drives = disc.parseDrutilXml(renamed);
+  assertEqual(drives[0].device, '/dev/disk5', 'the node is found wherever it hides');
+
+  const bare = DRUTIL_XML.replace(
+    '<key>DeviceNode</key><string>/dev/disk5</string>',
+    '<key>BSDName</key><string>disk9</string>'
+  );
+  assertEqual(disc.parseDrutilXml(bare)[0].device, '/dev/disk9', 'and a bare name is normalised');
+});
+
+test('two drives in one XML listing are both read', () => {
+  const two = DRUTIL_XML.replace(
+    '</array>',
+    '  <dict>\n    <key>Vendor</key><string>HL-DT-ST</string>\n' +
+      '    <key>Product</key><string>DVDRAM GP65NB60</string>\n' +
+      '    <key>Revision</key><string>PF00</string>\n' +
+      '    <key>Bus</key><string>USB</string>\n' +
+      '    <key>SupportLevel</key><string>Apple Shipping</string>\n' +
+      '    <key>DeviceNode</key><string>/dev/disk4</string>\n' +
+      '  </dict>\n</array>'
+  );
+  const drives = disc.parseDrutilXml(two);
+  assertEqual(drives.length, 2, 'both drives');
+  assertEqual(drives[1].label, 'HL-DT-ST DVDRAM GP65NB60', 'the second one too');
+});
+
+test('non-XML output is not mistaken for drives', () => {
+  assertEqual(disc.parseDrutilXml('').length, 0, 'empty');
+  assertEqual(disc.parseDrutilXml('No drives found').length, 0, 'a plain message');
+  assertEqual(disc.parseDrutilXml('   Vendor   Product   Rev   Bus   SupportLevel   DeviceNode\n' +
+    '   hp       DVDRW     DH61  USB   Unsupported    /dev/disk5').length, 0, 'a text table');
+});
+
 // ------------------------------------------------------- the disc's shape ---
 
 /**
