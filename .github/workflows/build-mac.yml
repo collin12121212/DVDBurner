@@ -120,8 +120,10 @@ jobs:
 
           echo "Found: $FFMPEG $FFPROBE $DVDAUTHOR $SPUMUX"
 
+          # Tee to a file as well as the log. `pipefail` is set above, so a
+          # failure here still fails the step.
           ./scripts/bundle-deps.sh vendor/bin \
-            "$FFMPEG" "$FFPROBE" "$DVDAUTHOR" "$SPUMUX"
+            "$FFMPEG" "$FFPROBE" "$DVDAUTHOR" "$SPUMUX" 2>&1 | tee /tmp/bundle.log
 
           echo "--- bundled ---"
           ls -la vendor/bin
@@ -134,6 +136,38 @@ jobs:
             echo -n "${tool} arch after relocation: "
             lipo -archs "vendor/bin/${tool}"
           done
+
+      - name: Publish the bundling output where it can be read
+        if: failure()
+        run: |
+          # Reading a failed step's log through the API needs a token, which
+          # this repository does not have. Publishing the output to a branch
+          # makes a failure readable with nothing but a clone, instead of
+          # somebody having to copy it out of the web interface by hand.
+          {
+            echo "=== bundle-deps output ==="
+            cat /tmp/bundle.log 2>/dev/null || echo "(nothing was captured)"
+            echo
+            echo "=== run context ==="
+            echo "runner: $(uname -m) $(sw_vers -productVersion 2>/dev/null)"
+            echo "brew prefix: $(brew --prefix 2>/dev/null)"
+            echo
+            echo "=== what each tool links against ==="
+            for tool in ffmpeg ffprobe dvdauthor spumux; do
+              echo "--- ${tool}"
+              otool -L "$(command -v ${tool} 2>/dev/null)" 2>/dev/null | tail -n +2 || true
+            done
+            echo
+            echo "=== anything that came out of the bundling ==="
+            find vendor -type f 2>/dev/null | head -60 || true
+          } > ci-diagnostics.txt 2>&1 || true
+
+          git config user.name 'github-actions'
+          git config user.email 'github-actions@users.noreply.github.com'
+          git checkout -B ci-diagnostics
+          git add -f ci-diagnostics.txt
+          git commit -m "Bundling diagnostics for ${GITHUB_SHA}" || true
+          git push -f origin ci-diagnostics || true
 
       - name: Verify the bundled tools run from a different directory
         run: |
