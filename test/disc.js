@@ -674,6 +674,63 @@ test('non-XML output is not mistaken for drives', () => {
     '   hp       DVDRW     DH61  USB   Unsupported    /dev/disk5').length, 0, 'a text table');
 });
 
+/*
+  A real Mac reported its writer as one line of labelled fields rather than the
+  table, in this shape. Neither of the other two parsers could read it, so the
+  app said no burner was attached while DVDStyler was burning to it happily.
+*/
+test('the labelled listing is read, device node or not', () => {
+  const line =
+    '   Vendor: 1   Product: hp DVDRW DU8A6SH   Rev: DH61   Bus: USB   ' +
+    'SupportLevel: Unsupported';
+
+  const drives = disc.parseDrutilKeyValues(line);
+  assertEqual(drives.length, 1, 'the drive is found');
+  assertEqual(drives[0].product, 'hp DVDRW DU8A6SH', 'the product is read');
+  assertEqual(drives[0].rev, 'DH61', 'the revision is read');
+  assertEqual(drives[0].bus, 'USB', 'the bus is read');
+  assertEqual(drives[0].supportLevel, 'Unsupported', 'the support level is read');
+  assertEqual(drives[0].label, 'hp DVDRW DU8A6SH', 'and a stray numeric vendor is dropped');
+});
+
+test('a labelled drive with no device node still gets a usable id', () => {
+  // The UI selects drives by id. An empty id meant the choice never stuck and
+  // the Burn button stayed disabled while a working drive sat there.
+  const drives = disc.parseDrutilKeyValues('Vendor: hp\nProduct: DVDRW DU8A6SH\nBus: USB');
+  assertEqual(drives.length, 1, 'one drive');
+  assert(drives[0].id, 'the id is not empty');
+  assertEqual(drives[0].device, '', 'and there is no device node, which is allowed');
+});
+
+test('a labelled device node is used when present', () => {
+  const drives = disc.parseDrutilKeyValues(
+    'Vendor: hp   Product: DVDRW DU8A6SH   Bus: USB   SupportLevel: Unsupported   DeviceNode: /dev/disk5'
+  );
+  assertEqual(drives[0].device, '/dev/disk5', 'the node is picked up');
+  assertEqual(drives[0].id, '/dev/disk5', 'and used as the id');
+});
+
+test('two labelled drives are read as two, not merged', () => {
+  const drives = disc.parseDrutilKeyValues(
+    'Vendor: hp   Product: DVDRW DU8A6SH   Bus: USB\n' +
+      'Vendor: HL-DT-ST   Product: DVDRAM GP65NB60   Bus: USB'
+  );
+  assertEqual(drives.length, 2, 'both drives');
+  assertEqual(drives[0].product, 'DVDRW DU8A6SH', 'the first');
+  assertEqual(drives[1].product, 'DVDRAM GP65NB60', 'the second');
+});
+
+test('listDrives falls through to the labelled form', () => {
+  // The whole chain: table, then labelled. Whichever shape a Mac produces, the
+  // drive has to come out the other end.
+  const drives = disc.parseDrutilList(
+    '   Vendor: 1   Product: hp DVDRW DU8A6SH   Rev: DH61   Bus: USB   SupportLevel: Unsupported'
+  );
+  assertEqual(drives.length, 1, 'the table parser still finds it');
+  assertEqual(drives[0].device, '', 'without a device node');
+  assert(drives[0].id, 'but with an id to select it by');
+});
+
 // ------------------------------------------------------- the disc's shape ---
 
 /**

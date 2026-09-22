@@ -3470,15 +3470,24 @@ function buildBurnPanel() {
   } else {
     const list = el('div', { class: 'drive-list' });
     for (const drive of writers) {
-      const selected = state.selectedDevice === drive.device;
+      /*
+        Selected by id, not by device node.
+
+        A drive macOS will not name still has to be selectable: hdiutil picks the
+        only attached writer itself, so an empty node costs nothing, but using it
+        as the selection key meant the choice never stuck — and the Burn button,
+        which is disabled while nothing is selected, stayed dead. Which is what
+        happened on a Mac whose burner was plugged in and working.
+      */
+      const selected = state.selectedDevice === drive.id;
       const hasMedia = Boolean(drive.media && drive.media.present);
       const button = el('button', {
         class: 'drive',
         type: 'button',
         'aria-pressed': String(selected),
         onclick: () => {
-          state.selectedDevice = drive.device;
-          api.settings.set({ lastDevice: drive.device }).catch(() => {});
+          state.selectedDevice = drive.id;
+          api.settings.set({ lastDevice: drive.id }).catch(() => {});
           render();
         },
       });
@@ -3498,7 +3507,7 @@ function buildBurnPanel() {
       list.append(button);
     }
     panel.append(list);
-    if (!state.selectedDevice) state.selectedDevice = writers[0].device;
+    if (!state.selectedDevice) state.selectedDevice = writers[0].id;
   }
 
   /*
@@ -3798,10 +3807,10 @@ async function refreshDrives() {
     state.drives = result.drives || [];
     state.driveSupported = result.supported !== false;
     state.driveNote = result.note || null;
-    if (state.selectedDevice && !state.drives.some((d) => d.device === state.selectedDevice)) {
-      state.selectedDevice = state.drives.length ? state.drives[0].device : null;
+    if (state.selectedDevice && !state.drives.some((d) => d.id === state.selectedDevice)) {
+      state.selectedDevice = state.drives.length ? state.drives[0].id : null;
     }
-    if (!state.selectedDevice && state.drives.length) state.selectedDevice = state.drives[0].device;
+    if (!state.selectedDevice && state.drives.length) state.selectedDevice = state.drives[0].id;
     if (state.step === 'finish') render();
   } catch (err) {
     state.drives = [];
@@ -3887,7 +3896,16 @@ async function runBurn() {
   }
   setBanner(null);
   try {
-    await api.job.burn({ device: state.selectedDevice });
+    /*
+      The selection is a drive id; the burn wants the device node.
+
+      A drive macOS will not name has no node, and that is fine — hdiutil uses
+      the only attached writer when it is not told which. Passing null is what
+      makes that happen, where passing the id would name a device that does not
+      exist.
+    */
+    const chosen = state.drives.find((d) => d.id === state.selectedDevice);
+    await api.job.burn({ device: (chosen && chosen.device) || null });
     setBanner('good', 'The disc was written successfully', [
       'The disc has been checked and is ready to use.',
       'Take it out and try it in a DVD player.',

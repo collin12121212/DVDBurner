@@ -165,6 +165,96 @@ function parseDrutilXml(xml) {
 }
 
 /**
+ * Read the "Key: value" listing that some versions of drutil produce.
+ *
+ * A real Mac reported its writer as one line of labelled fields —
+ * "Vendor: … Product: … Rev: … Bus: … SupportLevel: …" — rather than the
+ * fixed-width table, and neither the table parser nor the XML parser could make
+ * anything of it. The result was an app that said no burner was attached while
+ * one sat plugged in and DVDStyler was happily burning to it.
+ *
+ * This reads whatever labelled fields are present, in any arrangement, and does
+ * not require a device node: hdiutil picks the only attached writer itself, so a
+ * drive with no node is still perfectly usable.
+ */
+function parseDrutilKeyValues(stdout) {
+  const text = String(stdout || '');
+  if (!/Vendor\s*:/i.test(text) && !/SupportLevel\s*:/i.test(text)) return [];
+
+  const LABELS = [
+    'Vendor', 'Product', 'Revision', 'Rev', 'Bus', 'Protocol',
+    'SupportLevel', 'DeviceNode', 'BSDName', 'IOBSDName',
+  ];
+  const labelRe = new RegExp(`(${LABELS.join('|')})\\s*:`, 'gi');
+
+  const marks = [];
+  let m;
+  while ((m = labelRe.exec(text))) {
+    marks.push({ label: m[1], at: m.index, after: labelRe.lastIndex });
+  }
+  if (!marks.length) return [];
+
+  // Records are separated by each new "Vendor", so several drives in one blob
+  // are read as several drives rather than merged into one.
+  const records = [];
+  let current = null;
+  for (let i = 0; i < marks.length; i += 1) {
+    const to = i + 1 < marks.length ? marks[i + 1].at : text.length;
+    const value = text.slice(marks[i].after, to).trim();
+    const isVendor = /^vendor$/i.test(marks[i].label);
+
+    if (isVendor || !current) {
+      current = {};
+      records.push(current);
+    }
+    // First value wins, so a repeated label does not overwrite a real one.
+    if (!(marks[i].label in current)) current[marks[i].label] = value;
+  }
+
+  const pick = (record, ...names) => {
+    for (const name of names) {
+      const key = Object.keys(record).find((k) => k.toLowerCase() === name.toLowerCase());
+      if (key && record[key]) return record[key];
+    }
+    return '';
+  };
+
+  return records
+    .filter((record) => Object.keys(record).length)
+    .map((record, index) => {
+      let node = bsdDeviceNode(pick(record, 'DeviceNode', 'BSDName', 'IOBSDName'));
+      if (!node) {
+        for (const value of Object.values(record)) {
+          node = bsdDeviceNode(value);
+          if (node) break;
+        }
+      }
+
+      const vendorField = pick(record, 'Vendor');
+      const product = pick(record, 'Product');
+      const support = pick(record, 'SupportLevel');
+      // One Mac reports "Vendor: 1", where the value is plainly not a vendor
+      // name. Dropping it keeps the label readable rather than prefixing every
+      // drive with a stray number.
+      const vendor = /^\d+$/.test(vendorField.trim()) ? '' : vendorField;
+
+      return {
+        // Never empty: the UI selects drives by this, and an empty one made the
+        // Burn button think no drive was chosen.
+        id: node || `drutil-${index + 1}`,
+        device: node,
+        vendor,
+        product,
+        rev: pick(record, 'Revision', 'Rev'),
+        bus: pick(record, 'Bus', 'Protocol'),
+        supportLevel: support,
+        writeCapable: true,
+        label: [vendor, product].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() || 'Disc writer',
+      };
+    });
+}
+
+/**
  * Turn the raw output of `drutil list` into drive records.
  *
  * Kept as the fallback for when the XML form is unavailable, and separated out
@@ -236,6 +326,12 @@ function parseDrutilList(stdout) {
       writeCapable: !unsupported,
       label: [vendor, product].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() || nodeMatch[1],
     });
+  }
+
+  // Nothing from the table either: the labelled form is the last shape seen in
+  // the wild, so try that before giving up on a drive that may be right there.
+  if (!drives.length) {
+    drives.push(...parseDrutilKeyValues(stdout));
   }
 
   return drives;
@@ -609,6 +705,7 @@ module.exports = {
   // output without a Mac and without a drive attached.
   parseDrutilList,
   parseDrutilXml,
+  parseDrutilKeyValues,
   drutilColumnStarts,
   parseDrutilRow,
 };
