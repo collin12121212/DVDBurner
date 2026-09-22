@@ -48,6 +48,16 @@ mkdir -p "${PREFIX}" "${WORK}/src"
 
 LIBPNG_VERSION="1.6.44"
 DVDAUTHOR_VERSION="0.7.2"
+# MacPorts mirrors the upstream tarball byte for byte, which is why the checksum
+# below -- the one Homebrew publishes -- matches it.
+#
+# Not SourceForge's own download URLs. `downloads.sourceforge.net` and
+# `sourceforge.net/projects/.../download` both answer with HTTP 200 and an HTML
+# page rather than the file, so `curl -f` is satisfied and `tar` fails with "not
+# in gzip format". The checksum check below is what turns that into a clear
+# message instead.
+DVDAUTHOR_URL="https://distfiles.macports.org/dvdauthor/dvdauthor-${DVDAUTHOR_VERSION}.tar.gz"
+DVDAUTHOR_SHA256="3020a92de9f78eb36f48b6f22d5a001c47107826634a785a62dfcd080f612eb7"
 
 echo "Building for macOS ${MACOSX_DEPLOYMENT_TARGET} on $(uname -m)"
 echo "Scratch: ${WORK}"
@@ -60,7 +70,7 @@ fetch_static() {
   local out="${OUT_DIR}/${name}"
 
   echo "==> ${name}: downloading a static build"
-  curl -fL --retry 3 --retry-delay 2 -o "${WORK}/${name}.zip" \
+  curl -fsSL --retry 3 --retry-delay 2 -o "${WORK}/${name}.zip" \
     "https://evermeet.cx/ffmpeg/getrelease/${name}/zip"
 
   rm -rf "${WORK}/unzip-${name}"
@@ -88,27 +98,43 @@ fetch_static ffprobe
 echo ""
 echo "==> libpng ${LIBPNG_VERSION}: building (static, macOS ${MACOSX_DEPLOYMENT_TARGET})"
 cd "${WORK}/src"
-curl -fL --retry 3 --retry-delay 2 -o libpng.tar.gz \
+curl -fsSL --retry 3 --retry-delay 2 -o libpng.tar.gz \
   "https://download.sourceforge.net/libpng/libpng-${LIBPNG_VERSION}.tar.gz" || \
-  curl -fL --retry 3 --retry-delay 2 -o libpng.tar.gz \
+  curl -fsSL --retry 3 --retry-delay 2 -o libpng.tar.gz \
     "https://downloads.sourceforge.net/project/libpng/libpng16/${LIBPNG_VERSION}/libpng-${LIBPNG_VERSION}.tar.gz"
 
 mkdir -p libpng && tar xzf libpng.tar.gz -C libpng --strip-components=1
 cd libpng
 ./configure --prefix="${PREFIX}" --disable-shared --enable-static >/dev/null
-make -j"$(sysctl -n hw.ncpu)" >/dev/null
-make install >/dev/null
+make -j"$(sysctl -n hw.ncpu)" >/dev/null 2>&1
+make install >/dev/null 2>&1
 echo "    installed into ${PREFIX}"
 
 # --------------------------------------------------------------- dvdauthor ---
 echo ""
 echo "==> dvdauthor ${DVDAUTHOR_VERSION}: building (macOS ${MACOSX_DEPLOYMENT_TARGET})"
 cd "${WORK}/src"
-curl -fL --retry 3 --retry-delay 2 -o dvdauthor.tar.gz \
-  "https://downloads.sourceforge.net/project/dvdauthor/dvdauthor/${DVDAUTHOR_VERSION}/dvdauthor-${DVDAUTHOR_VERSION}.tar.gz"
+curl -fsSL --retry 3 --retry-delay 2 -o dvdauthor.tar.gz "${DVDAUTHOR_URL}"
+
+# The tarball is checked against the hash Homebrew publishes for it. A download
+# that is silently a different file would otherwise be compiled and shipped.
+ACTUAL="$(shasum -a 256 dvdauthor.tar.gz | awk '{print $1}')"
+if [ "${ACTUAL}" != "${DVDAUTHOR_SHA256}" ]; then
+  echo "ERROR: the dvdauthor tarball is not the one expected." >&2
+  echo "  expected ${DVDAUTHOR_SHA256}" >&2
+  echo "  got      ${ACTUAL}" >&2
+  exit 1
+fi
+echo "    checksum matches"
 
 mkdir -p dvdauthor && tar xzf dvdauthor.tar.gz -C dvdauthor --strip-components=1
 cd dvdauthor
+
+# No --without flags are passed. freetype, fontconfig, fribidi and libdvdread are
+# simply not installed here, so configure does not find them and builds without
+# them -- they are only needed for text subtitles and for reading DVDs, neither
+# of which this app does. libpng is present because it is ours, which is what
+# gives spumux its PNG support.
 
 # If configure refuses an argument, print what it would have accepted — working
 # that out from "unrecognized option" is otherwise a build cycle of guesswork.
