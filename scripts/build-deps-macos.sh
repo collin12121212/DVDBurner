@@ -130,18 +130,40 @@ echo "    checksum matches"
 mkdir -p dvdauthor && tar xzf dvdauthor.tar.gz -C dvdauthor --strip-components=1
 cd dvdauthor
 
-# No --without flags are passed. freetype, fontconfig, fribidi and libdvdread are
-# simply not installed here, so configure does not find them and builds without
-# them -- they are only needed for text subtitles and for reading DVDs, neither
-# of which this app does. libpng is present because it is ours, which is what
-# gives spumux its PNG support.
+# Nothing from Homebrew may be visible here, and that takes some arranging.
+#
+# The runner image has fontconfig, freetype, fribidi and libpng preinstalled, and
+# the first attempt found them and linked them — which would have dragged a
+# macOS 14 requirement back in through the side door, after all the trouble taken
+# to avoid exactly that.
+#
+#   PKG_CONFIG_LIBDIR  overrides pkg-config's search path entirely, so the only
+#                      library it can see is the libpng built above.
+#   PATH               trimmed so `freetype-config` in /usr/local/bin is not
+#                      found. freetype is only used for text subtitles.
+#
+# pkg-config has to come from Homebrew and is resolved by absolute path first,
+# because after trimming PATH there is no pkg-config left to find.
+PKG_CONFIG_BIN="$(command -v pkg-config || true)"
+if [ -z "${PKG_CONFIG_BIN}" ]; then
+  echo "ERROR: pkg-config is not available, so libpng cannot be located" >&2
+  exit 1
+fi
 
-# If configure refuses an argument, print what it would have accepted — working
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PKG_CONFIG="${PKG_CONFIG_BIN}"
+export PKG_CONFIG_LIBDIR="${PREFIX}/lib/pkgconfig"
+
+# --disable-dvdunauthor: that tool reads DVDs, which this app never does. Without
+# the flag, configure treats libdvdread's absence as fatal and stops with
+# "missing libdvdread" — which is how the flag was found.
+#
+# If configure refuses an argument, print what it would have accepted; working
 # that out from "unrecognized option" is otherwise a build cycle of guesswork.
-if ! PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig" \
-     CPPFLAGS="-I${PREFIX}/include" \
+if ! CPPFLAGS="-I${PREFIX}/include" \
      LDFLAGS="-L${PREFIX}/lib" \
-     ./configure --prefix="${PREFIX}" >"${WORK}/dvdauthor-configure.log" 2>&1; then
+     ./configure --prefix="${PREFIX}" --disable-dvdunauthor \
+     >"${WORK}/dvdauthor-configure.log" 2>&1; then
   echo "ERROR: dvdauthor's configure failed. Its output:" >&2
   cat "${WORK}/dvdauthor-configure.log" >&2
   echo "" >&2
@@ -149,6 +171,12 @@ if ! PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig" \
   ./configure --help >&2 || true
   exit 1
 fi
+
+# What it decided to use. A silent "no" for LIBPNG would mean spumux cannot read
+# the button images, which would only surface when a menu was built.
+echo "    configure chose:"
+grep -E '^checking for (LIBPNG|FONTCONFIG|FRIBIDI|MAGICK)|^checking for freetype-config|^checking ft2build' \
+  "${WORK}/dvdauthor-configure.log" | sed 's/^/      /' || true
 
 make -j"$(sysctl -n hw.ncpu)" >/dev/null
 make install >/dev/null
