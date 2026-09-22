@@ -46,6 +46,15 @@ WORK="$(mktemp -d)"
 PREFIX="${WORK}/local"
 mkdir -p "${PREFIX}" "${WORK}/src"
 
+# Resolved now, by absolute path, because later on PATH is trimmed to keep
+# Homebrew's libraries out and there would be no pkg-config left to find.
+# The freetype-config shim below needs it baked in for that reason.
+PKG_CONFIG_BIN="$(command -v pkg-config || true)"
+if [ -z "${PKG_CONFIG_BIN}" ]; then
+  echo "ERROR: pkg-config is not available, so libpng cannot be located" >&2
+  exit 1
+fi
+
 LIBPNG_VERSION="1.6.44"
 ZLIB_VERSION="1.3.1"
 ZLIB_SHA256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
@@ -183,13 +192,38 @@ fi
 make -j"$(sysctl -n hw.ncpu)" >/dev/null 2>&1
 make install >/dev/null 2>&1
 
+# FreeType stopped installing `freetype-config` — it was deprecated in favour of
+# pkg-config years ago — but dvdauthor 0.7.2 looks for it by name and by nothing
+# else, so a perfectly good freetype still produces "configure: error: freetype
+# not found".
+#
+# This shim answers in its place, using the flags FreeType itself publishes in
+# freetype2.pc rather than any invented here.
+cat > "${PREFIX}/bin/freetype-config" <<SHIM
+#!/bin/sh
+# Compatibility shim for dvdauthor. FreeType no longer installs this script;
+# the same information now lives in freetype2.pc, so that is what answers.
+PKG="${PKG_CONFIG_BIN}"
+case "\$1" in
+  --cflags)      exec "\${PKG}" --cflags freetype2 ;;
+  --libs)        exec "\${PKG}" --libs freetype2 ;;
+  --prefix)      exec "\${PKG}" --variable=prefix freetype2 ;;
+  --exec-prefix) exec "\${PKG}" --variable=prefix freetype2 ;;
+  --version)     exec "\${PKG}" --modversion freetype2 ;;
+  *)
+    echo "freetype-config: unsupported option '\$1'" >&2
+    exit 1
+    ;;
+esac
+SHIM
+chmod +x "${PREFIX}/bin/freetype-config"
+
 if [ ! -x "${PREFIX}/bin/freetype-config" ]; then
-  echo "ERROR: freetype built but produced no freetype-config, which is what" >&2
-  echo "       dvdauthor looks for. It cannot be located without it." >&2
+  echo "ERROR: could not provide freetype-config, which dvdauthor looks for." >&2
   ls -la "${PREFIX}/bin" >&2 || true
   exit 1
 fi
-echo "    installed into ${PREFIX}, with freetype-config"
+echo "    installed into ${PREFIX}, with a freetype-config shim over freetype2.pc"
 
 # --------------------------------------------------------------- dvdauthor ---
 echo ""
@@ -225,14 +259,8 @@ cd dvdauthor
 #                      because that is where the freetype-config just built
 #                      lives, and dvdauthor will not use freetype without it.
 #
-# pkg-config has to come from Homebrew and is resolved by absolute path first,
-# because after trimming PATH there is no pkg-config left to find.
-PKG_CONFIG_BIN="$(command -v pkg-config || true)"
-if [ -z "${PKG_CONFIG_BIN}" ]; then
-  echo "ERROR: pkg-config is not available, so libpng cannot be located" >&2
-  exit 1
-fi
-
+# pkg-config itself was resolved by absolute path near the top, before PATH was
+# trimmed, and is baked into the freetype-config shim for the same reason.
 export PATH="${PREFIX}/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PKG_CONFIG="${PKG_CONFIG_BIN}"
 export PKG_CONFIG_LIBDIR="${PREFIX}/lib/pkgconfig"
