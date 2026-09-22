@@ -97,6 +97,7 @@ contextBridge.exposeInMainWorld('burnhouse', {
 
   job: {
     build: (payload) => call('job:build', payload),
+    built: (payload) => call('job:built', payload),
     image: (payload) => call('job:image', payload),
     burn: (payload) => call('job:burn', payload),
     saveFolder: (payload) => call('job:save-folder', payload),

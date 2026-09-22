@@ -104,9 +104,18 @@ function merge(base, patch) {
   return out;
 }
 
-/** The working folder actually in use, creating it if needed. */
-function resolveWorkDir(settings) {
-  const dir = (settings && settings.workDir) || defaultWorkDir();
+/**
+ * The working folder actually in use, creating it if needed.
+ *
+ * With a project id it is that project's own folder. Builds used to share one
+ * folder, so every project overwrote the last one's prepared video and menu
+ * stills — and because the folder lives under the user's home rather than beside
+ * the app, a build now survives upgrading the app. Which is the point: fixing a
+ * bug on the Mac should not mean re-encoding an hour of video to try it.
+ */
+function resolveWorkDir(settings, projectId) {
+  const base = (settings && settings.workDir) || defaultWorkDir();
+  const dir = projectId ? path.join(base, String(projectId)) : base;
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }

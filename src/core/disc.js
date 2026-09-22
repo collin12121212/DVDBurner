@@ -446,17 +446,21 @@ async function listDrives({ drutil, hdiutil, diskutil } = {}) {
     }
   }
 
-  // Ask each device whether media is present, so the UI can say "insert a disc"
-  // rather than failing at the end of a long burn.
+  // Ask about the disc in each drive, so the app can say "there is no disc" or
+  // "that one already has something on it" BEFORE hdiutil is handed a disc it
+  // will not use. Without this the first sign of trouble is the tray opening,
+  // which says nothing about why.
   //
-  // Only for drives drutil named. `drutil status -drive` takes a BSD node, and a
-  // drive found through hdiutil has an IORegistry path instead; handing drutil
-  // the wrong kind of string would either error or, worse, answer about some
-  // other device. The label is cosmetic, so those simply go without.
-  for (const drive of drives) {
-    if (!drutil || !/^\/dev\//.test(drive.device || '')) continue;
+  // `drutil status -drive` takes a BSD node or a 1-based index into drutil's own
+  // list. Drives found through hdiutil have an IORegistry path instead, so those
+  // are asked for by position. With one drive attached — the usual case, and the
+  // one reported — the position is unambiguous.
+  for (let i = 0; i < drives.length; i += 1) {
+    const drive = drives[i];
+    if (!drutil) continue;
+    const target = /^\/dev\//.test(drive.device || '') ? drive.device : String(i + 1);
     try {
-      const { stdout } = await exec(drutil, ['status', '-drive', drive.device]);
+      const { stdout } = await exec(drutil, ['status', '-drive', target]);
       drive.media = summariseMedia(stdout);
     } catch {
       drive.media = { present: false, raw: '' };

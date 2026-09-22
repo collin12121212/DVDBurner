@@ -98,6 +98,17 @@ const state = {
 
   busy: false,
   lastBuild: null,
+  /*
+    What is already built on disk for this project, asked of the main process.
+
+    null      - not asked yet
+    'checking'- asked, waiting for the answer
+    object    - { built, upToDate, manifest }
+
+    Kept apart from lastBuild, which is a build done in this session and carries
+    detail a recorded build does not.
+  */
+  buildState: null,
   banner: null,
   /**
    * Alignment lines to draw while something is being dragged, as
@@ -3326,6 +3337,17 @@ function switchRow({ checked, title, onChange }) {
 function renderFinishStep(stage) {
   stage.className = 'stage';
   document.body.classList.remove('wide-stage');
+
+  /*
+    Ask what is already built, once, the first time this step is shown in a
+    session. A prepared disc belongs to the project and outlives the app, so
+    opening the app after an upgrade should offer that disc rather than silently
+    re-encoding an hour of video to produce the same bytes again.
+  */
+  if (state.buildState === null) {
+    state.buildState = 'checking';
+    refreshBuiltState();
+  }
   stage.append(
     el('h1', { text: 'Make the disc' }),
     el('p', {
@@ -3360,7 +3382,16 @@ function renderFinishStep(stage) {
     return;
   }
 
-  if (state.lastBuild) stage.append(buildDonePanel());
+  /*
+    A disc built earlier and still matching the project counts as built, even
+    though it was not built in this session — that is the whole point of keeping
+    the build on disk. One that no longer matches is shown as out of date rather
+    than offered.
+  */
+  const recorded = state.buildState && state.buildState !== 'checking' ? state.buildState : null;
+  if (recorded && recorded.built && !recorded.upToDate) stage.append(buildStalePanel());
+  else if (state.lastBuild) stage.append(buildDonePanel());
+  else if (recorded && recorded.built && recorded.upToDate) stage.append(buildDonePanel());
   stage.append(buildBurnPanel());
 
   stage.append(
@@ -3393,14 +3424,66 @@ function renderFinishStep(stage) {
   );
 }
 
+/**
+ * Ask the main process what is already built for this project, and show it.
+ *
+ * The answer decides whether the Finish page offers a disc that is ready to
+ * burn, says the project has moved on since it was built, or says nothing has
+ * been built at all.
+ */
+async function refreshBuiltState() {
+  try {
+    state.buildState = await api.job.built({ project: projectPayload() });
+  } catch {
+    // Not knowing is not the same as nothing being built, but it has the same
+    // consequence — build again — so it is reported the same way.
+    state.buildState = { built: false, upToDate: false };
+  }
+  if (state.step === 'finish') render();
+}
+
+/**
+ * The banner for a project that has changed since its disc was built.
+ *
+ * Burning without this would put the older disc on the blank disc and look like
+ * the changes had been ignored.
+ */
+function buildStalePanel() {
+  const manifest = (state.buildState && state.buildState.manifest) || {};
+  const when = manifest.builtAt ? new Date(manifest.builtAt).toLocaleString() : null;
+
+  return el('div', { class: 'panel' }, [
+    el('div', { class: 'panel-head' }, [
+      el('h2', { text: 'Changes not built yet' }),
+      when ? el('span', { class: 'panel-note', text: `built ${when}` }) : null,
+    ].filter(Boolean)),
+    buildBanner({
+      kind: 'info',
+      title: 'This project has changed since it was last built',
+      body:
+        'The disc prepared earlier is out of date, so it will not be burned. ' +
+        'Press "Build the Disc" below to bring it up to date — only what changed ' +
+        'is re-encoded.',
+    }),
+  ]);
+}
+
+
 function buildDonePanel() {
-  const build = state.lastBuild;
+  // Either a build from this session, which carries the full detail, or one
+  // recorded earlier and read back from disk, which carries the summary.
+  const recorded = state.buildState && state.buildState !== 'checking' ? state.buildState.manifest : null;
+  const build = state.lastBuild || recorded || {};
   const panel = el('div', { class: 'panel' });
   panel.append(
     el('div', { class: 'panel-head' }, [
       el('h2', { text: 'The disc is built' }),
-      el('span', { class: 'panel-note', text: formatBytes(build.sizeBytes) }),
-    ]),
+      build.sizeBytes
+        ? el('span', { class: 'panel-note', text: formatBytes(build.sizeBytes) })
+        : build.builtAt
+          ? el('span', { class: 'panel-note', text: `built ${new Date(build.builtAt).toLocaleString()}` })
+          : null,
+    ].filter(Boolean)),
     buildBanner({
       kind: 'good',
       title: `${build.videoCount} ${build.videoCount === 1 ? 'video' : 'videos'} ready to burn`,
@@ -3874,6 +3957,9 @@ async function runBuild() {
   try {
     const result = await api.job.build({ project: projectPayload() });
     state.lastBuild = result;
+    // The disc on disk now matches the project, so the out-of-date notice has
+    // to go without waiting for another round trip.
+    state.buildState = { built: true, upToDate: true, manifest: result };
     setBanner('good', 'The disc is built', [
       `${result.videoCount} ${result.videoCount === 1 ? 'video' : 'videos'}, ` +
         `${result.slideCount} ${result.slideCount === 1 ? 'menu page' : 'menu pages'}, ` +
@@ -3890,7 +3976,14 @@ async function runBuild() {
 }
 
 async function runBurn() {
-  if (!state.lastBuild) {
+  /*
+    Build first if there is nothing to burn, or if what is there no longer
+    matches the project. Burning the older disc would look like the changes had
+    been ignored, which is worse than taking the time to build again.
+  */
+  const recorded = state.buildState && state.buildState !== 'checking' ? state.buildState : null;
+  const outOfDate = Boolean(recorded && recorded.built && !recorded.upToDate);
+  if (!state.lastBuild || outOfDate) {
     await runBuild();
     if (!state.lastBuild) return;
   }
@@ -3905,7 +3998,7 @@ async function runBurn() {
       exist.
     */
     const chosen = state.drives.find((d) => d.id === state.selectedDevice);
-    await api.job.burn({ device: (chosen && chosen.device) || null });
+    await api.job.burn({ device: (chosen && chosen.device) || null, project: projectPayload() });
     setBanner('good', 'The disc was written successfully', [
       'The disc has been checked and is ready to use.',
       'Take it out and try it in a DVD player.',
@@ -3925,7 +4018,7 @@ async function runSaveImage() {
     const chosen = await api.files.saveImage(label);
     if (chosen.canceled) return;
     setBanner(null);
-    const result = await api.job.image({ path: chosen.path });
+    const result = await api.job.image({ path: chosen.path, project: projectPayload() });
     setBanner('good', 'The disc image was saved', [
       `${result.isoPath} (${formatBytes(result.sizeBytes)})`,
       'You can burn this later, or keep it as a backup.',
@@ -3945,7 +4038,7 @@ async function runSaveFolder() {
     });
     if (chosen.canceled) return;
     setBanner(null);
-    await api.job.saveFolder({ path: chosen.path });
+    await api.job.saveFolder({ path: chosen.path, project: projectPayload() });
     setBanner('good', 'The disc files were saved', [
       chosen.path,
       'This folder holds a VIDEO_TS directory, which is the DVD itself.',

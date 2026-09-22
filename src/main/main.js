@@ -493,7 +493,9 @@ function registerIpc() {
     const settings = settingsStore.read();
     tools = detectTools(settings);
     const project = pipeline.normaliseProject(payload.project || payload);
-    const workDir = settingsStore.resolveWorkDir(settings);
+    // One folder per project, so builds do not overwrite each other and a build
+    // survives upgrading the app.
+    const workDir = settingsStore.resolveWorkDir(settings, (payload.project || {}).id);
 
     const result = await jobs.run('build', async (ctx) => {
       ctx.onProgress({ stage: 'inspect', fraction: 0, message: 'Reading your videos\u2026' });
@@ -579,6 +581,41 @@ function registerIpc() {
     return result;
   });
 
+  /*
+    What is already built for this project, and whether it is still current.
+
+    The Finish page asks this on the way in, so a prepared disc from an earlier
+    session is offered rather than silently rebuilt — and so a project that has
+    been changed since says so instead of quietly burning the older disc.
+  */
+  handle('job:built', async (payload) => {
+    const settings = settingsStore.read();
+    const project = pipeline.normaliseProject(payload.project || payload);
+    const workDir = settingsStore.resolveWorkDir(settings, (payload.project || {}).id);
+    const record = pipeline.readBuildRecord(workDir);
+
+    if (!record) return { built: false, upToDate: false };
+
+    const expected = pipeline.projectFingerprint(project);
+    const structurePresent = fs.existsSync(path.join(workDir, 'author', 'VIDEO_TS', 'VIDEO_TS.IFO'));
+
+    return {
+      built: true,
+      upToDate: record.fingerprint === expected && structurePresent,
+      // Present so a stale build can say what it was, rather than only that it
+      // is out of date.
+      manifest: {
+        volumeLabel: record.volumeLabel || null,
+        builtAt: record.builtAt || null,
+        videoCount: record.videoCount || 0,
+        slideCount: record.slideCount || 0,
+        totalSeconds: record.totalSeconds || 0,
+        app: record.app || null,
+      },
+      workDir,
+    };
+  });
+
   handle('job:save-folder', async (payload) => {
     const source = prepared || (await requirePrepared(payload));
     const destination = payload && payload.path;
@@ -649,10 +686,51 @@ function registerIpc() {
   handle('server:info', async () => (shareServer ? shareServer.info() : { running: false }));
 }
 
+/**
+ * The prepared disc to burn, from this session or from disk.
+ *
+ * It used to be this session only, so quitting the app — or upgrading it, which
+ * is the same thing after an install — meant re-encoding everything before a
+ * disc could be burned. The prepared structure belongs to the project and lives
+ * in the user's own folder, so it is read back from there instead.
+ *
+ * Only if the project still matches. A changed project must be built again, and
+ * says so rather than quietly burning the older disc.
+ */
 async function requirePrepared(payload) {
   if (prepared) return prepared;
+
+  const project = pipeline.normaliseProject((payload && payload.project) || payload || {});
+  const settings = settingsStore.read();
+  const workDir = settingsStore.resolveWorkDir(settings, (payload && payload.project || {}).id);
+  const record = pipeline.readBuildRecord(workDir);
+  const videoTsDir = path.join(workDir, 'author', 'VIDEO_TS');
+
+  const structurePresent =
+    fs.existsSync(path.join(videoTsDir, 'VIDEO_TS.IFO')) &&
+    fs.existsSync(path.join(videoTsDir, 'VIDEO_TS.BUP'));
+
+  if (record && structurePresent) {
+    const fingerprint = pipeline.projectFingerprint(project);
+    if (record.fingerprint !== fingerprint) {
+      throw new Error(
+        'The project has changed since this disc was built. Press "Build the Disc" ' +
+          'on the Finish step, then burn it.'
+      );
+    }
+    return {
+      videoTsDir,
+      workDir,
+      volumeLabel: record.volumeLabel,
+      totalSeconds: record.totalSeconds || 0,
+      fingerprint,
+      builtAt: record.builtAt,
+      fromDisk: true,
+    };
+  }
+
   throw new Error(
-    'Build the disc first. Press "Build Disc" on the Finish step, then burn it.'
+    'Build the disc first. Press "Build the Disc" on the Finish step, then burn it.'
   );
 }
 

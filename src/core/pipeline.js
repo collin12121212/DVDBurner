@@ -21,6 +21,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 const spec = require('./dvd_spec');
@@ -345,11 +346,116 @@ async function prepare(project, { tools, workDir, onProgress, onLog, signal, Bro
     builtAt: new Date().toISOString(),
   };
 
+  /*
+    Record what was built, so the next run can tell whether it is still current.
+
+    This is what makes the prepared disc reusable across an app upgrade. The
+    folder it sits in belongs to the user, not the app, and the fingerprint
+    describes the project exactly — so opening the app, changing nothing and
+    pressing Burn should not re-encode anything, while changing anything at all
+    should be noticed rather than silently burning the old disc.
+  */
+  prepared.fingerprint = projectFingerprint(project);
+  try {
+    fs.writeFileSync(
+      path.join(root, 'build.json'),
+      JSON.stringify(
+        {
+          fingerprint: prepared.fingerprint,
+          builtAt: prepared.builtAt,
+          volumeLabel: prepared.volumeLabel,
+          videoCount: good.length,
+          slideCount: built.layout.slides.length,
+          totalSeconds: prepared.totalSeconds,
+          app: appVersion(),
+        },
+        null,
+        2
+      )
+    );
+  } catch {
+    // A build that cannot be recorded is still a build. It just cannot be reused.
+  }
+
   if (onProgress) {
     onProgress({ stage: 'author', fraction: 1, message: 'Disc structure ready.' });
   }
 
   return prepared;
+}
+
+/** This app's version, for the build record. */
+function appVersion() {
+  try {
+    return require('../../package.json').version;
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * A fingerprint of everything that decides what ends up on the disc.
+ *
+ * The slides, the films on them, the order, the disc settings — and for each
+ * video its size and modification time, so replacing a file in place with a
+ * different one is noticed even if the path is the same.
+ *
+ * Deliberately NOT included: app version, tool paths, the work folder. None of
+ * those change the disc, and including them would force a rebuild after every
+ * bug fix — which is the thing this exists to avoid.
+ */
+function projectFingerprint(project) {
+  const videos = (project.videos || []).map((video) => {
+    let size = 0;
+    let mtime = 0;
+    try {
+      const stat = fs.statSync(video.path);
+      size = stat.size;
+      mtime = Math.round(stat.mtimeMs);
+    } catch {
+      // A missing file still has to fingerprint, or removing one would look
+      // like no change at all.
+    }
+    return {
+      path: video.path,
+      size,
+      mtime,
+      duration: video.duration || null,
+      name: video.name || null,
+      menuLabel: video.menuLabel || null,
+    };
+  });
+
+  const canonical = JSON.stringify({
+    // The disc title is the volume label on the finished disc, so changing it
+    // changes the disc.
+    discTitle: project.discTitle || null,
+    deck: project.deck,
+    videos,
+    videoFormat: project.videoFormat,
+    aspect: project.aspect,
+    audioMode: project.audioMode,
+    chaptersEnabled: project.chaptersEnabled,
+    chapterMinutes: project.chapterMinutes,
+  });
+
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
+ * Read the record of what was last built into this folder.
+ *
+ * Returns null when nothing has been built there, so a first run is not
+ * mistaken for a stale one.
+ */
+function readBuildRecord(workDir) {
+  try {
+    const raw = fs.readFileSync(path.join(workDir, 'build.json'), 'utf8');
+    const record = JSON.parse(raw);
+    return record && record.fingerprint ? record : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -796,4 +902,7 @@ module.exports = {
   verifyDisc,
   removeDiscStructure,
   buildMenus,
+  // For deciding whether what is on disk is still what the project says.
+  projectFingerprint,
+  readBuildRecord,
 };
