@@ -132,7 +132,11 @@ stage_library() {
 patch_file() {
   local target="$1"
   local mode
-  mode="$(stat -f '%p' "${target}" 2>/dev/null || echo '')"
+  # `%p` is the file type AND the permissions: on macOS it prints 100755 for an
+  # executable, and chmod refuses that with "Invalid file mode: 100755", which
+  # killed this script on the first file it touched. `%Lp` is the permissions
+  # alone, which is the thing being saved and restored here.
+  mode="$(stat -f '%Lp' "${target}" 2>/dev/null || echo '')"
   [ -n "${mode}" ] || mode='755'
   chmod u+w "${target}"
 
@@ -158,7 +162,11 @@ patch_file() {
     fi
   done <<< "${deps}"
 
-  chmod "${mode}" "${target}" 2>/dev/null || true
+  # Restoring the mode must never be what stops the build, but it should not be
+  # silent either: a binary that comes out non-executable is a failure much
+  # later, in the app, and would look like something else entirely.
+  chmod "${mode}" "${target}" 2>/dev/null || \
+    echo "  warning: could not restore mode ${mode} on ${target}" >&2
 }
 
 resign() {
