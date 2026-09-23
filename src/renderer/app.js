@@ -3785,8 +3785,6 @@ function buildMultiElementInspector(elements) {
     el('div', { class: 'rail-title', text: `${elements.length} elements` })
   );
 
-  /** Every selected element has this key. */
-  const allHave = (key) => elements.every((e) => key in e);
   /** Every selected element is one of these kinds. */
   const allAre = (kinds) => elements.every((e) => kinds.has(e.kind));
 
@@ -3834,9 +3832,17 @@ function buildMultiElementInspector(elements) {
       : choices;
     return propRow(
       name,
-      propSelect(options, differs ? '' : first(key), (value) => {
+      propSelect(options, differs ? '' : first(key) || '', (value) => {
         if (differs && value === '') return;
-        change((element) => { element[key] = value; });
+        /*
+          An empty choice means "none", and these fields store none as null.
+          Writing '' instead would be a second way of saying the same thing — and
+          an element set that way would compare unequal to one where the field had
+          simply never been set, which is how a "has this changed?" check comes to
+          lie.
+        */
+        const stored = value === '' && first(key) === null ? null : value;
+        change((element) => { element[key] = stored; });
       }),
       label
     );
@@ -3964,7 +3970,6 @@ function buildMultiElementInspector(elements) {
       ],
     });
   }
-
   panel.append(propTable(groups));
 
   panel.append(
