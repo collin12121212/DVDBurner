@@ -47,10 +47,10 @@ function resetOutputDir(dir) {
  * players and televisions expect; full-range output crushes blacks on a real
  * set even though it looks fine on a computer monitor.
  *
- * `interlace=tff` is what actually sets top-field-first. The MPEG-2 encoder's
- * own `field_order` option is silently ignored once interlaced coding is
- * enabled, and `ildct+ilme` on its own produces bottom-field-first, so the
- * field order has to be imposed in the filter chain where it takes effect.
+ * `interlace=tff` (or `bff` on NTSC) is what actually sets the field order. The
+ * MPEG-2 encoder's own `field_order` option is silently ignored once interlaced
+ * coding is enabled, and `ildct+ilme` on its own produces bottom-field-first, so
+ * the order has to be imposed in the filter chain where it takes effect.
  *
  * The deep-resize filters are deliberate: `lanczos` is the sharpest resampler
  * ffmpeg ships that does not ring on hard edges, and the scale filter converts
@@ -81,7 +81,20 @@ function buildVideoFilter({ width, height, progressive = false, sourceMatrix = n
     `scale=${width}:${height}:flags=lanczos`,
     `setsar=${sar}`,
   ];
-  if (!progressive) chain.push('interlace=tff');
+  /*
+    Field order is NOT the same on both formats, and getting it wrong is what
+    causes ghosting.
+
+    NTSC is bottom-field-first and PAL is top-field-first — see the fieldMode in
+    dvd_spec.js. This used to force `tff` on both, so every NTSC disc carried
+    fields in the wrong order: a player that honours the flag weaves the two
+    fields of each frame back together the wrong way round, and moving pictures
+    come out with a ghost of the previous field behind them. Visible on a
+    television, invisible on a computer, which is exactly where it was reported.
+
+    The height is what distinguishes them here: 480 is NTSC, 576 is PAL.
+  */
+  if (!progressive) chain.push(height === 576 ? 'interlace=tff' : 'interlace=bff');
   return chain.join(',');
 }
 

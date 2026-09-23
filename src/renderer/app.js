@@ -3694,7 +3694,23 @@ function buildBurnPanel() {
         el('button', {
           class: 'btn btn-small btn-quiet',
           type: 'button',
-          text: hasWriter ? 'Refresh the drive list' : 'Check Again',
+          // Ejecting from here is the same thing the Finder's Eject does, and
+          // saves leaving the app to fetch a disc out.
+          text: '\u23cf Eject the disc',
+          disabled: state.busy || !discInDrive,
+          onclick: async () => {
+            try {
+              await api.drives.eject();
+            } catch (err) {
+              setBanner('error', 'The disc could not be ejected', String(err.message || err));
+            }
+            refreshDrives();
+          },
+        }),
+        el('button', {
+          class: 'btn btn-small btn-quiet',
+          type: 'button',
+          text: 'Refresh the drive list',
           onclick: refreshDrives,
         }),
       ]),
@@ -3818,6 +3834,11 @@ function goToStep(step) {
   state.step = next;
   state.banner = null;
   document.body.classList.toggle('wide-stage', state.step !== 'finish');
+
+  // Only the Finish page cares about drives, so the polling runs only there.
+  if (next === 'finish') startDriveWatch();
+  else stopDriveWatch();
+
   render();
 }
 
@@ -3898,6 +3919,54 @@ async function promptForVideos() {
     setBanner('error', 'Could not open the file chooser', String(err.message || err));
     render();
   }
+}
+
+/*
+  Keep the drive list current without being asked.
+
+  Plugging the burner in, taking it out, or putting a disc in or out are the
+  things that change the answer, and all of them happen outside the app. Making
+  somebody press "Refresh" to be told about them is asking them to guess when
+  their own hardware changed.
+
+  Cheap on purpose: one short-lived command every few seconds, and the page is
+  only redrawn when the answer is actually different — otherwise the poll would
+  fight every click on the page.
+*/
+let driveWatch = null;
+
+function driveSignature(drives) {
+  return JSON.stringify(
+    (drives || []).map((d) => [d.id, d.label, Boolean(d.media && d.media.present), d.media && d.media.type, d.media && d.media.freeSpace, d.media && d.media.alreadyWritten])
+  );
+}
+
+function startDriveWatch() {
+  if (driveWatch) return;
+  driveWatch = setInterval(async () => {
+    if (state.step !== 'finish' || state.busy) return;
+    try {
+      const result = await api.drives.list();
+      const drives = result.drives || [];
+      if (driveSignature(drives) === driveSignature(state.drives)) return;
+      state.drives = drives;
+      state.driveSupported = result.supported !== false;
+      state.driveNote = result.note || null;
+      if (state.selectedDevice && !drives.some((d) => d.id === state.selectedDevice)) {
+        state.selectedDevice = drives.length ? drives[0].id : null;
+      }
+      if (!state.selectedDevice && drives.length) state.selectedDevice = drives[0].id;
+      render();
+    } catch {
+      // A failed poll is not worth reporting; the next one may work, and the
+      // page still shows what it last knew.
+    }
+  }, 3000);
+}
+
+function stopDriveWatch() {
+  if (driveWatch) clearInterval(driveWatch);
+  driveWatch = null;
 }
 
 async function refreshDrives() {
