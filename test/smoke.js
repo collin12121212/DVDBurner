@@ -261,6 +261,26 @@ app.whenReady().then(async () => {
       opening.slides.some((s) => s.role !== 'menu'),
       'there is also a slide to put episodes on'
     );
+
+    /*
+      The project has to say which project it is.
+
+      The main process names a folder after this, and without it every project
+      resolved to the top of the working folder — so a second project's build
+      overwrote the first one's encoded video, menu stills and authored
+      VIDEO_TS. Asserted here rather than only in the pipeline tests because the
+      path runs through the interface, and this is the end of it that was
+      dropping it.
+    */
+    const payload = await window.webContents.executeJavaScript(
+      `window.__burnhouseTest.projectPayload()`,
+      true
+    );
+    record(
+      Boolean(payload && payload.id),
+      'the project tells the main process which project it is',
+      payload && payload.id ? payload.id : 'no id in the payload'
+    );
   } catch (err) {
     record(false, 'the opening deck rendered', String(err.message || err));
   }

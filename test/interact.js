@@ -603,6 +603,65 @@ async function run() {
     `${burn.panelNotices} notices`
   );
 
+  // --------------------------------------------- one folder per project ---
+  //
+  // The prepared disc is looked up by project, so the two things that decide
+  // whether that works are checked together: that the interface tells the main
+  // process which project is open, and that it asks again when a different one
+  // is opened. The second was wrong — the answer was fetched once per session
+  // and reused, so a second project inherited the first one's disc.
+  console.log('\nEach project its own prepared disc');
+
+  const work = path.join(sandbox, 'work');
+
+  // The layout an older version wrote: a single build at the top of the working
+  // folder, because there was only ever one.
+  fs.mkdirSync(path.join(work, 'titles', 'title_1'), { recursive: true });
+  fs.mkdirSync(path.join(work, 'author', 'VIDEO_TS'), { recursive: true });
+  fs.writeFileSync(path.join(work, 'titles', 'title_1', 'VTS_01_1.VOB'), Buffer.alloc(2048, 1));
+  fs.writeFileSync(path.join(work, 'author', 'VIDEO_TS', 'VIDEO_TS.IFO'), 'ifo');
+  fs.writeFileSync(path.join(work, 'author', 'VIDEO_TS', 'VIDEO_TS.BUP'), 'bup');
+  fs.writeFileSync(
+    path.join(work, 'build.json'),
+    JSON.stringify({ fingerprint: 'x'.repeat(64), volumeLabel: 'OLD' })
+  );
+
+  await js(`window.__burnhouseTest.createNewProject('First', 'charcoal')`);
+  await settle(700);
+  const firstId = await js(`window.__burnhouseTest.projectPayload().id`);
+  await js(`window.__burnhouseTest.goToStep('finish')`);
+  await settle(1400);
+
+  record(Boolean(firstId), 'a project tells the main process which project it is', String(firstId));
+  record(
+    fs.existsSync(path.join(work, firstId, 'build.json')),
+    'a build left by the old shared layout is adopted into the project'
+  );
+  record(
+    !fs.existsSync(path.join(work, 'build.json')),
+    'and nothing is left at the top of the working folder pretending to be one'
+  );
+
+  await js(`window.__burnhouseTest.createNewProject('Second', 'charcoal')`);
+  await settle(700);
+  const secondId = await js(`window.__burnhouseTest.projectPayload().id`);
+  await js(`window.__burnhouseTest.goToStep('finish')`);
+  await settle(1400);
+
+  record(
+    Boolean(secondId) && secondId !== firstId,
+    'a second project has an identity of its own',
+    String(secondId)
+  );
+  record(
+    fs.existsSync(path.join(work, secondId)),
+    'and is asked about separately, so it gets its own folder'
+  );
+  record(
+    fs.existsSync(path.join(work, firstId, 'build.json')),
+    'without disturbing the first project\u2019s prepared disc'
+  );
+
   // ------------------------------------------------------------------ done ---
   finish();
 }

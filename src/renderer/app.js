@@ -1685,6 +1685,8 @@ function createNewProject(name, themeId) {
   state.totalSeconds = 0;
   state.plan = null;
   state.lastBuild = null;
+  // Whatever the last project had built says nothing about this one.
+  state.buildState = null;
   state.banner = null;
 
   const tId = themeId || state.newProjectTheme || 'charcoal';
@@ -1721,6 +1723,8 @@ async function openProject(idOrPath) {
     ensureStarterSlides();
     state.selectedElementId = null;
     state.lastBuild = null;
+    // The previous project's build is not this project's build.
+    state.buildState = null;
     state.step = 'slides';
     // No "Project Opened" notice. Opening a project is the normal way in, and
     // announcing it every time just pushes the editor down the window to say
@@ -1801,6 +1805,9 @@ async function closeProjectToHome() {
   }
   state.step = 'projects';
   state.selectedElementId = null;
+  // Closing a project forgets what it had built, so opening another one cannot
+  // inherit the answer.
+  state.buildState = null;
   state.banner = null;
   api.project.listRecent().then((recent) => {
     state.recentProjects = recent || [];
@@ -3351,6 +3358,17 @@ function renderFinishStep(stage) {
     opening the app after an upgrade should offer that disc rather than silently
     re-encoding an hour of video to produce the same bytes again.
   */
+  /*
+    Ask what is already built, once per project.
+
+    Per project, not per session. This used to be asked the first time the Finish
+    step was shown and then never again, so opening a second project reused the
+    answer for the first: the page would describe the wrong disc — its video
+    count, when it was built, and whether it was ready to burn — and, because the
+    answer decides whether a build is needed at all, the second project's own
+    prepared disc was never even looked for. Clearing it here means the question
+    is asked again for whatever project is actually open.
+  */
   if (state.buildState === null) {
     state.buildState = 'checking';
     refreshBuiltState();
@@ -3847,6 +3865,19 @@ function clampElementInPlace(element) {
 /** The project the pipeline executes. */
 function projectPayload() {
   return {
+    /*
+      The project's own identity, so its prepared disc goes in its own folder.
+
+      This was missing, and its absence is why every project shared one prepared
+      disc: the main process had nothing to name a folder with, so it fell back
+      to the top of the working folder and the next build overwrote the last
+      one's encoded video, menu stills and authored VIDEO_TS.
+
+      Null rather than a freshly made id when there is somehow none. A new id per
+      call would be far worse than a shared folder: every single build would land
+      somewhere the next one could not find.
+    */
+    id: state.projectId || null,
     discTitle: state.discTitle || state.deck.discTitle || 'My DVD',
     // The two settings that used to be questions. They are constants now.
     audioMode: DISC_DEFAULTS.audioMode,
@@ -4233,7 +4264,11 @@ async function renderSetupDialog() {
         el('span', {
           class: 'stat-value',
           text: work.bytes
-            ? `${formatBytes(work.bytes)} \u2014 kept so rebuilding does not re-encode`
+            ? `${formatBytes(work.bytes)} \u2014 ${
+                (work.projects || 0) > 1
+                  ? `${work.projects} projects, kept so rebuilding does not re-encode`
+                  : 'kept so rebuilding does not re-encode'
+              }`
             : 'nothing kept',
         }),
       ]),
@@ -6071,6 +6106,10 @@ function installTestHooks() {
     createNewProject: (name, themeId) => createNewProject(name, themeId),
     closeProject: () => closeProjectToHome(),
     saveProject: () => saveCurrentProject(false),
+    // Exactly what the main process is sent when a disc is built, so a test can
+    // check the project's identity is in it. It has to be: without an id every
+    // project shares one prepared-disc folder and overwrites the last one.
+    projectPayload: () => projectPayload(),
     getRecentProjects: () => state.recentProjects,
     // The simulator, so its accuracy can be checked without a person at the
     // keyboard. Returning the state is the point: a test can assert where the

@@ -13,6 +13,10 @@
  *   - hdiutil is told not to verify when verification is off, because its own
  *     default is to verify and silence does not mean no.
  *
+ * And the folders all of that is kept in. Work that is saved is only saved if it
+ * can be found again: one folder per project, with the build an older version
+ * left in the shared one adopted rather than abandoned.
+ *
  * Everything here is pure filesystem and argument inspection, so it runs in well
  * under a second and needs no video tools, no drive and no disc.
  *
@@ -28,6 +32,7 @@ const encode = require('../src/core/encode');
 const disc = require('../src/core/disc');
 const probeMod = require('../src/core/probe');
 const pipeline = require('../src/core/pipeline');
+const settingsStore = require('../src/main/settings');
 const spec = require('../src/core/dvd_spec');
 
 let passed = 0;
@@ -677,6 +682,196 @@ test('the fingerprint is stable, so an unchanged project is not rebuilt', () => 
   // whole thing rests on.
   assertEqual(build().deck.slides[0].id, 'slide_1', 'A slide id must survive normalising');
   assertEqual(build().deck.slides[0].elements[0].id, 'el_1', 'And so must an element id');
+});
+
+// ------------------------------------------------------- work folders ---
+
+section('Keeping each project\u2019s prepared disc in its own folder');
+
+/** A stand-in for a prepared disc: the files a build actually leaves behind. */
+function fakeBuild(dir, { label = 'DISC', fingerprint = 'f'.repeat(64) } = {}) {
+  fs.mkdirSync(path.join(dir, 'titles', 'title_1'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'titles', 'title_1', 'VTS_01_1.VOB'), Buffer.alloc(4096, 1));
+  fs.mkdirSync(path.join(dir, 'author', 'VIDEO_TS'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'author', 'VIDEO_TS', 'VIDEO_TS.IFO'), 'ifo');
+  fs.writeFileSync(path.join(dir, 'build.json'), JSON.stringify({ fingerprint, volumeLabel: label }));
+  fs.writeFileSync(path.join(dir, `${label}.iso`), Buffer.alloc(1024, 2));
+  return dir;
+}
+
+test('two projects are given two folders', () => {
+  const base = tmpdir('workdirs');
+  const a = settingsStore.resolveWorkDir({ workDir: base }, 'proj_a');
+  const b = settingsStore.resolveWorkDir({ workDir: base }, 'proj_b');
+
+  assert(a !== b, 'Two projects must not resolve to the same folder');
+  assert(a.startsWith(base) && b.startsWith(base), 'Both stay inside the working folder');
+  assertEqual(fs.existsSync(a), true, 'A project folder is created');
+  assertEqual(fs.existsSync(b), true, 'And so is the other');
+});
+
+test('one project building does not disturb another', () => {
+  const base = tmpdir('workdirs-2');
+  const a = settingsStore.resolveWorkDir({ workDir: base }, 'proj_a');
+  const b = settingsStore.resolveWorkDir({ workDir: base }, 'proj_b');
+
+  fakeBuild(a, { label: 'TRIP', fingerprint: 'a'.repeat(64) });
+  const beforeA = fs.readFileSync(path.join(a, 'build.json'), 'utf8');
+
+  fakeBuild(b, { label: 'WEDDING', fingerprint: 'b'.repeat(64) });
+
+  assertEqual(
+    fs.readFileSync(path.join(a, 'build.json'), 'utf8'),
+    beforeA,
+    'The first project\u2019s build record must be exactly as it was'
+  );
+  assertEqual(
+    fs.existsSync(path.join(a, 'titles', 'title_1', 'VTS_01_1.VOB')),
+    true,
+    'And its encoded title must still be there'
+  );
+  assertEqual(
+    settingsStore.preparedWorkSummary(base).projects,
+    2,
+    'Both prepared discs are counted'
+  );
+});
+
+test('without an id the working folder itself is used, as before', () => {
+  const base = tmpdir('workdirs-3');
+  assertEqual(settingsStore.resolveWorkDir({ workDir: base }), base, 'No id means the top of the folder');
+  assertEqual(settingsStore.resolveWorkDir({ workDir: base }, ''), base, 'An empty id is no id');
+  assertEqual(settingsStore.resolveWorkDir({ workDir: base }, null), base, 'And so is a missing one');
+});
+
+test('an id cannot put the working folder somewhere else', () => {
+  const base = tmpdir('workdirs-4');
+
+  // These ids arrive from a project file, which can be hand-edited, copied from
+  // another machine, or written by a future version. The joined path is later
+  // deleted recursively by "Clear Working Files", so none of them may escape.
+  const hostile = [
+    '../../etc',
+    '..',
+    '.',
+    'a/b/c',
+    'C:\\Windows',
+    'proj\\..\\..\\evil',
+    'proj\u0000a',
+    '...',
+  ];
+
+  for (const id of hostile) {
+    const dir = settingsStore.resolveWorkDir({ workDir: base }, id);
+    assert(
+      dir === base || (path.resolve(dir).startsWith(path.resolve(base) + path.sep)),
+      `"${id}" resolved outside the working folder: ${dir}`
+    );
+  }
+
+  assertEqual(settingsStore.safeProjectFolder('..'), '_', 'A bare parent reference is neutralised');
+  assertEqual(settingsStore.safeProjectFolder('proj_123'), 'proj_123', 'A real id is untouched');
+  assertEqual(settingsStore.safeProjectFolder('a'.repeat(500)).length, 80, 'An absurd id is truncated');
+});
+
+test('a build left by the old shared layout is adopted, not abandoned', () => {
+  const base = tmpdir('workdirs-adopt');
+
+  /*
+    What an older version wrote: everything at the top of the working folder,
+    because there was only ever one of it. Without adopting this, switching to
+    per-project folders would make a fully prepared disc invisible and re-encode
+    the whole thing to produce the same bytes.
+  */
+  fakeBuild(base, { label: 'MY_DVD', fingerprint: 'c'.repeat(64) });
+  const record = fs.readFileSync(path.join(base, 'build.json'), 'utf8');
+
+  const dir = settingsStore.resolveWorkDir({ workDir: base }, 'proj_1');
+
+  assertEqual(
+    fs.readFileSync(path.join(dir, 'build.json'), 'utf8'),
+    record,
+    'The build record must have moved into the project folder'
+  );
+  assertEqual(
+    fs.existsSync(path.join(dir, 'titles', 'title_1', 'VTS_01_1.VOB')),
+    true,
+    'And so must the encoded titles'
+  );
+  assertEqual(
+    fs.existsSync(path.join(dir, 'MY_DVD.iso')),
+    true,
+    'And the image, whose name comes from the disc label rather than a list'
+  );
+  assertEqual(
+    fs.existsSync(path.join(base, 'build.json')),
+    false,
+    'Nothing may be left claiming the shared folder is still a build'
+  );
+  assertEqual(
+    fs.existsSync(path.join(base, 'titles')),
+    false,
+    'The old titles folder goes with it'
+  );
+});
+
+test('the shared build is adopted once, by the first project to ask', () => {
+  const base = tmpdir('workdirs-adopt-2');
+  fakeBuild(base, { label: 'ONE', fingerprint: 'd'.repeat(64) });
+
+  const first = settingsStore.resolveWorkDir({ workDir: base }, 'proj_1');
+  const second = settingsStore.resolveWorkDir({ workDir: base }, 'proj_2');
+
+  assertEqual(fs.existsSync(path.join(first, 'build.json')), true, 'The first to ask gets it');
+  assertEqual(
+    fs.existsSync(path.join(second, 'build.json')),
+    false,
+    'The second does not, because there was only ever one build there'
+  );
+  assertEqual(settingsStore.preparedWorkSummary(base).shared, false, 'And the shared layout is gone');
+});
+
+test('a project that has its own build is never overwritten by the old one', () => {
+  const base = tmpdir('workdirs-adopt-3');
+  const dir = settingsStore.resolveWorkDir({ workDir: base }, 'proj_1');
+  fakeBuild(dir, { label: 'MINE', fingerprint: 'e'.repeat(64) });
+
+  // The shared folder appears afterwards — a second copy of the app, or a
+  // restore from a backup. It must not land on top of a prepared disc.
+  fakeBuild(base, { label: 'OLDER', fingerprint: 'f'.repeat(64) });
+  settingsStore.adoptSharedBuild(base, dir);
+
+  const record = JSON.parse(fs.readFileSync(path.join(dir, 'build.json'), 'utf8'));
+  assertEqual(record.volumeLabel, 'MINE', 'The project\u2019s own build must be left alone');
+  assertEqual(
+    fs.existsSync(path.join(base, 'build.json')),
+    true,
+    'And the other one stays where it was, to be adopted or cleared'
+  );
+});
+
+test('the project id is carried through normalising but left out of the fingerprint', () => {
+  const root = tmpdir('workdirs-fingerprint');
+  const file = sourceFile(root, 'a.mp4');
+  const video = { path: file, duration: 600, name: 'a.mp4', menuLabel: '' };
+  const deck = {
+    discTitle: 'Trip',
+    themeId: 'charcoal',
+    slides: [{ id: 'slide_1', title: 'Trip', role: 'menu', elements: [] }],
+  };
+
+  const asA = pipeline.normaliseProject({ id: 'proj_a', videos: [video], discTitle: 'Trip', deck });
+  const asB = pipeline.normaliseProject({ id: 'proj_b', videos: [video], discTitle: 'Trip', deck });
+
+  assertEqual(asA.id, 'proj_a', 'The id must survive normalising, or stages look in different folders');
+
+  // The same project saved under a new id is the same disc. Hashing the id would
+  // re-encode an hour of video because a project file was copied.
+  assertEqual(
+    pipeline.projectFingerprint(asA),
+    pipeline.projectFingerprint(asB),
+    'The id must not change what the fingerprint says about the disc'
+  );
 });
 
 // --------------------------------------------------------------------- go ---

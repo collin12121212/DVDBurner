@@ -494,8 +494,9 @@ function registerIpc() {
     tools = detectTools(settings);
     const project = pipeline.normaliseProject(payload.project || payload);
     // One folder per project, so builds do not overwrite each other and a build
-    // survives upgrading the app.
-    const workDir = settingsStore.resolveWorkDir(settings, (payload.project || {}).id);
+    // survives upgrading the app. The id is the project's own, carried in the
+    // payload from the editor — without it every project shared one folder.
+    const workDir = settingsStore.resolveWorkDir(settings, project.id);
 
     const result = await jobs.run('build', async (ctx) => {
       ctx.onProgress({ stage: 'inspect', fraction: 0, message: 'Reading your videos\u2026' });
@@ -550,7 +551,7 @@ function registerIpc() {
     const settings = settingsStore.read();
     tools = detectTools(settings);
     const target = payload && payload.path;
-    const source = prepared || (await requirePrepared(payload));
+    const source = await requirePrepared(payload);
 
     const result = await jobs.run('image', async (ctx) => {
       const out = await pipeline.makeImage(source, {
@@ -569,7 +570,7 @@ function registerIpc() {
   handle('job:burn', async (payload) => {
     const settings = settingsStore.read();
     tools = detectTools(settings);
-    const source = prepared || (await requirePrepared(payload));
+    const source = await requirePrepared(payload);
 
     const result = await jobs.run('burn', async (ctx) => {
       const out = await pipeline.burn(source, {
@@ -599,7 +600,7 @@ function registerIpc() {
   handle('job:built', async (payload) => {
     const settings = settingsStore.read();
     const project = pipeline.normaliseProject(payload.project || payload);
-    const workDir = settingsStore.resolveWorkDir(settings, (payload.project || {}).id);
+    const workDir = settingsStore.resolveWorkDir(settings, project.id);
     const record = pipeline.readBuildRecord(workDir);
 
     if (!record) return { built: false, upToDate: false };
@@ -625,7 +626,7 @@ function registerIpc() {
   });
 
   handle('job:save-folder', async (payload) => {
-    const source = prepared || (await requirePrepared(payload));
+    const source = await requirePrepared(payload);
     const destination = payload && payload.path;
     if (!destination) throw new Error('Choose where to save the disc files.');
     return pipeline.saveFolder(source, destination, () => {});
@@ -648,33 +649,53 @@ function registerIpc() {
     How much room the working folder is taking, and a way to empty it.
 
     It holds a full copy of every disc that has been prepared — the encoded
-    titles, the menu, and the authored VIDEO_TS — and, since titles are now kept
-    between builds rather than thrown away and rewritten, it keeps holding them.
-    On a laptop with a small drive that is worth being able to see, and worth
-    being able to reclaim.
+    titles, the menu, and the authored VIDEO_TS — one folder per project, and,
+    since titles are now kept between builds rather than thrown away and
+    rewritten, it keeps holding them. With several projects that is several
+    gigabytes, which on a laptop with a small drive is worth being able to see
+    and worth being able to reclaim.
   */
   handle('work:info', async () => {
     const settings = settingsStore.read();
     const dir = settingsStore.resolveWorkDir(settings);
-    return { dir, bytes: folderSizeDeep(dir), exists: fs.existsSync(dir) };
+    return {
+      dir,
+      bytes: folderSizeDeep(dir),
+      exists: fs.existsSync(dir),
+      ...settingsStore.preparedWorkSummary(dir),
+    };
   });
 
   handle('work:clear', async () => {
     const settings = settingsStore.read();
     const dir = settingsStore.resolveWorkDir(settings);
     const bytes = folderSizeDeep(dir);
+    const { projects, shared } = settingsStore.preparedWorkSummary(dir);
+
+    // Counting the projects matters here: this deletes the prepared disc of
+    // every project at once, and a message that said "the disc" while removing
+    // four of them would be describing a smaller action than it takes.
+    const many = projects + (shared ? 1 : 0);
+    const what =
+      many === 0
+        ? 'The prepared files'
+        : many === 1
+          ? 'The prepared disc'
+          : `The prepared discs for ${many} projects`;
 
     const answer = await dialog.showMessageBox(mainWindow, {
       type: 'warning',
       buttons: ['Keep the Files', 'Delete Them'],
       defaultId: 0,
       cancelId: 0,
-      message: 'Delete the prepared disc files?',
+      message: `Delete the prepared disc files?`,
       detail:
-        `Burnhouse has kept ${formatBytes(bytes)} of prepared video in:\n${dir}\n\n` +
-        'Deleting it frees the space. The next build will take the full time again, ' +
-        'and any disc that was ready to burn will have to be built again first. ' +
-        'Nothing you made — your videos, your project, or a disc you have already ' +
+        `${what} — ${formatBytes(bytes)} — are kept in:\n${dir}\n\n` +
+        'Deleting them frees the space. ' +
+        (many > 1
+          ? 'Every project will have to be built again from scratch, which takes the full time it took the first time.'
+          : 'Building again will take the full time it took the first time.') +
+        ' Nothing you made — your videos, your projects, or a disc you have already ' +
         'burned — is touched.',
     });
     if (answer.response !== 1) return { canceled: true, freed: 0 };
@@ -746,13 +767,21 @@ function registerIpc() {
  *
  * Only if the project still matches. A changed project must be built again, and
  * says so rather than quietly burning the older disc.
+ *
+ * The in-session copy is only handed back when it belongs to the project being
+ * asked about. With one project that distinction did not exist and this returned
+ * whatever had been built most recently; with several it is the difference
+ * between burning the disc she just designed and the one she designed before it.
  */
 async function requirePrepared(payload) {
-  if (prepared) return prepared;
-
   const project = pipeline.normaliseProject((payload && payload.project) || payload || {});
+
+  if (prepared && (prepared.project ? prepared.project.id === project.id : false)) {
+    return prepared;
+  }
+
   const settings = settingsStore.read();
-  const workDir = settingsStore.resolveWorkDir(settings, (payload && payload.project || {}).id);
+  const workDir = settingsStore.resolveWorkDir(settings, project.id);
   const record = pipeline.readBuildRecord(workDir);
   const videoTsDir = path.join(workDir, 'author', 'VIDEO_TS');
 

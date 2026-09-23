@@ -61,6 +61,16 @@ function normaliseProject(input = {}) {
   );
 
   return {
+    /*
+      Carried through so every stage agrees which project it is working on.
+
+      The id decides which folder the prepared disc lives in, so a stage that
+      lost it would look somewhere else and report a disc that is sitting right
+      there as missing. It is deliberately NOT part of the fingerprint: the same
+      project saved under a new id is the same disc, and hashing this would
+      re-encode an hour of video because a file was copied.
+    */
+    id: input.id ? String(input.id) : null,
     discTitle,
     // The video system is never chosen by the person using the app: she is in
     // North America, so it is NTSC, and the wrong answer here is the single
