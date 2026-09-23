@@ -475,36 +475,78 @@ async function listDrives({ drutil, hdiutil, diskutil } = {}) {
 function summariseMedia(output) {
   const text = String(output || '');
   const present = /Type:\s*(?!No Media)/i.test(text) && !/No Media/i.test(text);
-  const typeMatch = /Type:\s*(.+)/i.exec(text);
-  const erasable = /Erasable:\s*(Yes|No|TRUE|FALSE)/i.exec(text);
-  const appendable = /Appendable:\s*(Yes|No|TRUE|FALSE)/i.exec(text);
-  const overWritable = /Overwritable:\s*(Yes|No|TRUE|FALSE)/i.test(text)
-    ? /Overwritable:\s*(Yes|No|TRUE|FALSE)/i.exec(text)
-    : null;
-  // Several spellings, because drutil has used more than one and the capacity
-  // is the number most worth having.
-  const freeMatch =
-    /Free Space:\s*(.+)/i.exec(text) ||
-    /Volume Free Space:\s*(.+)/i.exec(text) ||
-    /Available:\s*(.+)/i.exec(text);
-  const capacityMatch =
-    /Media Capacity:\s*(.+)/i.exec(text) ||
-    /Capacity:\s*(.+)/i.exec(text) ||
-    /Total Size:\s*(.+)/i.exec(text) ||
-    /Disk Size:\s*(.+)/i.exec(text);
-  // drutil names the disc's device node on a line of its own, which is how a
-  // capacity can be looked up when drutil itself does not report one.
-  const nodeMatch = /(?:^|\n)\s*Name:\s*(\/dev\/\w+)/i.exec(text);
+  /*
+    Written against what drutil actually prints on macOS 12.7.6 with a disc in it:
+
+             Type: DVD-R                Name: /dev/disk2
+         Sessions: 1                  Tracks: 1
+       Space Free:   00:00:00         blocks: 0 /   0.00MB /   0.00MiB
+       Space Used:   01:27:67         blocks: 6592 /  13.50MB /  12.88MiB
+        Book Type: DVD-R (v5)
+
+    Three things had been guessed wrong, which is why the app said "capacity
+    unknown" for a disc sitting in front of it: the field is "Space Free" and not
+    "Free Space"; the device name shares a line with Type rather than starting
+    one; and the figures are MB inside a line that also carries a timecode.
+  */
+  const typeMatch = /Type:\s*([^\n]*?)(?:\s{2,}Name:|\s*$)/im.exec(text);
+  const nodeMatch = /Name:\s*(\/dev\/\w+)/i.exec(text);
+  const sessionsMatch = /Sessions:\s*(\d+)/i.exec(text);
+  const bookMatch = /Book Type:\s*(.+)/i.exec(text);
+  const erasableMatch = /Erasable:\s*(Yes|No|TRUE|FALSE)/i.exec(text);
+  const appendableMatch = /Appendable:\s*(Yes|No|TRUE|FALSE)/i.exec(text);
+
+  /*
+    The value's unit depends on its size, which cost another round: a blank disc
+    reports "4.71GB", a part-written one "13.50MB" — same field, different units.
+    Matching only MB left a fresh disc saying "capacity unknown", which is the
+    exact complaint this fixes.
+  */
+  const sizeOf = (line) => {
+    if (!line) return null;
+    const gb = /([\d.]+)\s*GB/i.exec(line);
+    if (gb) return Number(gb[1]) * 1024;
+    const mb = /([\d.]+)\s*MB/i.exec(line);
+    return mb ? Number(mb[1]) : null;
+  };
+  const freeMb = sizeOf(/Space Free:\s*(.+)/i.exec(text)?.[1]);
+  const usedMb = sizeOf(/Space Used:\s*(.+)/i.exec(text)?.[1]);
+  const sessions = sessionsMatch ? Number(sessionsMatch[1]) : null;
+
+  // drutil says so outright on a blank disc: "Writability: appendable, blank,
+  // overwritable". It prints an empty Writability line once a disc is written.
+  const writability = /Writability:\s*([^\n]*)/i.exec(text)?.[1]?.trim() || '';
+  const saysBlank = /\bblank\b/i.test(writability);
+
+  /*
+    Blank means never written to. A disc carrying a session, or with no room
+    left, is not blank — worth saying before a burn rather than after the tray
+    has opened. An explicit "blank" from drutil settles it either way.
+  */
+  const alreadyWritten = saysBlank
+    ? false
+    : (sessions !== null && sessions > 0) || (freeMb !== null && freeMb <= 0);
+  const totalMb = freeMb === null && usedMb === null ? null : (freeMb || 0) + (usedMb || 0);
+  // MB below a gigabyte, GB above: "0.01 GB used" is a worse way of saying
+  // "13.5 MB used", and a written disc reports in MB.
+  const size = (mb) => (mb === null ? null : mb < 1024 ? `${mb.toFixed(1)} MB` : `${(mb / 1024).toFixed(2)} GB`);
 
   return {
     present,
     type: typeMatch ? typeMatch[1].trim() : null,
-    erasable: erasable ? /yes|true/i.test(erasable[1]) : null,
-    appendable: appendable ? /yes|true/i.test(appendable[1]) : null,
-    overWritable: overWritable ? /yes|true/i.test(overWritable[1]) : null,
-    freeSpace: freeMatch ? freeMatch[1].trim() : null,
-    capacity: capacityMatch ? capacityMatch[1].trim() : null,
     node: nodeMatch ? nodeMatch[1].trim() : null,
+    sessions,
+    bookType: bookMatch ? bookMatch[1].trim() : null,
+    erasable: erasableMatch ? /yes|true/i.test(erasableMatch[1]) : null,
+    appendable: appendableMatch ? /yes|true/i.test(appendableMatch[1]) : null,
+    overWritable: null,
+    freeMb,
+    usedMb,
+    capacityMb: totalMb,
+    freeSpace: freeMb === null ? null : `${size(freeMb)} free`,
+    usedSpace: usedMb === null ? null : `${size(usedMb)} used`,
+    capacity: totalMb === null ? null : size(totalMb),
+    alreadyWritten,
     raw: text,
   };
 }

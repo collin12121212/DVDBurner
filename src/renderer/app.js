@@ -3580,9 +3580,15 @@ function buildBurnPanel() {
           el('div', { class: 'drive-name', text: drive.label || drive.device }),
           el('div', {
             class: 'drive-meta',
-            text: hasMedia
-              ? `${(drive.media && drive.media.type) || 'Disc'} \u00b7 ${(drive.media && drive.media.freeSpace) || 'capacity unknown'}`
-              : 'No disc in the drive',
+            text: !hasMedia
+              ? 'No disc in the drive'
+              : drive.media.alreadyWritten && !drive.media.erasable
+                ? `${drive.media.type || 'Disc'} \u00b7 already has something on it${
+                    drive.media.usedSpace ? ` (${drive.media.usedSpace})` : ''
+                  }`
+                : `${drive.media.type || 'Disc'} \u00b7 ${
+                    drive.media.freeSpace || drive.media.capacity || 'capacity unknown'
+                  }`,
           }),
         ]),
         el('span', { class: `drive-state${hasMedia ? ' ready' : ''}`, text: hasMedia ? 'Ready' : 'Empty' })
@@ -3602,14 +3608,17 @@ function buildBurnPanel() {
     with the reason written next to it.
   */
   /*
-    The disc has to be there too, not just the writer.
+    The disc has to be there, and it has to be blank.
 
     Pressing Burn with an empty drive handed hdiutil nothing and it opened the
-    tray, which explained itself badly. Saying so before the press costs nothing
-    and is the difference between a mystery and a message.
+    tray, which explained itself badly. A disc that already has something on it
+    is the same kind of avoidable surprise — drutil reports it with a session on
+    it — so the app says so before the press rather than after.
   */
   const chosenDrive = writers.find((d) => d.id === state.selectedDevice) || writers[0] || null;
-  const discInDrive = Boolean(chosenDrive && chosenDrive.media && chosenDrive.media.present);
+  const media = (chosenDrive && chosenDrive.media) || null;
+  const discInDrive = Boolean(media && media.present);
+  const usedDisc = Boolean(media && media.present && media.alreadyWritten && !media.erasable);
 
   const blocked = state.busy
     ? 'Working\u2026'
@@ -3621,7 +3630,9 @@ function buildBurnPanel() {
           ? 'Choose a drive above'
           : !discInDrive
             ? 'No disc in the drive'
-            : null;
+            : usedDisc
+              ? 'That disc already has something on it'
+              : null;
 
   const burn = el('button', {
     class: 'btn-burn',

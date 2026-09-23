@@ -64,7 +64,10 @@ fi
 echo "    $(du -h "${DMG}" | cut -f1)"
 
 echo "==> Mounting"
-MOUNT="$(hdiutil attach "${DMG}" -nobrowse -quiet | grep -o '/Volumes/.*' | head -1)"
+# No -quiet here: it suppresses the mount point too, which is the one thing this
+# needs. The trailing `|| true` keeps a failed grep from aborting the script
+# before the check below can explain what happened.
+MOUNT="$(hdiutil attach "${DMG}" -nobrowse 2>/dev/null | grep -o '/Volumes/.*' | head -1 || true)"
 if [ -z "${MOUNT}" ] || [ ! -d "${MOUNT}/${APP_NAME}.app" ]; then
   echo "The image mounted but does not contain ${APP_NAME}.app." >&2
   ls -la "${MOUNT}" >&2 || true
