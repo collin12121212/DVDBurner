@@ -3972,7 +3972,7 @@ function buildMultiElementInspector(elements) {
       class: 'prop-hint',
       text:
         'Every change here is applied to all of them. Drag one and the rest come ' +
-        'with it. Hold Cmd, Ctrl or Shift and click to add or remove one.',
+        `with it. Hold ${addToSelectionKey()} and click to add or remove one.`,
     })
   );
 
@@ -4083,6 +4083,22 @@ function switchRow({ checked, title, desc, onChange }) {
       desc ? el('div', { class: 'switch-desc', text: desc }) : null,
     ].filter(Boolean)),
   ]);
+}
+
+/**
+ * What to call the modifier that adds to a selection, on this computer.
+ *
+ * Ctrl on Windows, Cmd on a Mac — and on a Mac Ctrl must not be named at all,
+ * because Ctrl-click there is the system's own right-click and would open the
+ * context menu instead of adding to the selection. Telling somebody to press a
+ * key that does something else is worse than saying nothing.
+ *
+ * Shift is accepted everywhere and is named everywhere, since it is the one
+ * nobody has to be told about twice.
+ */
+function addToSelectionKey() {
+  const isMac = document.body.classList.contains('platform-mac');
+  return isMac ? 'Cmd or Shift' : 'Ctrl or Shift';
 }
 
 // --------------------------------------------------------- step: finish ---
@@ -5336,7 +5352,7 @@ function openHelp() {
       class: 'hint',
       style: 'margin-bottom: 18px',
       text:
-        'Hold Cmd, Ctrl or Shift and click to select more than one thing on a slide. ' +
+        `Hold ${addToSelectionKey()} and click to select more than one thing on a slide. ` +
         'The panel on the right then shows only the properties they all have, and ' +
         'changing one changes it on all of them \u2014 line up three buttons, or give every ' +
         'label the same size, in one go. Where they differ the row says "mixed". Drag ' +
