@@ -20,6 +20,7 @@
 const deckModel = require('./deck');
 
 const { RASTER, SAFE_MARGIN, MAX_BUTTONS_PER_SLIDE, getTheme, getFont, fontSizeFor } = deckModel;
+const safeArea = require('./safe_area');
 
 /** Line spacing as a multiple of the font size. */
 const LINE_HEIGHT = 1.32;
@@ -353,6 +354,24 @@ function navigationElements(slide, slides) {
  * Returns the resolved elements, the buttons that must exist on this menu page
  * in the DVD structure, and any problems the user should be told about.
  */
+/**
+ * Whether the remote can land on an element.
+ *
+ * A button always can. A video tile can, because pressing it plays the film. A
+ * picture can only when it has been given somewhere to go: with no destination
+ * it is a picture and nothing else, and putting a highlight on it would light up
+ * something that does nothing when pressed — which reads as a broken remote.
+ *
+ * This is the one place that decides, so the picture on the disc and the
+ * simulator that plays it back cannot disagree about which parts are clickable.
+ */
+function isSelectable(element) {
+  if (!element) return false;
+  if (element.kind === 'button' || element.kind === 'video') return true;
+  if (element.kind === 'image') return Boolean(element.targetSlideId || element.videoId);
+  return false;
+}
+
 function layoutSlide(deck, slide) {
   const theme = getTheme(slide.themeId || deck.themeId);
   const authored = slide.elements.map((element) => resolveElement(element, theme));
@@ -362,10 +381,11 @@ function layoutSlide(deck, slide) {
   }));
 
   const all = [...authored, ...nav];
-  // A video tile plays something, so it needs a button region just as a button
-  // does. Everything downstream then treats it exactly like a button, which is
-  // what makes the remote able to choose it.
-  const buttonElements = all.filter((e) => e.kind === 'button' || e.kind === 'video');
+  // A video tile plays something, and a picture that has been given a
+  // destination goes somewhere, so both need a button region just as a button
+  // does. Everything downstream then treats them exactly alike, which is what
+  // makes the remote able to choose them.
+  const buttonElements = all.filter(isSelectable);
 
   const problems = [];
   if (buttonElements.length > MAX_BUTTONS_PER_SLIDE) {
@@ -442,39 +462,25 @@ function even(n) {
 /**
  * Keep an element inside the television-safe area.
  *
- * Applies to positions and to sizes, because both matter: an element dragged
- * to the edge would be cropped by the television, and one resized too large
- * would push its own text off the picture. Called on every mutation rather than
- * only when rendering, so an invalid deck can never be saved or burned.
+ * The rule itself lives in safe_area.js, because the editor has to apply exactly
+ * the same one while she is dragging. It used to be written out here as well,
+ * and the two copies had drifted: this one capped an element's size and then
+ * positioned it, so an element at the maximum size had exactly one legal
+ * position and could not be moved, while the editor's copy capped nothing and
+ * produced an inverted range. Only the editor's ran, so this one was a trap
+ * waiting for whoever wired it up next.
+ *
+ * Exported for callers that have a single element in hand; `clampDeck` below is
+ * what the pipeline uses.
  */
-function clampElement(element, width, height) {
-  const box = element.box || element;
-  const maxWidth = width - SAFE_MARGIN * 2;
-  // Video tiles sit above the navigation row (< Menu / Next > at y=408..440),
-  // so their bottom edge is capped at y=396 to guarantee they never collide.
-  const maxBottom = element.kind === 'video' ? 396 : (height - SAFE_MARGIN);
-  const maxHeight = maxBottom - SAFE_MARGIN;
-  const w = Math.min(Math.max(40, Math.round(box.width)), maxWidth);
-  const h = Math.min(Math.max(24, Math.round(box.height)), maxHeight);
-  const x = Math.min(Math.max(SAFE_MARGIN, Math.round(box.x)), width - SAFE_MARGIN - w);
-  const y = Math.min(Math.max(SAFE_MARGIN, Math.round(box.y)), maxBottom - h);
-
-  return {
-    ...element,
-    x,
-    y,
-    width: w,
-    height: h,
-  };
-}
 
 /**
  * Apply safe-area limits to every element of every slide.
  *
- * Runs over the whole deck on every edit, so there is a single invariant:
- * whatever is in the deck is placeable on a television. That keeps the guard
- * honest no matter which interaction produced the change — a drag, a resize, a
- * template, or a deck loaded from settings.
+ * Runs over the whole deck, so there is a single invariant: whatever is in the
+ * deck is placeable on a television. That keeps the guard honest no matter which
+ * interaction produced the change — a drag, a resize, a template, or a deck
+ * loaded from settings.
  */
 function clampDeck(deck) {
   const width = RASTER.width;
@@ -484,13 +490,18 @@ function clampDeck(deck) {
     slides: deck.slides.map((slide) => ({
       ...slide,
       elements: slide.elements.map((element) => {
+        const clamped = safeArea.clampElement(
+          { ...element, x: (element.box || element).x, y: (element.box || element).y },
+          width,
+          height
+        );
+        const placed = { ...element, x: clamped.x, y: clamped.y, width: clamped.width, height: clamped.height };
         // Text and buttons grow to fit their content, so their stored height is
         // a floor rather than a fixed size.
-        const clamped = clampElement(element, width, height);
         if (element.kind === 'text' && element.autoHeight !== false) {
-          return { ...clamped, height: element.height };
+          return { ...placed, height: element.height };
         }
-        return clamped;
+        return placed;
       }),
     })),
   };
@@ -515,10 +526,13 @@ module.exports = {
   textBlockHeight,
   resolveElement,
   navigationElements,
+  isSelectable,
   layoutSlide,
   layoutDeck,
   buttonsForAuthoring,
-  clampElement,
+  // The shared rule, re-exported so anything that reached for it here keeps
+  // working and keeps getting the same answer as the editor.
+  clampElement: safeArea.clampElement,
   clampDeck,
   rasterStretch,
   displayAspectToRaster,

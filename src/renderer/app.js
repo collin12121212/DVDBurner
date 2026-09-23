@@ -20,9 +20,18 @@
 
 const api = window.burnhouse;
 const draw = window.BurnhouseSlideDraw;
-
-const RASTER = { width: 720, height: 480 };
-const SAFE_MARGIN = 40;
+/*
+  The raster, the safe margin and the rule about where an element may sit all
+  come from safe_area.js, which the authoring side requires as a module. They
+  used to be written out again here, which is how the editor and the authoring
+  side came to disagree about an element larger than the area it was being held
+  inside — and the size a picture may be dragged to is exactly that question.
+*/
+const safeArea = window.BurnhouseSafeArea;
+const RASTER = safeArea.RASTER;
+const SAFE_MARGIN = safeArea.SAFE_MARGIN;
+const MIN_ELEMENT_WIDTH = safeArea.MIN_WIDTH;
+const MIN_ELEMENT_HEIGHT = safeArea.MIN_HEIGHT;
 const MAX_BUTTONS_PER_SLIDE = 18;
 
 /**
@@ -840,6 +849,9 @@ function addElement(kind, patch = {}) {
       width: patch.width || 260,
       height: patch.height || 190,
       fit: 'fit',
+      // A picture may be given something to do, exactly as a button may.
+      videoId: patch.videoId || null,
+      targetSlideId: patch.targetSlideId || null,
     });
   } else if (kind === 'video') {
     Object.assign(base, {
@@ -865,23 +877,18 @@ function addElement(kind, patch = {}) {
     });
   }
 
-  // Whatever asked for this element — a drop, the toolbar, a test — the tile
-  // must land inside the television-safe area. A drop aimed near an edge would
-  // otherwise push half the new tile off the slide, where the highlight would
-  // still fire on a player but the picture would be cropped.
-  base.x = Math.min(
-    Math.max(SAFE_MARGIN, Math.round(base.x)),
-    RASTER.width - SAFE_MARGIN - base.width
-  );
-  base.y = Math.min(
-    Math.max(SAFE_MARGIN, Math.round(base.y)),
-    RASTER.height - SAFE_MARGIN - base.height
-  );
+  // Whatever asked for this element — a drop, the toolbar, a test — it must land
+  // where it can be seen. The rule lives in safe_area.js so this agrees with the
+  // authoring side and with every drag that follows.
+  safeArea.clampElement(base, RASTER.width, RASTER.height);
 
   slide.elements.push(base);
   state.selectedElementId = base.id;
   persistDeck();
   render();
+  // Returned so a caller that has just put something on a slide can say what it
+  // was and where it went.
+  return base;
 }
 
 function deleteElement(elementId) {
@@ -1112,11 +1119,12 @@ function handleAt(box, point) {
   return null;
 }
 
-/** Kinds that must keep their shape, or the picture on the disc looks stretched. */
-const SHAPE_LOCKED_KINDS = new Set(['video', 'image']);
-
-const MIN_ELEMENT_WIDTH = 40;
-const MIN_ELEMENT_HEIGHT = 24;
+/**
+ * Kinds that must keep their shape while being resized, or the picture on the
+ * disc looks stretched. Defined in safe_area.js, beside the clamp that depends
+ * on it and which the authoring side uses too.
+ */
+const SHAPE_LOCKED_KINDS = safeArea.SHAPE_LOCKED;
 
 /**
  * The box an element becomes when a handle is dragged.
@@ -1316,6 +1324,43 @@ function drawEditorOverlay(ctx, layout) {
         ctx.restore();
       }
     }
+  }
+
+  /*
+    Which pictures the remote can land on.
+
+    A button and a video tile already look pressable. A picture does not, so one
+    that has been given somewhere to go is marked with a small badge — otherwise
+    she sets a destination, sees nothing change, and has no way of telling a
+    clickable picture from an ordinary one.
+
+    The badge sits at the element's visible corner rather than its own: a picture
+    larger than the frame has its corner off the edge, where a mark would never
+    be seen. This is editor furniture, drawn after the slide itself, and it never
+    reaches the disc.
+  */
+  for (const element of layout.buttons || []) {
+    if (element.kind !== 'image' || element.id === selected) continue;
+    const box = element.box;
+    const spotX = Math.max(4, Math.min(Math.round(box.x), layout.width - 30));
+    const spotY = Math.max(4, Math.min(Math.round(box.y), layout.height - 26));
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(217, 163, 83, 0.95)';
+    ctx.beginPath();
+    ctx.roundRect(spotX, spotY, 24, 20, 5);
+    ctx.fill();
+
+    ctx.strokeStyle = '#1c1b19';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(spotX + 10, spotY + 6);
+    ctx.lineTo(spotX + 15, spotY + 10);
+    ctx.lineTo(spotX + 10, spotY + 14);
+    ctx.stroke();
+    ctx.restore();
   }
 
   if (state.showSafeArea) {
@@ -2552,7 +2597,9 @@ function renderEditorToolbar() {
       status.append(
         el('span', {
           class: 'dim',
-          text: 'Drag a video from the Videos panel onto this slide to make a button that plays it.',
+          text:
+            'Drag a video from the Videos panel onto this slide to make a button that ' +
+            'plays it, or drop a picture here to place it.',
         })
       );
     }
@@ -2605,12 +2652,31 @@ function addManualButton() {
   addElement('button', { label: 'Go to another slide', targetSlideId: others[0].id });
 }
 
+/**
+ * Put a picture on the current slide.
+ *
+ * The one route a picture takes onto a slide, whether it was chosen through the
+ * file picker or dropped on the canvas, so the two cannot end up different in
+ * size, in shape, or in how the file is read and downscaled.
+ *
+ * `step` staggers a drop of several. Without it they would all be placed at the
+ * same starting point and would look like a single picture, with the others
+ * hidden underneath.
+ */
+async function addPictureFromPath(path, step = 0) {
+  const src = await api.files.readImage(path);
+  return addElement('image', {
+    src,
+    fileName: basename(path),
+    ...(step ? { x: 120 + step * 26, y: 140 + step * 26 } : {}),
+  });
+}
+
 async function pickPicture() {
   try {
     const result = await api.files.pickImage();
     if (result.canceled) return;
-    const dataUrl = await api.files.readImage(result.path);
-    addElement('image', { src: dataUrl, fileName: basename(result.path) });
+    await addPictureFromPath(result.path);
   } catch (err) {
     setBanner('error', 'That picture could not be used', String(err.message || err));
     render();
@@ -2844,13 +2910,21 @@ function propTable(groups) {
   return table;
 }
 
-/** One name/value line. The name is also the filter key. */
-function propRow(name, control) {
+/**
+ * One name/value line.
+ *
+ * `name` is the filter key and is what the property filter searches, so it stays
+ * the plain identifier. `label` is what she reads, for the rows where the
+ * identifier is not a phrase — "GoToSlide" is a name for a variable, not for a
+ * thing, and the panel is hers to read.
+ */
+function propRow(name, control, label) {
   const row = el('div', { class: 'prop-row' });
   row.dataset.prop = String(name).toLowerCase();
   const value = el('span', { class: 'prop-value' });
   value.append(control);
-  row.append(el('span', { class: 'prop-name', text: name, title: name }), value);
+  const shown = label || name;
+  row.append(el('span', { class: 'prop-name', text: shown, title: shown }), value);
   return row;
 }
 
@@ -3134,7 +3208,7 @@ function buildElementInspector(slide, element) {
             if (element.targetSlideId) element.videoId = null;
             apply({}, { rebuild: true });
           }
-        )),
+        ), 'Goes to'),
       ],
     });
     groups.push({ title: 'Layout', rows: layoutRows() });
@@ -3166,6 +3240,33 @@ function buildElementInspector(slide, element) {
             apply({}, { rebuild: true });
           },
         })),
+      ],
+    });
+    /*
+      What the picture does when it is pressed.
+
+      None is the default and is offered by name, because a picture that is just
+      a picture is the ordinary case — it must not read as "something you have
+      not filled in yet". Choosing a slide makes the picture a button on the
+      disc: the remote lands on it, it lights up when chosen, and pressing it
+      goes there, exactly as a button does.
+    */
+    groups.push({
+      title: 'Behaviour',
+      rows: [
+        propRow('GoToSlide', propSelect(
+          [{ value: '', label: 'None \u2014 just a picture' }].concat(
+            state.deck.slides
+              .filter((other) => other.id !== slide.id)
+              .map((other) => ({ value: other.id, label: other.title }))
+          ),
+          element.targetSlideId || '',
+          (value) => {
+            element.targetSlideId = value || null;
+            if (element.targetSlideId) element.videoId = null;
+            apply({}, { rebuild: true });
+          }
+        ), 'Goes to'),
       ],
     });
     groups.push({ title: 'Layout', rows: layoutRows() });
@@ -3855,11 +3956,7 @@ function goToStep(step) {
 }
 
 function clampElementInPlace(element) {
-  const w = element.width;
-  const h = element.height;
-  const maxBottom = element.kind === 'video' ? 396 : (RASTER.height - SAFE_MARGIN);
-  element.x = Math.min(Math.max(SAFE_MARGIN, Math.round(element.x)), RASTER.width - SAFE_MARGIN - w);
-  element.y = Math.min(Math.max(SAFE_MARGIN, Math.round(element.y)), maxBottom - h);
+  return safeArea.clampElement(element, RASTER.width, RASTER.height);
 }
 
 /** The project the pipeline executes. */
@@ -4561,6 +4658,19 @@ function openHelp() {
         'disc plays the video. Drop it on the slide list on the left instead and ' +
         'it makes a whole new slide for that video.',
     }),
+    el('h2', { text: 'Making something clickable' }),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 18px',
+      text:
+        'A button goes to another slide: choose where in "Goes to". A picture can do ' +
+        'exactly the same \u2014 click it, set "Goes to" in the panel on the right, and the ' +
+        'remote will land on the picture and open that slide when it is pressed. A ' +
+        'picture with a destination is marked with a small arrow so you can tell it ' +
+        'apart from an ordinary one. Leave it on "None" and the picture is just a ' +
+        'picture. Point either one at a slide holding a video and it plays that video ' +
+        'straight away.',
+    }),
     el('h2', { text: 'Moving things around' }),
     el('p', {
       class: 'hint',
@@ -4569,8 +4679,10 @@ function openHelp() {
         'Drag anything on the slide to move it, or use the arrow keys. Click it once and ' +
         'little square handles appear on its edges and corners \u2014 drag those to make it ' +
         'bigger or smaller. Videos and pictures keep their shape while you do, so nothing ' +
-        'gets stretched; hold Shift if you really do want to stretch one. Nothing can be ' +
-        'dragged outside the safe area, because some televisions crop the edge of the picture.',
+        'gets stretched; hold Shift if you really do want to stretch one. Words and ' +
+        'buttons are held inside the safe area, because some televisions crop the edge ' +
+        'of the picture. A picture may be made larger than that and moved around within ' +
+        'it, so a photograph can fill the frame.',
     }),
     el('h2', { text: 'Right-clicking' }),
     el('p', {
@@ -5952,8 +6064,9 @@ function pathsFromFiles(files) {
 /**
  * Files dropped straight from Finder / Windows Explorer.
  *
- * Drops directly onto the slide: adds the video to the disc and puts it on the slide
- * in one single gesture. No second drag! Boom done.
+ * A picture becomes a picture on the slide, exactly as pressing "Add a picture"
+ * would. Anything else is a video for the disc: the video is added and put on
+ * the slide in one single gesture, with no second drag.
  */
 async function importFilesOntoSlide(files) {
   const paths = pathsFromFiles(files);
@@ -5967,7 +6080,42 @@ async function importFilesOntoSlide(files) {
     render();
     return;
   }
-  const added = await addVideoPaths(paths);
+  return importPathsOntoSlide(paths);
+}
+
+/**
+ * The same, from paths rather than from dropped files.
+ *
+ * Split out because resolving a dropped file to a path needs the main process,
+ * and because this is the part worth testing: what a given set of files becomes.
+ */
+async function importPathsOntoSlide(paths) {
+  /*
+    Pictures are handled here and never handed to addVideoPaths.
+
+    That is all that was wrong with dropping an image before: the drop went to
+    the video importer, which answered "Some files were not videos — photo.png
+    was skipped", and the picture never appeared. Dropping one on the slide is
+    the first thing anybody tries, so it has to do the obvious thing.
+  */
+  const pictures = paths.filter((path) => looksLikeImage(path));
+  for (let i = 0; i < pictures.length; i += 1) {
+    try {
+      await addPictureFromPath(pictures[i], i);
+    } catch (err) {
+      setBanner(
+        'error',
+        'That picture could not be used',
+        `${basename(pictures[i])}: ${String(err.message || err)}`
+      );
+      render();
+    }
+  }
+
+  const videos = paths.filter((path) => !looksLikeImage(path));
+  if (!videos.length) return;
+
+  const added = await addVideoPaths(videos);
   if (!added.length) return;
 
   for (let i = 0; i < added.length; i++) {
@@ -5996,7 +6144,33 @@ async function importFilesOntoSlide(files) {
 async function importFilesOntoFilmstrip(files) {
   const paths = pathsFromFiles(files);
   if (!paths.length) return;
-  const added = await addVideoPaths(paths);
+  return importPathsOntoFilmstrip(paths);
+}
+
+async function importPathsOntoFilmstrip(paths) {
+  // A picture makes a new slide showing it, exactly as a video does. Sent to the
+  // video importer it would be rejected as "not a video" and the drop would
+  // quietly do nothing.
+  const pictures = paths.filter((path) => looksLikeImage(path));
+  for (const picture of pictures) {
+    const slide = addSlideAtEnd();
+    state.activeSlideId = slide.id;
+    try {
+      await addPictureFromPath(picture);
+    } catch (err) {
+      setBanner(
+        'error',
+        'That picture could not be used',
+        `${basename(picture)}: ${String(err.message || err)}`
+      );
+      render();
+    }
+  }
+
+  const videos = paths.filter((path) => !looksLikeImage(path));
+  if (!videos.length) return;
+
+  const added = await addVideoPaths(videos);
   if (!added.length) return;
   for (const video of added) dropVideoOnFilmstrip(video);
 }
@@ -6072,6 +6246,56 @@ function installTestHooks() {
     }),
     addSlide: (options) => addSlide(options),
     addElement: (kind, patch) => addElement(kind, patch),
+    // What a drop becomes, from paths rather than from dropped files. Resolving
+    // a File to a path needs the main process and a real drag, so the part worth
+    // checking — which a given file turns into — is reached directly.
+    importPathsOntoSlide: (paths) => importPathsOntoSlide(paths),
+    importPathsOntoFilmstrip: (paths) => importPathsOntoFilmstrip(paths),
+    clampElement: (element) => clampElementInPlace({ ...element }),
+    banner: () => (state.banner ? { kind: state.banner.kind, title: state.banner.title } : null),
+    // The slide being edited, and what the disc makes of the deck as it stands —
+    // the same model the burn and the simulator are both built from.
+    goToSlide: (slideId) => {
+      if (!state.deck.slides.some((s) => s.id === slideId)) return false;
+      state.activeSlideId = slideId;
+      state.selectedElementId = null;
+      render();
+      return true;
+    },
+    selectElement: (elementId) => {
+      state.selectedElementId = elementId;
+      renderInspector();
+      return state.selectedElementId;
+    },
+    setImageTarget: (elementId, targetSlideId) => {
+      const { element } = findElement(elementId);
+      if (!element || element.kind !== 'image') return false;
+      element.targetSlideId = targetSlideId || null;
+      if (element.targetSlideId) element.videoId = null;
+      persistDeck();
+      refreshCanvas();
+      return element.targetSlideId;
+    },
+    /*
+      What the disc makes of the deck as it stands.
+
+      Asked of the main process rather than cached, so it is the same model the
+      burn is built from and cannot be a stale copy of it.
+    */
+    discButtons: async () =>
+      (await api.deck.discModel({ videos: state.videos, deck: state.deck })).menus.map((page) => ({
+        page: page.page,
+        slideId: page.slideId,
+        title: page.title,
+        buttons: page.buttons.map((b) => ({
+          name: b.name,
+          x0: b.x0,
+          y0: b.y0,
+          x1: b.x1,
+          y1: b.y1,
+          command: b.command,
+        })),
+      })),
     // The slide list's right-click menu, so its contents can be checked without
     // a person at the mouse.
     openSlideMenuFor: (slideId) => {

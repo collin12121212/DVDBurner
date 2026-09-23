@@ -64,6 +64,12 @@ function assertEqual(actual, expected, message) {
   }
 }
 
+function assertClose(actual, expected, tolerance, message) {
+  if (Math.abs(actual - expected) > tolerance) {
+    throw new Error(`${message || 'Values differ'}: expected ${expected} (±${tolerance}), got ${actual}`);
+  }
+}
+
 function tmpdir(tag) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `burnhouse-${tag}-`));
 }
@@ -872,6 +878,295 @@ test('the project id is carried through normalising but left out of the fingerpr
     pipeline.projectFingerprint(asB),
     'The id must not change what the fingerprint says about the disc'
   );
+});
+
+// -------------------------------------------------------- the safe area ---
+
+section('Dragging an element that is bigger than the safe area');
+
+const safeArea = require('../src/core/safe_area');
+
+/** An element of the given size, dragged to the given corner of the world. */
+function dragged(kind, x, y, width, height) {
+  return safeArea.clampElement({ kind, x, y, width, height });
+}
+
+test('an element the size of the safe area can still be moved to both edges', () => {
+  const box = { x: safeArea.SAFE_MARGIN, y: safeArea.SAFE_MARGIN, width: 640, height: 400 };
+
+  const left = safeArea.clampEdge(-500, box.width, safeArea.SAFE_MARGIN, 720 - safeArea.SAFE_MARGIN);
+  const right = safeArea.clampEdge(5000, box.width, safeArea.SAFE_MARGIN, 720 - safeArea.SAFE_MARGIN);
+
+  assertEqual(left, 40, 'It stops at the left guide');
+  assertEqual(right, 40, 'And at the right one, which is the same place when it is exactly full width');
+});
+
+test('a picture wider than the safe area can be dragged across it', () => {
+  /*
+    The reported bug. A picture scaled past the safe area used to be pinned: the
+    upper position bound came out below the lower one, so both halves of the
+    clamp collapsed to the same negative number and every drag snapped it back
+    there. What has to be true instead is that its position varies with the drag.
+  */
+  const hardLeft = dragged('image', -9999, -9999, 900, 600);
+  const hardRight = dragged('image', 9999, 9999, 900, 600);
+  const middle = dragged('image', 0, 0, 900, 600);
+
+  assert(hardLeft.x < hardRight.x, `Dragging must move it: ${hardLeft.x} then ${hardRight.x}`);
+  assert(hardLeft.y < hardRight.y, `On both axes: ${hardLeft.y} then ${hardRight.y}`);
+  assert(middle.x > hardLeft.x && middle.x < hardRight.x, 'And it passes through the middle');
+
+  // It must never leave a blank strip inside the safe area: an oversized picture
+  // covers the area it is placed against, and the drag chooses which part shows.
+  const right = 720 - safeArea.SAFE_MARGIN;
+  const bottom = 480 - safeArea.SAFE_MARGIN;
+  for (const box of [hardLeft, hardRight, middle]) {
+    assert(box.x <= safeArea.SAFE_MARGIN, `A gap opens on the left at x=${box.x}`);
+    assert(box.x + box.width >= right, `A gap opens on the right at x=${box.x}`);
+    assert(box.y <= safeArea.SAFE_MARGIN, `A gap opens at the top at y=${box.y}`);
+    assert(box.y + box.height >= bottom, `A gap opens at the bottom at y=${box.y}`);
+  }
+});
+
+test('a picture that fits is held inside, exactly as before', () => {
+  const tooFar = dragged('image', -500, -500, 260, 190);
+  assertEqual(tooFar.x, safeArea.SAFE_MARGIN, 'A small picture stops at the left guide');
+  assertEqual(tooFar.y, safeArea.SAFE_MARGIN, 'And at the top one');
+
+  const tooFarRight = dragged('image', 5000, 5000, 260, 190);
+  assertEqual(tooFarRight.x, 720 - safeArea.SAFE_MARGIN - 260, 'And at the right one');
+  assertEqual(tooFarRight.y, 480 - safeArea.SAFE_MARGIN - 190, 'And at the bottom one');
+});
+
+test('text and buttons are pulled back to the safe area instead of getting stuck', () => {
+  for (const kind of ['text', 'button', 'frame']) {
+    const box = dragged(kind, 0, 0, 5000, 5000);
+    // The size comes down rather than the position collapsing. Without this an
+    // element this big has exactly one legal position, so it cannot be moved.
+    assertEqual(box.width, 640, `${kind} should be no wider than the safe area`);
+    assertEqual(box.height, 400, `${kind} should be no taller than the safe area`);
+    assert(box.x >= safeArea.SAFE_MARGIN, `${kind} x must be inside`);
+    assert(box.y >= safeArea.SAFE_MARGIN, `${kind} y must be inside`);
+    assertEqual(box.x, safeArea.SAFE_MARGIN, `${kind} fills the width, so it sits at the left guide`);
+  }
+});
+
+test('a video tile is pulled back without being squashed', () => {
+  const box = dragged('video', 0, 0, 1600, 900);
+  const before = 1600 / 900;
+
+  assert(box.width <= 640 && box.height <= safeArea.VIDEO_BOTTOM - safeArea.SAFE_MARGIN, 'It fits the safe area');
+  assertClose(box.width / box.height, before, 0.01, 'A stretched face on the disc is what this prevents');
+  assert(
+    box.y + box.height <= safeArea.VIDEO_BOTTOM,
+    'And it still stops short of the navigation row'
+  );
+});
+
+test('the editor and the authoring side share one clamp', () => {
+  const deck = require('../src/core/deck');
+  const slideLayout = require('../src/core/slide_layout');
+
+  // Two copies of this rule is what let them disagree in the first place: the
+  // editor's version and the authoring version were not the same arithmetic, and
+  // only one of them was ever called.
+  assertEqual(slideLayout.clampElement, safeArea.clampElement, 'One implementation, not two');
+  assertEqual(deck.RASTER, safeArea.RASTER, 'And one definition of the raster');
+  assertEqual(deck.SAFE_MARGIN, safeArea.SAFE_MARGIN, 'And of the margin');
+});
+
+test('an oversized picture survives being written to the disc and read back', () => {
+  // The deck guard has to agree with the editor, or a picture that drags nicely
+  // would be moved the moment anything laid the deck out again.
+  const deckModel = require('../src/core/deck');
+  const slideLayout = require('../src/core/slide_layout');
+
+  const deck = {
+    themeId: 'charcoal',
+    slides: [
+      deckModel.makeSlide({
+        title: 'Full bleed',
+        elements: [deckModel.makeImageElement({ x: -200, y: -150, width: 1100, height: 780 })],
+      }),
+    ],
+  };
+
+  const clamped = slideLayout.clampDeck(deckModel.normaliseDeck(deck));
+  const image = clamped.slides[0].elements[0];
+  assert(image.width > 640, `A picture may be wider than the safe area, got ${image.width}`);
+  assert(image.x <= safeArea.SAFE_MARGIN, 'And is placed so it covers the area');
+});
+
+// ------------------------------------------- pictures that go somewhere ---
+
+section('A picture the remote can land on');
+
+test('a picture is only clickable when it has been given somewhere to go', () => {
+  const slideLayout = require('../src/core/slide_layout');
+  const deckModel = require('../src/core/deck');
+
+  assertEqual(slideLayout.isSelectable(deckModel.makeButtonElement({ label: 'B' })), true, 'A button always is');
+  assertEqual(slideLayout.isSelectable(deckModel.makeImageElement({})), false, 'A plain picture is not');
+  assertEqual(
+    slideLayout.isSelectable(deckModel.makeImageElement({ targetSlideId: 'other' })),
+    true,
+    'A picture with a slide to open is'
+  );
+  assertEqual(
+    slideLayout.isSelectable(deckModel.makeImageElement({ videoId: 'v1' })),
+    true,
+    'And one pointed straight at a film is too'
+  );
+  for (const kind of ['text', 'frame']) {
+    assertEqual(
+      slideLayout.isSelectable({ kind, targetSlideId: 'other' }),
+      false,
+      `A ${kind} is not clickable even with a destination`
+    );
+  }
+});
+
+test('a picture keeps the slide it points at, and defaults to none', () => {
+  const deckModel = require('../src/core/deck');
+
+  const plain = deckModel.makeImageElement({ src: 'data:image/png;base64,x' });
+  assertEqual(plain.targetSlideId, null, 'A new picture goes nowhere');
+  assertEqual(plain.videoId, null, 'And plays nothing');
+
+  const linked = deckModel.makeImageElement({ targetSlideId: 'second' });
+  assertEqual(linked.targetSlideId, 'second', 'A destination survives being made');
+
+  // Through normalising, which is what a saved deck and the pipeline both do.
+  const slide = deckModel.makeSlide({ elements: [linked] });
+  assertEqual(slide.elements[0].targetSlideId, 'second', 'And survives normalising');
+});
+
+test('a linked picture is a button on the disc, in every respect', () => {
+  const deckModel = require('../src/core/deck');
+  const dvdModel = require('../src/core/dvd_model');
+
+  const slides = [
+    deckModel.makeSlide({
+      id: 'menu',
+      title: 'Menu',
+      role: 'menu',
+      elements: [
+        deckModel.makeImageElement({ id: 'linked', x: 40, y: 60, width: 200, height: 150, targetSlideId: 'second' }),
+        deckModel.makeImageElement({ id: 'plain', x: 300, y: 60, width: 200, height: 150 }),
+      ],
+    }),
+    deckModel.makeSlide({
+      id: 'second',
+      title: 'Second',
+      role: 'menu',
+      elements: [
+        deckModel.makeImageElement({ id: 'back', x: 40, y: 300, width: 200, height: 100, targetSlideId: 'menu' }),
+      ],
+    }),
+  ];
+
+  const model = dvdModel.buildDiscModel({
+    deck: { discTitle: 'T', themeId: 'charcoal', slides },
+    videos: [],
+  });
+
+  assertEqual(model.menus.length, 2, 'Both slides become pages, because both have something to press');
+
+  const page = model.menus[0];
+  assertEqual(page.buttons.length, 1, 'Only the linked picture is a button on the first page');
+  assertEqual(page.buttons[0].name, 'btn1', 'It is named like any other button');
+  assertEqual(page.buttons[0].x0, 40, 'And carries the picture\u2019s own rectangle');
+  assertEqual(page.buttons[0].y0, 60, 'Including its position');
+  assertEqual(page.buttons[0].command, 'jump menu 2;', 'And jumps where a button pointing there would');
+
+  // The remote has to be able to reach it, which is what makes it usable with a
+  // handset rather than only with a mouse.
+  assert(page.navigation.btn1, 'It takes part in arrow-key navigation');
+  assertEqual(page.navigation.btn1.up, 'btn1', 'With somewhere for every arrow to go');
+
+  // And the picture with nothing to do is not a button, so a plain picture
+  // cannot turn a slide into a menu page or light up when the remote passes it.
+  assert(
+    !page.buttons.some((b) => b.label === '' && b.x0 === 300),
+    'The plain picture was not made pressable'
+  );
+});
+
+test('a plain picture does not turn its slide into a menu page', () => {
+  const deckModel = require('../src/core/deck');
+  const dvdModel = require('../src/core/dvd_model');
+
+  const slides = [
+    deckModel.makeSlide({
+      id: 'art',
+      title: 'Art',
+      role: 'menu',
+      elements: [
+        deckModel.makeImageElement({ id: 'deco', x: 40, y: 60, width: 600, height: 300 }),
+        deckModel.makeButtonElement({ id: 'go', label: 'Second', targetSlideId: 'second', x: 40, y: 380 }),
+      ],
+    }),
+    deckModel.makeSlide({
+      id: 'second',
+      title: 'Second',
+      role: 'menu',
+      elements: [deckModel.makeButtonElement({ id: 'back', label: 'Back', targetSlideId: 'art' })],
+    }),
+  ];
+
+  const model = dvdModel.buildDiscModel({
+    deck: { discTitle: 'T', themeId: 'charcoal', slides },
+    videos: [],
+  });
+
+  assertEqual(model.menus.length, 2, 'Two pages, one per slide');
+  assertEqual(
+    model.menus[0].buttons.length,
+    1,
+    'The decorative picture is not one of them'
+  );
+  assertEqual(model.menus[0].buttons[0].command, 'jump menu 2;', 'Only the button is');
+});
+
+test('a picture pointed at a slide holding a film plays the film', () => {
+  const deckModel = require('../src/core/deck');
+  const dvdModel = require('../src/core/dvd_model');
+
+  const slides = [
+    deckModel.makeSlide({
+      id: 'menu',
+      title: 'Menu',
+      role: 'menu',
+      elements: [
+        deckModel.makeImageElement({ id: 'poster', targetSlideId: 'episode' }),
+        deckModel.makeImageElement({ id: 'backdrop', targetSlideId: 'extras' }),
+      ],
+    }),
+    deckModel.makeSlide({
+      id: 'episode',
+      title: 'Episode',
+      role: 'content',
+      elements: [deckModel.makeVideoElement({ id: 'v', videoId: 'v1' })],
+    }),
+    deckModel.makeSlide({
+      id: 'extras',
+      title: 'Extras',
+      role: 'menu',
+      elements: [deckModel.makeImageElement({ id: 'e2', targetSlideId: 'menu' })],
+    }),
+  ];
+
+  const model = dvdModel.buildDiscModel({
+    deck: { discTitle: 'T', themeId: 'charcoal', slides },
+    videos: [{ id: 'v1', name: 'Episode one', duration: 600 }],
+  });
+
+  // The same rule a button follows: aiming at a slide that holds exactly one
+  // film plays it rather than making the viewer choose it a second time.
+  assertEqual(model.menus[0].buttons[0].command, 'jump title 1;', 'The poster plays the film');
+  // Every slide here carries something pressable, so the pages are numbered in
+  // slide order: the menu, the episode, then the extras.
+  assertEqual(model.menus[0].buttons[1].command, 'jump menu 3;', 'The other opens the page');
 });
 
 // --------------------------------------------------------------------- go ---

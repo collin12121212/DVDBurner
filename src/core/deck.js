@@ -15,15 +15,16 @@
  */
 
 const { THEMES, DEFAULT_THEME_ID } = require('./themes');
+/*
+  The raster and the safe margin come from safe_area.js, which is also the one
+  place that decides where an element may sit. They used to be defined here and
+  again in the editor, which is how the two came to disagree about an element
+  larger than the area it was being kept inside.
 
-/** NTSC, because this is for North America and the user should never see this. */
-const RASTER = { width: 720, height: 480, format: 'ntsc' };
-
-/**
- * Televisions crop the outer edge of the picture. Nothing is placed within this
- * margin, and dragging is not allowed to push an element into it.
- */
-const SAFE_MARGIN = 40;
+  Re-exported below, so everything that already reads them from this module
+  keeps working.
+*/
+const { RASTER, SAFE_MARGIN, VIDEO_BOTTOM } = require('./safe_area');
 
 /**
  * The DVD-Video specification caps a menu at 36 buttons, but a menu with 36
@@ -201,6 +202,17 @@ function makeImageElement(patch = {}) {
     width: num(patch.width, 272),
     height: num(patch.height, 200),
     fit: patch.fit === 'fill' ? 'fill' : 'fit',
+    /*
+      A picture can be pressed, exactly as a button can.
+
+      `targetSlideId` is the slide it goes to, and it plays the film on that
+      slide if there is one — the same rule a button follows, resolved in the
+      same place, so a picture and a button aimed at the same slide do the same
+      thing. `None` is the default: with no destination the picture is just a
+      picture, and it is not given a highlight the remote can land on.
+    */
+    videoId: patch.videoId || null,
+    targetSlideId: patch.targetSlideId || null,
   };
 }
 
@@ -512,6 +524,7 @@ function stripExtension(name) {
 module.exports = {
   RASTER,
   SAFE_MARGIN,
+  VIDEO_BOTTOM,
   MAX_BUTTONS_PER_SLIDE,
   THEMES,
   DEFAULT_THEME_ID,

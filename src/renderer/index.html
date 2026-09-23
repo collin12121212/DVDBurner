@@ -113,7 +113,10 @@
 </div>
 
 <!-- The shared slide drawing code, loaded before the interface so the preview,
-     the filmstrip thumbnails and the disc all render a slide identically. -->
+     the filmstrip thumbnails and the disc all render a slide identically. The
+     safe-area rule rides with it: the raster, the margin, and where an element
+     may be dragged to are the same numbers the authoring side uses. -->
+<script src="../core/safe_area.js"></script>
 <script src="../core/slide_draw.js"></script>
 <script src="app.js"></script>
 </body>

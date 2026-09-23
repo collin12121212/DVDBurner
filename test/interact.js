@@ -603,6 +603,302 @@ async function run() {
     `${burn.panelNotices} notices`
   );
 
+  // ------------------------------------------- dropping a picture on a slide ---
+  console.log('\nDropping a picture onto a slide');
+
+  // A real PNG, written where the app can read it. Dropping one is the first
+  // thing anybody tries, and it used to answer "Some files were not videos".
+  const picturePath = path.join(sandbox, 'cover.png');
+  fs.writeFileSync(
+    picturePath,
+    Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
+      'base64'
+    )
+  );
+
+  await js(`window.__burnhouseTest.createNewProject('Pictures', 'charcoal')`);
+  await settle(700);
+
+  const beforeDrop = await js(`window.__burnhouseTest.getState()`);
+  const videosBefore = beforeDrop.videos.length;
+
+  await js(`window.__burnhouseTest.importPathsOntoSlide([${JSON.stringify(picturePath)}])`);
+  await settle(900);
+
+  const afterDrop = await js(`window.__burnhouseTest.getState()`);
+  const activeAfter = afterDrop.slides.find((s) => s.id === afterDrop.activeSlideId) || { elements: [] };
+  const pictures = activeAfter.elements.filter((e) => e.kind === 'image');
+
+  record(pictures.length === 1, 'a dropped picture becomes a picture on the slide', `${pictures.length} pictures`);
+  record(
+    pictures[0] && pictures[0].hasPoster,
+    'and the picture was actually read, not left empty'
+  );
+  record(
+    pictures[0] && pictures[0].width === 260 && pictures[0].height === 190,
+    'at the same size the "Add a picture" button gives it',
+    pictures[0] ? `${pictures[0].width}x${pictures[0].height}` : 'none'
+  );
+  record(
+    afterDrop.videos.length === videosBefore,
+    'a picture is not mistaken for a video',
+    `${videosBefore} then ${afterDrop.videos.length}`
+  );
+
+  const dropNotice = await js(`window.__burnhouseTest.banner()`);
+  record(
+    !dropNotice || !/not videos/i.test(dropNotice.title || ''),
+    'and it does not complain that the file was not a video',
+    dropNotice ? dropNotice.title : 'no notice'
+  );
+
+  // A second picture in the same drop must not hide under the first.
+  await js(
+    `window.__burnhouseTest.importPathsOntoSlide([${JSON.stringify(picturePath)}, ${JSON.stringify(picturePath)}])`
+  );
+  await settle(900);
+
+  const stacked = await js(`window.__burnhouseTest.getState()`);
+  const stackedActive = stacked.slides.find((s) => s.id === stacked.activeSlideId) || { elements: [] };
+  const stackedPictures = stackedActive.elements.filter((e) => e.kind === 'image');
+  // A drop of several must not stack them all in one place. The first one keeps
+  // the position the button would give it; the rest are staggered off it, so what
+  // she dropped is what she can see and drag.
+  const fromTheSecondDrop = stackedPictures.slice(pictures.length);
+  record(
+    fromTheSecondDrop.length === 2,
+    'dropping two more adds two more pictures',
+    `${stackedPictures.length} pictures in total`
+  );
+  record(
+    new Set(fromTheSecondDrop.map((p) => `${p.x},${p.y}`)).size === 2,
+    'and the two from one drop are staggered rather than exactly on top of each other',
+    fromTheSecondDrop.map((p) => `${p.x},${p.y}`).join(' / ')
+  );
+  record(
+    fromTheSecondDrop[0] && fromTheSecondDrop[0].x === 120 && fromTheSecondDrop[0].y === 140,
+    'the first of a drop lands exactly where the button would put it',
+    fromTheSecondDrop[0] ? `${fromTheSecondDrop[0].x},${fromTheSecondDrop[0].y}` : 'none'
+  );
+
+  // ------------------------------------------ dragging a picture too large ---
+  console.log('\nDragging a picture that is bigger than the safe area');
+
+  const pinnedLeft = await js(
+    `window.__burnhouseTest.clampElement({ kind: 'image', x: -9999, y: 0, width: 900, height: 600 })`
+  );
+  const pinnedRight = await js(
+    `window.__burnhouseTest.clampElement({ kind: 'image', x: 9999, y: 0, width: 900, height: 600 })`
+  );
+
+  record(
+    pinnedLeft.x < pinnedRight.x,
+    'a picture wider than the safe area moves when it is dragged',
+    `x ${pinnedLeft.x} then ${pinnedRight.x}`
+  );
+  record(
+    pinnedLeft.width === 900 && pinnedRight.width === 900,
+    'and is not shrunk to fit while being moved',
+    `${pinnedLeft.width} then ${pinnedRight.width}`
+  );
+
+  const smallPicture = await js(
+    `window.__burnhouseTest.clampElement({ kind: 'image', x: -9999, y: -9999, width: 260, height: 190 })`
+  );
+  record(
+    smallPicture.x === 40 && smallPicture.y === 40,
+    'while a picture that fits is still held inside the guide',
+    `${smallPicture.x},${smallPicture.y}`
+  );
+
+  /*
+    And the real gesture, with real pointer events.
+
+    The checks above prove the rule is right; this proves the drag actually uses
+    it, which is the part that was reported. A picture scaled past the safe area
+    used to be pinned wherever it landed and every drag snapped it back, so what
+    matters is that the position changes by the amount the pointer moved.
+  */
+  await js(`window.__burnhouseTest.createNewProject('Dragging', 'charcoal')`);
+  await settle(700);
+
+  // Placed in its own round trip, and given a moment: the layout the drag
+  // hit-tests against is fetched asynchronously, and a drag before it lands
+  // finds nothing under the pointer and does nothing at all.
+  await js(`window.__burnhouseTest.addElement('image', { width: 900, height: 600 })`);
+  await settle(900);
+
+  const dragResult = await js(`(() => {
+    const canvas = document.getElementById('slideCanvas');
+    const rect = canvas.getBoundingClientRect();
+    const toClient = (x, y) => ({
+      clientX: rect.left + (x / 720) * rect.width,
+      clientY: rect.top + (y / 480) * rect.height,
+    });
+    const boxOf = () => {
+      const s = window.__burnhouseTest.getState();
+      const slide = s.slides.find((sl) => sl.id === s.activeSlideId);
+      const img = slide.elements.find((e) => e.kind === 'image');
+      return img ? { x: img.x, y: img.y, width: img.width, height: img.height } : null;
+    };
+
+    const before = boxOf();
+    const from = toClient(200, 200);
+    const to = toClient(100, 200);
+    const pointer = (type, at, extra) => new PointerEvent(type, {
+      bubbles: true, pointerId: 1, isPrimary: true, ...at, ...extra,
+    });
+
+    canvas.dispatchEvent(pointer('pointerdown', from, { button: 0, buttons: 1 }));
+    document.dispatchEvent(pointer('pointermove', to, { buttons: 1 }));
+    document.dispatchEvent(pointer('pointerup', to, { button: 0 }));
+
+    return { before, after: boxOf() };
+  })()`);
+  await settle(400);
+
+  record(
+    dragResult.after && dragResult.before && dragResult.after.x !== dragResult.before.x,
+    'dragging a picture wider than the safe area moves it',
+    `x ${dragResult.before.x} then ${dragResult.after.x}`
+  );
+  record(
+    dragResult.after && Math.abs(dragResult.after.x - (dragResult.before.x - 100)) <= 2,
+    'and it follows the pointer rather than snapping to a limit',
+    `moved ${dragResult.after ? dragResult.after.x - dragResult.before.x : '?'}`
+  );
+  record(
+    dragResult.after && dragResult.after.width === 900,
+    'without being shrunk while it is moved',
+    dragResult.after ? String(dragResult.after.width) : '?'
+  );
+
+  // ------------------------------- a picture that goes to another slide ---
+  console.log('\nMaking a picture clickable');
+
+  await js(`window.__burnhouseTest.createNewProject('Linked', 'charcoal')`);
+  await settle(700);
+
+  const linkSetup = await js(`(async () => {
+    const swatch = document.createElement('canvas');
+    swatch.width = 272; swatch.height = 200;
+    const c = swatch.getContext('2d');
+    c.fillStyle = '#3f6d8f';
+    c.fillRect(0, 0, 272, 200);
+    const src = swatch.toDataURL('image/png');
+
+    const state = window.__burnhouseTest.getState();
+    const firstId = state.slides[0].id;
+    const secondId = state.slides[1] ? state.slides[1].id : state.slides[0].id;
+
+    // A picture that does something, and one that does not.
+    const linked = window.__burnhouseTest.addElement('image', {
+      src, x: 40, y: 60, width: 272, height: 200, targetSlideId: secondId,
+    });
+    const plain = window.__burnhouseTest.addElement('image', {
+      src, x: 380, y: 60, width: 272, height: 200,
+    });
+    // And something on the second slide, so it is a page worth going to.
+    window.__burnhouseTest.goToSlide(secondId);
+    window.__burnhouseTest.addElement('button', { label: 'Back', targetSlideId: firstId });
+
+    // Back to the first slide with the linked picture selected, which is the
+    // state the inspector checks below are about.
+    window.__burnhouseTest.goToSlide(firstId);
+    window.__burnhouseTest.selectElement(linked.id);
+
+    return { firstId, secondId, linkedId: linked.id, plainId: plain.id };
+  })()`);
+  await settle(1200);
+
+  record(
+    Boolean(linkSetup.linkedId) && Boolean(linkSetup.plainId),
+    'two pictures were placed',
+    `${linkSetup.linkedId} / ${linkSetup.plainId}`
+  );
+
+  /*
+    What the disc makes of them.
+
+    The point of the whole thing: a picture that has been given a destination is
+    a button on the disc, with a rectangle the remote can land on and a command
+    that goes there, and a picture without one is not.
+  */
+  const discs = await js(`window.__burnhouseTest.discButtons()`);
+  const page1 = discs[0];
+  record(discs.length === 2, 'both slides became menu pages', `${discs.length} pages`);
+  record(
+    page1 && page1.buttons.length === 1,
+    'the first page has exactly one button: the picture that goes somewhere',
+    page1 ? `${page1.buttons.length} buttons` : 'no page'
+  );
+  record(
+    page1 && page1.buttons[0] && /jump menu/.test(page1.buttons[0].command),
+    'and that button jumps to the other slide',
+    page1 && page1.buttons[0] ? page1.buttons[0].command : 'none'
+  );
+  record(
+    page1 && page1.buttons[0] && page1.buttons[0].x0 === 40 && page1.buttons[0].y0 === 60,
+    'with the picture\u2019s own rectangle, not a box of its own',
+    page1 && page1.buttons[0] ? `${page1.buttons[0].x0},${page1.buttons[0].y0}` : 'none'
+  );
+
+  // The inspector offers the choice, naming the "no destination" case rather
+  // than leaving it as an unlabelled prompt she has to interpret.
+  const choices = await js(`(() => {
+    const row = [...document.querySelectorAll('#inspector .prop-row')]
+      .find((r) => r.dataset.prop === 'gotoslide');
+    if (!row) return null;
+    const select = row.querySelector('select');
+    return {
+      label: row.querySelector('.prop-name').textContent,
+      value: select.value,
+      options: [...select.options].map((o) => o.textContent),
+    };
+  })()`);
+  record(choices !== null, 'the picture inspector has a "goes to" row');
+  record(
+    choices && choices.label === 'Goes to',
+    'labelled in words rather than as an identifier',
+    choices ? choices.label : 'no row'
+  );
+  record(
+    choices && choices.value === linkSetup.secondId,
+    'showing the slide it was pointed at',
+    choices ? choices.value : 'no row'
+  );
+  record(
+    choices && choices.options.some((o) => /none/i.test(o)),
+    'and offering doing nothing by name',
+    choices ? choices.options.join(' / ') : 'no row'
+  );
+
+  /*
+    Turning it off must take the button away again. Asked about the picture's own
+    slide rather than the disc as a whole: the picture is the only pressable thing
+    on it, so with the destination gone that slide stops being a page — and the
+    other slide's button, which points at it, then leads nowhere and goes too.
+    That cascade is the numbering settling correctly, not a fault.
+  */
+  const unlinked = await js(`(async () => {
+    const first = ${JSON.stringify(linkSetup.firstId)};
+    const onFirst = async () =>
+      (await window.__burnhouseTest.discButtons()).filter((p) => p.slideId === first).length;
+
+    const before = await onFirst();
+    window.__burnhouseTest.setImageTarget(${JSON.stringify(linkSetup.linkedId)}, null);
+    await new Promise((r) => setTimeout(r, 700));
+    return { before, after: await onFirst() };
+  })()`);
+  await settle(400);
+
+  record(
+    unlinked.before === 1 && unlinked.after === 0,
+    'setting it back to None takes the picture off the remote again',
+    `its slide was a page ${unlinked.before} time, then ${unlinked.after}`
+  );
+
   // --------------------------------------------- one folder per project ---
   //
   // The prepared disc is looked up by project, so the two things that decide
