@@ -524,8 +524,43 @@ function appVersion() {
  * Deliberately NOT included: app version, tool paths, the work folder. None of
  * those change the disc, and including them would force a rebuild after every
  * bug fix — which is the thing this exists to avoid.
+ *
+ * The exception is the encoder recipe revision, which is included, and the
+ * distinction is the whole point:
+ *
+ *   a new app version  changes nothing about the bytes, so a prepared disc
+ *                      stays valid and should not be rebuilt
+ *   a new recipe       changes the bytes while leaving every input identical,
+ *                      so the prepared disc is stale even though the project
+ *                      has not moved at all
+ *
+ * That second case is not hypothetical. The fingerprint used to be the project
+ * alone, and the ghosting fix — a change that produces different, correct
+ * output from the same source and the same settings — could not invalidate
+ * anything. A disc prepared before it stayed "up to date" afterwards and would
+ * have been burned as it was, carrying the very bug the release was about.
+ * Excluding the app version is right; excluding the recipe with it was not.
+ *
+ * This is the same guard the per-title cache carries in encode.js, for the same
+ * reason, one level up: skip work when nothing that decides the output has
+ * changed, and never otherwise.
  */
 function projectFingerprint(project) {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(fingerprintPayload(project)))
+    .digest('hex');
+}
+
+/**
+ * What the fingerprint is taken of, before it is hashed.
+ *
+ * Separate from the hash so it can be read and tested directly: the revision is
+ * a parameter, which is how a test can prove that bumping the recipe really
+ * does invalidate a prepared disc rather than having to take the mechanism on
+ * trust.
+ */
+function fingerprintPayload(project, encoderRevision = encode.ENCODE_REVISION) {
   const videos = (project.videos || []).map((video) => {
     let size = 0;
     let mtime = 0;
@@ -547,7 +582,7 @@ function projectFingerprint(project) {
     };
   });
 
-  const canonical = JSON.stringify({
+  return {
     // The disc title is the volume label on the finished disc, so changing it
     // changes the disc.
     discTitle: project.discTitle || null,
@@ -573,9 +608,18 @@ function projectFingerprint(project) {
     discType: project.discType,
     chaptersEnabled: project.chaptersEnabled,
     chapterMinutes: project.chapterMinutes,
-  });
+    /*
+      Last, and not because it matters least.
 
-  return crypto.createHash('sha256').update(canonical).digest('hex');
+      Every field above describes the project. This one describes the program
+      that turns it into video, and it is the only field here that can change
+      while the project stays exactly as it was. Without it, a release that fixes
+      the encoder produces a prepared disc that still claims to be current, and
+      the fix never reaches a burned disc unless somebody happens to change a
+      slide first.
+    */
+    encoderRevision,
+  };
 }
 
 /**
@@ -1040,5 +1084,6 @@ module.exports = {
   buildMenus,
   // For deciding whether what is on disk is still what the project says.
   projectFingerprint,
+  fingerprintPayload,
   readBuildRecord,
 };

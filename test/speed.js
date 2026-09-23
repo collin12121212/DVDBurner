@@ -22,6 +22,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 
 const encode = require('../src/core/encode');
 const disc = require('../src/core/disc');
@@ -599,6 +600,83 @@ test('the app version and the tool paths are not part of the fingerprint', () =>
     before,
     'Where the work is kept does not change the disc'
   );
+});
+
+test('the encoder recipe is part of the fingerprint', () => {
+  const root = tmpdir('fingerprint-4');
+  const file = sourceFile(root, 'a.mp4');
+  const video = { path: file, duration: 600, name: 'a.mp4', menuLabel: '' };
+  const project = pipeline.normaliseProject({ videos: [video], discTitle: 'Trip' });
+
+  const payload = pipeline.fingerprintPayload(project);
+  assertEqual(
+    payload.encoderRevision,
+    encode.ENCODE_REVISION,
+    'The recipe revision has to be hashed, or a fix in the encoder cannot invalidate anything'
+  );
+
+  /*
+    The case that matters, and the one that actually happened.
+
+    A release that changes the encoder produces different bytes from a project
+    that has not moved at all. If the fingerprint is the project alone, the disc
+    prepared before that release still claims to be current, the Burn button goes
+    straight to writing it, and the fix never reaches a disc. That is how a
+    prepared disc from before the ghosting fix survived several releases.
+  */
+  const bumped = crypto
+    .createHash('sha256')
+    .update(JSON.stringify(pipeline.fingerprintPayload(project, encode.ENCODE_REVISION + 1)))
+    .digest('hex');
+
+  assert(
+    bumped !== pipeline.projectFingerprint(project),
+    'A new encoder recipe must make a prepared disc out of date'
+  );
+  assert(
+    JSON.stringify(pipeline.fingerprintPayload(project, encode.ENCODE_REVISION + 1)) !==
+      JSON.stringify(payload),
+    'And the difference has to be in what is hashed, not only in the hash'
+  );
+});
+
+test('the fingerprint is stable, so an unchanged project is not rebuilt', () => {
+  const root = tmpdir('fingerprint-5');
+  const file = sourceFile(root, 'a.mp4');
+  const video = { path: file, duration: 600, name: 'a.mp4', menuLabel: '' };
+
+  /*
+    A deck is always supplied, by the editor, and its ids were minted once when
+    the slides were made and have been carried in the project ever since. That
+    is what makes the fingerprint stable across calls — and it has to be, because
+    the fingerprint written by one build is compared against one computed by a
+    later, separate call. If normalising the same project twice gave two answers,
+    a prepared disc would look out of date to the very next question and would be
+    rebuilt every single time, for ever.
+  */
+  const deck = {
+    discTitle: 'Trip',
+    themeId: 'charcoal',
+    buttonStyle: 'bar',
+    slides: [
+      {
+        id: 'slide_1',
+        title: 'Trip',
+        role: 'menu',
+        themeId: 'charcoal',
+        elements: [{ id: 'el_1', kind: 'text', text: 'Trip', x: 40, y: 44, width: 640 }],
+      },
+    ],
+  };
+
+  const build = () => pipeline.normaliseProject({ videos: [video], discTitle: 'Trip', deck });
+
+  assertEqual(pipeline.projectFingerprint(build()), pipeline.projectFingerprint(build()), 'Asking twice must give the same answer, or nothing would ever be reused');
+
+  // And the ids really are preserved rather than regenerated, which is what the
+  // whole thing rests on.
+  assertEqual(build().deck.slides[0].id, 'slide_1', 'A slide id must survive normalising');
+  assertEqual(build().deck.slides[0].elements[0].id, 'el_1', 'And so must an element id');
 });
 
 // --------------------------------------------------------------------- go ---
