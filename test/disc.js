@@ -503,270 +503,120 @@ test('a slide with a film and its own buttons still plays the film', () => {
 section('Finding a disc writer');
 
 /*
-  `drutil list` is what macOS gives us, and every column in it can contain a
-  space. Reading the fields by counting back from the end of the line got the bus
-  as "Apple" and the support level as the wrong word, and then refused the drive
-  because of it — so the app said no burner was attached while one sat there
-  plugged in. These are the shapes that have to survive.
+  Everything here is written against output taken from the Mac this is for,
+  running macOS 12.7.6 with the drive attached. Two things in it are worth
+  knowing before reading further, because both were assumed wrongly for a long
+  time and the app reported no disc writer at all as a result:
+
+    - `drutil list` has NO DeviceNode column. The real header is
+      "Vendor Product Rev Bus SupportLevel" and nothing else. Any parser waiting
+      for /dev/diskN matches nothing, on any Mac, ever.
+
+    - `drutil list -xml` is a DTD'd element tree with ATTRIBUTES, not a plist of
+      key/value pairs.
+
+  And the support level for this drive is genuinely `unSupported` — yet burning
+  to it works, which is why nothing gates on that value any more.
 */
-test('a USB writer with a two-word support level is found', () => {
-  const out = [
-    '   Vendor   Product           Rev   Bus           SupportLevel             DeviceNode',
-    '   hp       DVDRW  DU8A6SH    DH61  USB           Apple Supported          /dev/disk5',
-  ].join('\n');
 
-  const drives = disc.parseDrutilList(out);
-  assertEqual(drives.length, 1, 'one drive');
-  assertEqual(drives[0].device, '/dev/disk5', 'the device node');
-  assertEqual(drives[0].vendor, 'hp', 'the vendor');
-  assertEqual(drives[0].bus, 'USB', 'the bus, not the first word of the support level');
-  assertEqual(drives[0].rev, 'DH61', 'the revision');
-  assertEqual(drives[0].supportLevel, 'Apple Supported', 'the whole support level');
-  assertEqual(drives[0].writeCapable, true, 'and it can write');
-});
-
-test('a product name containing spaces stays in one piece', () => {
-  const out = [
-    '   Vendor   Product           Rev   Bus           SupportLevel             DeviceNode',
-    '   HL-DT-ST DVDRAM GP65NB60   PF00  USB           Apple Shipping           /dev/disk4',
-  ].join('\n');
-
-  const drives = disc.parseDrutilList(out);
-  assertEqual(drives[0].product, 'DVDRAM GP65NB60', 'the product keeps its second word');
-  assertEqual(drives[0].vendor, 'HL-DT-ST', 'and the vendor is not swallowed');
-  assertEqual(drives[0].label, 'HL-DT-ST DVDRAM GP65NB60', 'the label reads naturally');
-});
-
-test('an unrecognised support level still counts as writable', () => {
-  // Being strict here hid working burners. Only an explicit "Unsupported" is
-  // taken at its word.
-  const out = [
-    '   Vendor   Product           Rev   Bus           SupportLevel             DeviceNode',
-    '   hp       DVDRW  DU8A6SH    DH61  USB           Vendor Specific          /dev/disk5',
-    '   bogus    Not A Burner      X1    USB           Unsupported              /dev/disk9',
-  ].join('\n');
-
-  const drives = disc.parseDrutilList(out);
-  assertEqual(drives.length, 2, 'both rows are parsed');
-  assertEqual(drives[0].writeCapable, true, 'an unfamiliar level is not a refusal');
-  assertEqual(drives[1].writeCapable, false, 'but "Unsupported" is believed');
-});
-
-test('several writers are all listed, and nothing else is', () => {
-  const out = [
-    '   Vendor   Product           Rev   Bus           SupportLevel             DeviceNode',
-    '   HL-DT-ST DVDRAM GP65NB60   PF00  USB           Apple Shipping           /dev/disk4',
-    '   hp       DVDRW  DU8A6SH    DH61  USB           Apple Supported          /dev/disk5',
-    '',
-    'No media inserted',
-  ].join('\n');
-
-  assertEqual(disc.parseDrutilList(out).length, 2, 'exactly the two device rows');
-});
-
-test('output with no usable header still yields the drive', () => {
-  // An unfamiliar layout must not mean "no burner", which is the failure this
-  // whole section exists to prevent.
-  const out = [
-    'Vendor Product Rev Bus SupportLevel DeviceNode',
-    'hp DVDRW_8A6SH DH61 USB Apple Supported /dev/disk5',
-  ].join('\n');
-
-  const drives = disc.parseDrutilList(out);
-  assertEqual(drives.length, 1, 'the drive is still found');
-  assertEqual(drives[0].device, '/dev/disk5', 'with its device node');
-  assertEqual(drives[0].writeCapable, true, 'and it is usable');
-});
-
-test('empty output is no drives, not an error', () => {
-  assertEqual(disc.parseDrutilList('').length, 0, 'nothing in, nothing out');
-  assertEqual(disc.parseDrutilList('No drives found').length, 0, 'so is a plain message');
-});
-
-/*
-  The XML form is what the app asks for, because the plain listing is a
-  fixed-width table whose columns move between macOS versions and whose fields
-  can each contain spaces. A real Mac reported its working USB writer in a shape
-  the text parser could not read at all, and the app said no burner was attached.
-*/
-const DRUTIL_XML = [
-  '<?xml version="1.0" encoding="UTF-8"?>',
-  '<plist version="1.0">',
-  '<array>',
-  '  <dict>',
-  '    <key>Vendor</key><string>hp</string>',
-  '    <key>Product</key><string>DVDRW  DU8A6SH</string>',
-  '    <key>Revision</key><string>DH61</string>',
-  '    <key>Bus</key><string>USB</string>',
-  '    <key>SupportLevel</key><string>Unsupported</string>',
-  '    <key>DeviceNode</key><string>/dev/disk5</string>',
-  '  </dict>',
-  '</array>',
-  '</plist>',
+const DRUTIL_TEXT = [
+  '   Vendor   Product           Rev   Bus       SupportLevel',
+  '1  hp       DVDRW  DU8A6SH    DH61  USB       Unsupported',
 ].join('\n');
 
-test('a drive is read out of the XML listing', () => {
+const DRUTIL_XML = [
+  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+  '<!DOCTYPE  [',
+  '    <!ELEMENT deviceList (device)*>',
+  '    <!ELEMENT device (vendor, product, firmware, interconnect, support)>',
+  '    <!ATTLIST device name CDATA #IMPLIED>',
+  '    <!ATTLIST device index CDATA #IMPLIED>',
+  '    <!ELEMENT support EMPTY>',
+  '    <!ATTLIST support level (appleShipping|appleSupported|vendorSupported|unSupported|notSupported) #REQUIRED>',
+  ']>',
+  '<deviceList>',
+  '    <device name="hp DVDRW DU8A6SH" index="1">',
+  '        <vendor name="hp"/>',
+  '        <product name="DVDRW  DU8A6SH"/>',
+  '        <firmware revision="DH61"/>',
+  '        <interconnect name="USB"/>',
+  '        <support level="unSupported"/>',
+  '    </device>',
+  '</deviceList>',
+].join('\n');
+
+test('the XML listing is read as the Mac actually prints it', () => {
   const drives = disc.parseDrutilXml(DRUTIL_XML);
   assertEqual(drives.length, 1, 'one drive');
   assertEqual(drives[0].vendor, 'hp', 'the vendor');
-  assertEqual(drives[0].product, 'DVDRW  DU8A6SH', 'the product, spaces and all');
+  assertEqual(drives[0].product, 'DVDRW  DU8A6SH', 'the product, double space and all');
   assertEqual(drives[0].rev, 'DH61', 'the revision');
   assertEqual(drives[0].bus, 'USB', 'the bus');
-  assertEqual(drives[0].device, '/dev/disk5', 'the device node');
+  assertEqual(drives[0].supportLevel, 'unSupported', 'the support level as spelled');
+  assertEqual(drives[0].label, 'hp DVDRW DU8A6SH', 'and a label worth reading');
 });
 
-test('a drive macOS calls Unsupported is still offered', () => {
-  // hdiutil picks the only attached writer itself when not told which to use,
-  // so refusing to list the drive costs the whole feature and gains nothing.
-  // The burn attempt is what decides, and it fails before writing if it must.
+test('a drive macOS calls unSupported is offered anyway', () => {
+  // This drive reports unSupported and burns perfectly. Gating on it greyed out
+  // the Burn button for a writer that works, which is the bug this guards.
   const drives = disc.parseDrutilXml(DRUTIL_XML);
-  assertEqual(drives[0].supportLevel, 'Unsupported', 'the level is reported');
-  assertEqual(drives[0].writeCapable, true, 'but the drive is still usable');
-  assertEqual(drives[0].label, 'hp DVDRW DU8A6SH', 'and it reads sensibly');
+  assertEqual(drives[0].writeCapable, true, 'the drive is usable');
 });
 
-test('a drive with no device node is still listed', () => {
-  const withoutNode = DRUTIL_XML.replace(
-    '<key>DeviceNode</key><string>/dev/disk5</string>',
-    ''
-  );
-  const drives = disc.parseDrutilXml(withoutNode);
-  assertEqual(drives.length, 1, 'the drive survives');
-  assertEqual(drives[0].device, '', 'with no device node');
-  assert(drives[0].id, 'and some identifier to select it by');
-});
-
-test('a device node under an unexpected key is still found', () => {
-  const renamed = DRUTIL_XML.replace(
-    '<key>DeviceNode</key><string>/dev/disk5</string>',
-    '<key>IOKitPath</key><string>IOService:/USB/disk5</string>'
-  );
-  const drives = disc.parseDrutilXml(renamed);
-  assertEqual(drives[0].device, '/dev/disk5', 'the node is found wherever it hides');
-
-  const bare = DRUTIL_XML.replace(
-    '<key>DeviceNode</key><string>/dev/disk5</string>',
-    '<key>BSDName</key><string>disk9</string>'
-  );
-  assertEqual(disc.parseDrutilXml(bare)[0].device, '/dev/disk9', 'and a bare name is normalised');
+test('drutil names no device node, and that is fine', () => {
+  // hdiutil picks the only attached writer itself, so a node was never needed.
+  // Requiring one is what hid the drive for several rounds.
+  const drives = disc.parseDrutilXml(DRUTIL_XML);
+  assertEqual(drives[0].device, '', 'no node from drutil');
+  assert(drives[0].id, 'but an id to select it by');
 });
 
 test('two drives in one XML listing are both read', () => {
   const two = DRUTIL_XML.replace(
-    '</array>',
-    '  <dict>\n    <key>Vendor</key><string>HL-DT-ST</string>\n' +
-      '    <key>Product</key><string>DVDRAM GP65NB60</string>\n' +
-      '    <key>Revision</key><string>PF00</string>\n' +
-      '    <key>Bus</key><string>USB</string>\n' +
-      '    <key>SupportLevel</key><string>Apple Shipping</string>\n' +
-      '    <key>DeviceNode</key><string>/dev/disk4</string>\n' +
-      '  </dict>\n</array>'
+    '</deviceList>',
+    '    <device name="HL-DT-ST DVDRAM GP65NB60" index="2">\n' +
+      '        <vendor name="HL-DT-ST"/>\n' +
+      '        <product name="DVDRAM GP65NB60"/>\n' +
+      '        <firmware revision="PF00"/>\n' +
+      '        <interconnect name="USB"/>\n' +
+      '        <support level="appleShipping"/>\n' +
+      '    </device>\n</deviceList>'
   );
   const drives = disc.parseDrutilXml(two);
   assertEqual(drives.length, 2, 'both drives');
   assertEqual(drives[1].label, 'HL-DT-ST DVDRAM GP65NB60', 'the second one too');
 });
 
-test('non-XML output is not mistaken for drives', () => {
-  assertEqual(disc.parseDrutilXml('').length, 0, 'empty');
-  assertEqual(disc.parseDrutilXml('No drives found').length, 0, 'a plain message');
-  assertEqual(disc.parseDrutilXml('   Vendor   Product   Rev   Bus   SupportLevel   DeviceNode\n' +
-    '   hp       DVDRW     DH61  USB   Unsupported    /dev/disk5').length, 0, 'a text table');
-});
-
-/*
-  On macOS the device hdiutil wants is the DiscRecording IORegistry entry path
-  that `hdiutil burn -list` prints, not a BSD node. DVDStyler burns the drive in
-  question with exactly that form, which is the whole reason this exists.
-*/
-test('an IORegistry path keeps the spaces in the drive name', () => {
-  // The path ENDS with the drive's name, and that name contains spaces. Cutting
-  // at the first space truncates it, and a truncated path is worse than none.
-  const line =
-    'IOService:/AppleUSBHost/AppleUSBDevice/IOUSBHostInterface/' +
-    'IOBlockStorageDriver/hp DVDRW DU8A6SH Medium';
-
-  const drives = disc.parseHdiutilBurnList(line);
+test('the plain listing is read by its columns', () => {
+  const drives = disc.parseDrutilList(DRUTIL_TEXT);
   assertEqual(drives.length, 1, 'one drive');
-  assertEqual(drives[0].device, line, 'the whole path, spaces and all');
-  assert(drives[0].id, 'with an id to select it by');
+  assertEqual(drives[0].product, 'DVDRW  DU8A6SH', 'the product survives its spaces');
+  assertEqual(drives[0].bus, 'USB', 'the bus is the bus, not a word of the support level');
+  assertEqual(drives[0].supportLevel, 'Unsupported', 'the level');
+  assertEqual(drives[0].writeCapable, true, 'and it can still be written to');
 });
 
-test('several burners from hdiutil are all listed once each', () => {
+test('an empty listing is no drives', () => {
+  assertEqual(disc.parseDrutilXml('<deviceList/>').length, 0, 'an empty XML list');
+  assertEqual(disc.parseDrutilList('').length, 0, 'empty text');
+});
+
+test('a line of prose is not a drive', () => {
+  // "No drives found" was once read as a drive called "found", and the page
+  // offered to burn to it.
+  assertEqual(disc.parseDrutilList('No drives found').length, 0, 'prose is not a drive');
+  assertEqual(disc.parseDrutilXml('No drives found').length, 0, 'nor is it XML');
+});
+
+test('a two-word support level is read whole', () => {
   const out = [
-    'IOService:/AppleACPIPlatformExpert/PCI0@0/IOBlockStorageDriver/HL-DT-ST DVDRAM GP65NB60 Medium',
-    'IOService:/AppleUSBHost/AppleUSBDevice/IOBlockStorageDriver/hp DVDRW DU8A6SH Medium',
-    'IOService:/AppleUSBHost/AppleUSBDevice/IOBlockStorageDriver/hp DVDRW DU8A6SH Medium',
+    '   Vendor   Product           Rev   Bus       SupportLevel',
+    '   HL-DT-ST DVDRAM GP65NB60   PF00  USB       Apple Shipping',
   ].join('\n');
-
-  const drives = disc.parseHdiutilBurnList(out);
-  assertEqual(drives.length, 2, 'two drives, not three');
-  assert(drives[0].device.includes('HL-DT-ST'), 'the first');
-  assert(drives[1].device.includes('DU8A6SH'), 'the second');
-});
-
-test('output with no IORegistry path yields no drives', () => {
-  // So the caller falls through to drutil rather than inventing a burner.
-  assertEqual(disc.parseHdiutilBurnList('').length, 0, 'empty');
-  assertEqual(disc.parseHdiutilBurnList('hdiutil: burn: no devices').length, 0, 'a message');
-  assertEqual(
-    disc.parseHdiutilBurnList('   Vendor   Product   DeviceNode\n   hp  DVDRW  /dev/disk5').length,
-    0,
-    'a drutil table'
-  );
-});
-
-
-test('the labelled listing is read, device node or not', () => {
-  const line =
-    '   Vendor: 1   Product: hp DVDRW DU8A6SH   Rev: DH61   Bus: USB   ' +
-    'SupportLevel: Unsupported';
-
-  const drives = disc.parseDrutilKeyValues(line);
-  assertEqual(drives.length, 1, 'the drive is found');
-  assertEqual(drives[0].product, 'hp DVDRW DU8A6SH', 'the product is read');
-  assertEqual(drives[0].rev, 'DH61', 'the revision is read');
-  assertEqual(drives[0].bus, 'USB', 'the bus is read');
-  assertEqual(drives[0].supportLevel, 'Unsupported', 'the support level is read');
-  assertEqual(drives[0].label, 'hp DVDRW DU8A6SH', 'and a stray numeric vendor is dropped');
-});
-
-test('a labelled drive with no device node still gets a usable id', () => {
-  // The UI selects drives by id. An empty id meant the choice never stuck and
-  // the Burn button stayed disabled while a working drive sat there.
-  const drives = disc.parseDrutilKeyValues('Vendor: hp\nProduct: DVDRW DU8A6SH\nBus: USB');
+  const drives = disc.parseDrutilList(out);
   assertEqual(drives.length, 1, 'one drive');
-  assert(drives[0].id, 'the id is not empty');
-  assertEqual(drives[0].device, '', 'and there is no device node, which is allowed');
-});
-
-test('a labelled device node is used when present', () => {
-  const drives = disc.parseDrutilKeyValues(
-    'Vendor: hp   Product: DVDRW DU8A6SH   Bus: USB   SupportLevel: Unsupported   DeviceNode: /dev/disk5'
-  );
-  assertEqual(drives[0].device, '/dev/disk5', 'the node is picked up');
-  assertEqual(drives[0].id, '/dev/disk5', 'and used as the id');
-});
-
-test('two labelled drives are read as two, not merged', () => {
-  const drives = disc.parseDrutilKeyValues(
-    'Vendor: hp   Product: DVDRW DU8A6SH   Bus: USB\n' +
-      'Vendor: HL-DT-ST   Product: DVDRAM GP65NB60   Bus: USB'
-  );
-  assertEqual(drives.length, 2, 'both drives');
-  assertEqual(drives[0].product, 'DVDRW DU8A6SH', 'the first');
-  assertEqual(drives[1].product, 'DVDRAM GP65NB60', 'the second');
-});
-
-test('listDrives falls through to the labelled form', () => {
-  // The whole chain: table, then labelled. Whichever shape a Mac produces, the
-  // drive has to come out the other end.
-  const drives = disc.parseDrutilList(
-    '   Vendor: 1   Product: hp DVDRW DU8A6SH   Rev: DH61   Bus: USB   SupportLevel: Unsupported'
-  );
-  assertEqual(drives.length, 1, 'the table parser still finds it');
-  assertEqual(drives[0].device, '', 'without a device node');
-  assert(drives[0].id, 'but with an id to select it by');
+  assertEqual(drives[0].supportLevel, 'Apple Shipping', 'the whole level');
+  assertEqual(drives[0].product, 'DVDRAM GP65NB60', 'and the product is not swallowed');
 });
 
 // ------------------------------------------------------- the disc's shape ---

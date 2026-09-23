@@ -3601,6 +3601,16 @@ function buildBurnPanel() {
     always in the same place: grey when there is no writer, red when there is,
     with the reason written next to it.
   */
+  /*
+    The disc has to be there too, not just the writer.
+
+    Pressing Burn with an empty drive handed hdiutil nothing and it opened the
+    tray, which explained itself badly. Saying so before the press costs nothing
+    and is the difference between a mystery and a message.
+  */
+  const chosenDrive = writers.find((d) => d.id === state.selectedDevice) || writers[0] || null;
+  const discInDrive = Boolean(chosenDrive && chosenDrive.media && chosenDrive.media.present);
+
   const blocked = state.busy
     ? 'Working\u2026'
     : !state.driveSupported
@@ -3609,7 +3619,9 @@ function buildBurnPanel() {
         ? 'No writer connected'
         : !state.selectedDevice
           ? 'Choose a drive above'
-          : null;
+          : !discInDrive
+            ? 'No disc in the drive'
+            : null;
 
   const burn = el('button', {
     class: 'btn-burn',
