@@ -94,7 +94,20 @@ const state = {
     slides: [],
   },
   activeSlideId: null,
+  /*
+    What is selected, and which of it is the one.
+
+    Several elements can be selected at once, and then a property changed in the
+    panel is applied to every one of them that has it. `selectedElementId` is the
+    *primary* — the one the resize handles belong to and the one a property is
+    read from when the panel needs a single value to show. It is always a member
+    of `selectedElementIds`, or null when nothing is selected.
+
+    Both are kept because the single-selection case is the common one and every
+    caller that only wants "the element" keeps working unchanged.
+  */
   selectedElementId: null,
+  selectedElementIds: [],
 
   layout: null,
   /** Whether to draw the television-safe guide over the slide. */
@@ -207,6 +220,77 @@ function findElement(elementId) {
     if (element) return { slide, element };
   }
   return { slide: null, element: null };
+}
+
+// --------------------------------------------------------------- selection ---
+
+/**
+ * Replace the selection.
+ *
+ * `primary` is the element the handles and the panel's single-value rows belong
+ * to; without one it is the last in the list, which is the one just added.
+ */
+function setElementSelection(ids, primary) {
+  const unique = [];
+  for (const id of [].concat(ids || [])) {
+    if (id && !unique.includes(id)) unique.push(id);
+  }
+  state.selectedElementIds = unique;
+  state.selectedElementId = primary && unique.includes(primary)
+    ? primary
+    : unique[unique.length - 1] || null;
+}
+
+function clearElementSelection() {
+  setElementSelection([]);
+}
+
+/** The selected elements, in the order they were added to the selection. */
+function selectedElements() {
+  return state.selectedElementIds
+    .map((id) => findElement(id).element)
+    .filter(Boolean);
+}
+
+function isElementSelected(id) {
+  return state.selectedElementIds.includes(id);
+}
+
+/**
+ * Select what was pressed, but only if it is not already selected.
+ *
+ * The difference matters for dragging a group: pressing inside a multiple
+ * selection must leave the selection alone so that the whole group can be moved.
+ * Pressing something outside it replaces the selection with that one element,
+ * which is what a click means.
+ */
+function setElementSelectionIfOutside(element) {
+  if (!element) {
+    clearElementSelection();
+    return;
+  }
+  if (isElementSelected(element.id)) return;
+  setElementSelection([element.id], element.id);
+}
+
+/**
+ * Add an element to the selection, or take it out if it is already in it.
+ *
+ * This is what Ctrl-click does — and Cmd-click, and Shift-click. All three are
+ * accepted on purpose: Ctrl-click is the natural gesture on Windows, Cmd-click
+ * is the one on a Mac, and on a Mac Ctrl-click is also how the system asks for a
+ * right-click, so relying on Ctrl alone would make the feature unreachable
+ * there. Shift-click works on both and is the one nobody has to be told.
+ */
+function toggleElementSelection(id) {
+  if (!id) return;
+  const current = state.selectedElementIds.slice();
+  const at = current.indexOf(id);
+  if (at === -1) current.push(id);
+  else current.splice(at, 1);
+  // The element just clicked becomes the primary whether it was added or
+  // removed, so the handles and the panel follow what was last touched.
+  setElementSelection(current, current.includes(id) ? id : undefined);
 }
 
 // ------------------------------------------------------------------ boot ---
@@ -515,6 +599,20 @@ const IMAGE_EXTENSIONS = new Set([
 ]);
 
 /**
+ * The sound formats offered and accepted.
+ *
+ * Anything ffmpeg can decode would do, and these are the ones a person actually
+ * has: music from a shop, a recording from a phone, an exported track. The list
+ * is deliberately longer than the picker's filter, so a dropped file with an
+ * unusual extension is still recognised as a sound rather than offered to the
+ * video importer.
+ */
+const AUDIO_EXTENSIONS = new Set([
+  '.mp3', '.m4a', '.aac', '.wav', '.aif', '.aiff', '.ogg', '.oga', '.opus',
+  '.flac', '.wma', '.mp2', '.ac3', '.mka',
+]);
+
+/**
  * Whether a path looks like a picture.
  *
  * By extension only, and only to choose a sensible response to a drop — a file
@@ -525,6 +623,20 @@ function looksLikeImage(path) {
   const lower = String(path).toLowerCase();
   const dot = lower.lastIndexOf('.');
   return dot !== -1 && IMAGE_EXTENSIONS.has(lower.slice(dot));
+}
+
+/**
+ * Whether a path looks like a sound.
+ *
+ * By extension, like the picture check, and for the same reason: it only decides
+ * what to do with a dropped file. Whether the file can actually be decoded is
+ * settled by ffmpeg when the disc is built, and a sound that cannot be read
+ * makes its page silent rather than failing the disc.
+ */
+function looksLikeAudio(path) {
+  const lower = String(path).toLowerCase();
+  const dot = lower.lastIndexOf('.');
+  return dot !== -1 && AUDIO_EXTENSIONS.has(lower.slice(dot));
 }
 
 /** Whether a drag is an internal video being dragged onto a slide. */
@@ -713,7 +825,7 @@ function addSlide(options = {}) {
   const at = options.at !== undefined ? options.at : index + 1;
   state.deck.slides.splice(Math.max(0, at), 0, slide);
   state.activeSlideId = slide.id;
-  state.selectedElementId = null;
+  clearElementSelection();
   persistDeck();
   render();
   return slide;
@@ -747,7 +859,7 @@ function duplicateSlide(slideId) {
   const index = state.deck.slides.findIndex((s) => s.id === slideId);
   state.deck.slides.splice(index + 1, 0, copy);
   state.activeSlideId = copy.id;
-  state.selectedElementId = null;
+  clearElementSelection();
   persistDeck();
   render();
 }
@@ -883,7 +995,7 @@ function addElement(kind, patch = {}) {
   safeArea.clampElement(base, RASTER.width, RASTER.height);
 
   slide.elements.push(base);
-  state.selectedElementId = base.id;
+  setElementSelection([base.id], base.id);
   persistDeck();
   render();
   // Returned so a caller that has just put something on a slide can say what it
@@ -891,13 +1003,33 @@ function addElement(kind, patch = {}) {
   return base;
 }
 
-function deleteElement(elementId) {
-  const { slide } = findElement(elementId);
-  if (!slide) return;
-  slide.elements = slide.elements.filter((e) => e.id !== elementId);
-  if (state.selectedElementId === elementId) state.selectedElementId = null;
+/**
+ * Remove one element, or several.
+ *
+ * Given a list, because deleting a multiple selection is one action and should
+ * leave the rest of the selection alone — clearing everything would throw away
+ * a selection she had just built for no reason.
+ */
+function deleteElements(elementIds) {
+  const wanted = new Set([].concat(elementIds || []).filter(Boolean));
+  if (!wanted.size) return;
+
+  let removed = 0;
+  for (const slide of state.deck.slides) {
+    const before = slide.elements.length;
+    slide.elements = slide.elements.filter((e) => !wanted.has(e.id));
+    removed += before - slide.elements.length;
+  }
+  if (!removed) return;
+
+  const remaining = state.selectedElementIds.filter((id) => !wanted.has(id));
+  setElementSelection(remaining);
   persistDeck();
   render();
+}
+
+function deleteElement(elementId) {
+  deleteElements([elementId]);
 }
 
 function updateElement(elementId, patch) {
@@ -1291,38 +1423,47 @@ function drawSnapGuides(ctx, layout) {
   ctx.restore();
 }
 
-/** Selection outlines, resize handles and the television-safe guide. */
+/**
+ * Selection outlines, resize handles and the television-safe guide.
+ *
+ * Every selected element is outlined, so a multiple selection is visible as a
+ * set rather than as one thing with no indication that others came along. The
+ * resize handles belong to the primary alone: resizing several at once means
+ * deciding what happens to their relative sizes, and guessing wrong there would
+ * silently reshape a design.
+ */
 function drawEditorOverlay(ctx, layout) {
-  const selected = state.selectedElementId;
+  const selected = state.selectedElementIds.slice();
+  const primary = state.selectedElementId;
 
-  if (selected) {
-    const element = layout.elements.find((e) => e.id === selected);
-    if (element) {
-      const box = element.box;
+  for (const id of selected) {
+    const element = layout.elements.find((e) => e.id === id);
+    if (!element) continue;
+    const box = element.box;
+    const isPrimary = id === primary && selected.length === 1;
 
+    ctx.save();
+    ctx.strokeStyle = '#d9a353';
+    ctx.lineWidth = 2;
+    ctx.setLineDash(isPrimary ? [6, 4] : [3, 3]);
+    ctx.strokeRect(box.x - 2, box.y - 2, box.width + 4, box.height + 4);
+    ctx.restore();
+
+    // The resize handles. A generated element (the Back/Next row) has no
+    // handles because it is not hers to move — it is placed by the layout.
+    if (isPrimary && !element.generated) {
       ctx.save();
-      ctx.strokeStyle = '#d9a353';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([6, 4]);
-      ctx.strokeRect(box.x - 2, box.y - 2, box.width + 4, box.height + 4);
-      ctx.restore();
-
-      // The resize handles. A generated element (the Back/Next row) has no
-      // handles because it is not hers to move — it is placed by the layout.
-      if (!element.generated) {
-        ctx.save();
-        for (const spot of Object.values(handlesFor(box))) {
-          const half = HANDLE_DRAW / 2;
-          ctx.fillStyle = '#f3ede2';
-          ctx.strokeStyle = '#1c1b19';
-          ctx.lineWidth = 1.5;
-          ctx.beginPath();
-          ctx.rect(spot.x - half, spot.y - half, HANDLE_DRAW, HANDLE_DRAW);
-          ctx.fill();
-          ctx.stroke();
-        }
-        ctx.restore();
+      for (const spot of Object.values(handlesFor(box))) {
+        const half = HANDLE_DRAW / 2;
+        ctx.fillStyle = '#f3ede2';
+        ctx.strokeStyle = '#1c1b19';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.rect(spot.x - half, spot.y - half, HANDLE_DRAW, HANDLE_DRAW);
+        ctx.fill();
+        ctx.stroke();
       }
+      ctx.restore();
     }
   }
 
@@ -1745,7 +1886,7 @@ function createNewProject(name, themeId) {
     ],
   };
   state.activeSlideId = state.deck.slides[0].id;
-  state.selectedElementId = null;
+  clearElementSelection();
   state.step = 'slides';
 
   saveCurrentProject(false);
@@ -1766,7 +1907,7 @@ async function openProject(idOrPath) {
       slides: [],
     };
     ensureStarterSlides();
-    state.selectedElementId = null;
+    clearElementSelection();
     state.lastBuild = null;
     // The previous project's build is not this project's build.
     state.buildState = null;
@@ -1849,7 +1990,7 @@ async function closeProjectToHome() {
     await saveCurrentProject(false);
   }
   state.step = 'projects';
-  state.selectedElementId = null;
+  clearElementSelection();
   // Closing a project forgets what it had built, so opening another one cannot
   // inherit the answer.
   state.buildState = null;
@@ -2124,6 +2265,21 @@ function renderInspector() {
   */
   const selected = state.selectedElementId ? findElement(state.selectedElementId).element : null;
 
+  /*
+    Two or more selected: the panel becomes a panel of what they share.
+
+    Only properties every selected element actually has are offered, because
+    anything else would be a control that silently does nothing to some of them.
+    The single-element panel is untouched, so the common case is not disturbed
+    by any of this.
+  */
+  if (selected && state.selectedElementIds.length > 1) {
+    panel.append(buildMultiElementInspector(selectedElements()));
+    panel.append(el('div', { class: 'rule', text: 'This slide' }));
+    panel.append(buildSlideInspector(slide));
+    return;
+  }
+
   if (selected) {
     panel.append(buildElementInspector(slide, selected));
     panel.append(el('div', { class: 'rule', text: 'This slide' }));
@@ -2198,15 +2354,33 @@ function renderFilmstrip() {
 
     // A miniature of the real slide, drawn by the same code as the disc.
     const thumb = el('canvas', { class: 'slide-thumb', width: '180', height: '120' });
+    /*
+      Filtered, because this is the DOM's own append and not the helper above:
+      `append(null)` writes the word "null" onto the card, which is exactly what
+      a silent slide then showed under its name.
+    */
     entry.append(
-      el('span', { class: 'slide-number', text: String(index + 1) }),
-      thumb,
-      el('span', { class: 'slide-card-title', text: slide.title })
+      ...[
+        el('span', { class: 'slide-number', text: String(index + 1) }),
+        thumb,
+        el('span', { class: 'slide-card-title', text: slide.title }),
+        // Which slides have a sound, at a glance. It cannot be drawn on the slide
+        // itself — the menu picture is what goes on the disc, and a speaker mark
+        // printed on it would be printed on the disc too.
+        slide.audio
+          ? el('span', {
+              class: 'slide-card-sound',
+              text: '\u266a',
+              title: `Plays ${slide.audio.fileName || basename(slide.audio.path)}`,
+              'aria-label': 'This slide has a sound',
+            })
+          : null,
+      ].filter(Boolean)
     );
 
     entry.addEventListener('click', () => {
       state.activeSlideId = slide.id;
-      state.selectedElementId = null;
+      clearElementSelection();
       persistDeck();
       render();
     });
@@ -2229,7 +2403,7 @@ function renderFilmstrip() {
       event.preventDefault();
       event.stopPropagation();
       state.activeSlideId = slide.id;
-      state.selectedElementId = null;
+      clearElementSelection();
       persistDeck();
       render();
       openSlideMenu(event, slide);
@@ -2509,6 +2683,13 @@ function renderEditorToolbar() {
       el('button', {
         class: 'btn btn-small',
         type: 'button',
+        text: '+ Sound\u2026',
+        title: 'Play a sound or a song while this menu page is on screen',
+        onclick: addSoundToSlide,
+      }),
+      el('button', {
+        class: 'btn btn-small',
+        type: 'button',
         text: '+ Panel',
         title: 'A shaded box to group things',
         onclick: () => addElement('frame'),
@@ -2683,6 +2864,145 @@ async function pickPicture() {
   }
 }
 
+// ------------------------------------------------------------ menu sound ---
+
+/** How long a page's sound may run. Comes from the deck, which enforces it. */
+function menuSoundSecondsCap() {
+  const presets = state.presets || {};
+  return Number.isFinite(presets.menuSoundMaxSeconds) && presets.menuSoundMaxSeconds > 0
+    ? presets.menuSoundMaxSeconds
+    : 90;
+}
+
+/**
+ * The message for a sound, so every place that shows one says the same thing.
+ *
+ * A trimmed sound says so: the disc will play part of her song, and finding that
+ * out from the television rather than from the panel would be a nasty surprise.
+ */
+function describeSound(sound) {
+  if (!sound || !sound.path) return 'Nothing chosen yet.';
+  const cap = menuSoundSecondsCap();
+  const plays = Number(sound.seconds) || 0;
+  if (sound.duration > 0) {
+    const trimmed = sound.duration > plays + 0.5;
+    return trimmed
+      ? `${formatDuration(plays)} of it will play, out of ${formatDuration(sound.duration)} — a menu page is capped at ${formatDuration(cap)}.`
+      : `${formatDuration(sound.duration)} — all of it will play.`;
+  }
+  return `The length could not be read, so the page will run for ${formatDuration(cap)}.`;
+}
+
+/**
+ * Set a slide's sound from a file on disk.
+ *
+ * Shared by the picker and by dropping a sound file on a slide, so both routes
+ * end up with the same sound treated the same way.
+ */
+async function setSlideSoundFromPath(slide, filePath) {
+  if (!slide) return false;
+  try {
+    const info = await api.files.probeAudio(filePath);
+    const cap = menuSoundSecondsCap();
+    const duration = Math.max(0, Number(info && info.duration) || 0);
+
+    slide.audio = {
+      path: filePath,
+      fileName: basename((info && info.name) || filePath),
+      duration,
+      seconds: duration > 0 ? Math.min(cap, duration) : cap,
+    };
+
+    persistDeck();
+    refreshCanvas();
+    renderInspector();
+
+    if (info && info.unreadable) {
+      setBanner(
+        'info',
+        'That sound could not be measured',
+        'It will still be used. The page will run for the longest length a menu is ' +
+          'allowed, and the disc will be silent in that spot if the file cannot be read at all.'
+      );
+      render();
+    }
+    return true;
+  } catch (err) {
+    setBanner('error', 'That sound could not be used', String(err.message || err));
+    render();
+    return false;
+  }
+}
+
+/** Choose a sound for this menu page, through the file picker. */
+async function chooseSlideSound(slide) {
+  try {
+    const result = await api.files.pickAudio();
+    if (result.canceled) return;
+    await setSlideSoundFromPath(slide, result.path);
+  } catch (err) {
+    setBanner('error', 'Could not open the file chooser', String(err.message || err));
+    render();
+  }
+}
+
+/** The + Sound button: a sound for the page being looked at. */
+async function addSoundToSlide() {
+  const slide = activeSlide();
+  if (!slide) {
+    setBanner('info', 'Add a slide first', 'A sound belongs to a menu page.');
+    render();
+    return;
+  }
+  await chooseSlideSound(slide);
+}
+
+/**
+ * A Listen button for a chosen sound.
+ *
+ * Its own little player rather than the browser's own controls, because the
+ * point is to check the file is the right one, not to be a music player. The
+ * label is changed in place rather than by redrawing, so pressing it does not
+ * rebuild the panel around it.
+ */
+function buildSoundPreview(path) {
+  const button = el('button', {
+    class: 'btn btn-small btn-quiet',
+    type: 'button',
+    text: 'Listen',
+  });
+
+  let audio = null;
+
+  button.addEventListener('click', async () => {
+    if (audio && !audio.paused) {
+      audio.pause();
+      button.textContent = 'Listen';
+      return;
+    }
+    if (!audio) {
+      try {
+        const urls = await api.files.mediaUrls([path]);
+        const url = urls && urls[path];
+        if (!url) throw new Error('the file could not be found');
+        audio = new Audio(url);
+        audio.addEventListener('ended', () => {
+          button.textContent = 'Listen';
+        });
+      } catch (err) {
+        setBanner('error', 'That sound could not be played', String(err.message || err));
+        render();
+        return;
+      }
+    }
+    const attempt = audio.play();
+    if (attempt && attempt.catch) attempt.catch(() => {});
+    button.textContent = 'Stop';
+  });
+
+  return button;
+}
+
 // ------------------------------------------------------------ inspector ---
 
 
@@ -2728,6 +3048,39 @@ function buildSlideInspector(slide) {
   */
   const hasBackground = Boolean(slide.backgroundImage);
 
+  /** Take the custom picture off this slide. */
+  const removeBackground = () => {
+    slide.backgroundImage = null;
+    persistDeck();
+    refreshCanvas();
+    renderInspector();
+  };
+
+  /*
+    The picture, with a way out on top of it.
+
+    A background picture could be replaced but not removed from anywhere
+    obvious: the button that did it sat below the picture as another grey
+    rectangle among several, which is not where anybody looks for "get rid of
+    this". Hovering the picture now covers it with a cross, and pressing that
+    takes the picture away — the control is on the thing it acts on.
+  */
+  const backgroundPreview = hasBackground
+    ? el('div', { class: 'bg-preview-wrap' }, [
+        el('div', {
+          class: 'bg-preview',
+          style: `background-image:url("${slide.backgroundImage}")`,
+        }),
+        el('button', {
+          class: 'bg-preview-remove',
+          type: 'button',
+          title: 'Remove the background picture',
+          'aria-label': 'Remove the background picture',
+          onclick: removeBackground,
+        }, [el('span', { class: 'bg-preview-x', text: '\u2715' })]),
+      ])
+    : null;
+
   const backgroundRow = el('div', { class: 'btn-row' }, [
     el('button', {
       class: 'btn btn-small',
@@ -2735,19 +3088,6 @@ function buildSlideInspector(slide) {
       text: hasBackground ? 'Replace the picture\u2026' : 'Use a picture\u2026',
       onclick: () => chooseSlideBackground(slide),
     }),
-    hasBackground
-      ? el('button', {
-          class: 'btn btn-small btn-quiet',
-          type: 'button',
-          text: 'Remove',
-          onclick: () => {
-            slide.backgroundImage = null;
-            persistDeck();
-            refreshCanvas();
-            renderInspector();
-          },
-        })
-      : null,
   ]);
 
   const backgroundFit = hasBackground
@@ -2801,22 +3141,80 @@ function buildSlideInspector(slide) {
   */
   const backgroundField = el('div', { class: 'field bg-drop' }, [
     el('label', { class: 'label', text: 'Background picture' }),
-    hasBackground
-      ? el('div', {
-          class: 'bg-preview',
-          style: `background-image:url("${slide.backgroundImage}")`,
-        })
-      : null,
+    backgroundPreview,
     backgroundRow,
     backgroundFit,
     el('p', {
       class: 'hint',
       text: hasBackground
-        ? 'Drawn behind everything and darkened a little so the words stay readable. Drop another picture here to swap it.'
+        ? 'Drawn behind everything and darkened a little so the words stay readable. Point at it to remove it, or drop another picture here to swap it.'
         : 'Optional. Drag a picture straight onto this box, or press the button.',
     }),
   ]);
   attachBackgroundDropTarget(backgroundField, slide);
+
+  /*
+    The sound this page plays.
+
+    A DVD menu page has exactly one sound track, so this is a property of the
+    page rather than an element on it: "one more thing on the slide" would imply
+    several, or a place on the picture, and neither means anything on a disc.
+    It is here rather than behind a menu because it is a design decision like the
+    background picture beside it — both are what the page *is*, not what is
+    printed on it.
+  */
+  const sound = slide.audio;
+  const soundField = el('div', { class: 'field' }, [
+    el('label', { class: 'label', text: 'Menu sound' }),
+    sound
+      ? el('div', { class: 'sound-row' }, [
+          el('span', {
+            class: 'sound-mark',
+            text: '\u266a',
+            'aria-hidden': 'true',
+          }),
+          el('div', { class: 'sound-main' }, [
+            el('span', {
+              class: 'sound-name',
+              text: sound.fileName || basename(sound.path),
+              title: sound.path,
+            }),
+            el('span', { class: 'sound-meta', text: describeSound(sound) }),
+          ]),
+        ])
+      : el('p', { class: 'hint', text: 'Nothing chosen, so this page is silent.' }),
+    el('div', { class: 'btn-row' }, [
+      el('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: sound ? 'Replace the sound\u2026' : 'Choose a sound\u2026',
+        onclick: () => chooseSlideSound(slide),
+      }),
+      sound ? buildSoundPreview(sound.path) : null,
+      sound
+        ? el('button', {
+            class: 'btn btn-small btn-quiet',
+            type: 'button',
+            text: 'Remove',
+            onclick: () => {
+              slide.audio = null;
+              persistDeck();
+              refreshCanvas();
+              renderInspector();
+            },
+          })
+        : null,
+    ].filter(Boolean)),
+    sound
+      ? el('p', {
+          class: 'hint',
+          text:
+            'Plays while this page is on screen. When it ends the page waits for the ' +
+            'remote as usual, so a long song does not hold anything up. Drop a sound ' +
+            'file on the slide to use it.',
+        })
+      : null,
+  ]);
 
   return el('div', {}, [
     el('div', { class: 'rail-title', text: 'Slide ' + (state.deck.slides.indexOf(slide) + 1) }),
@@ -2829,6 +3227,7 @@ function buildSlideInspector(slide) {
       themeGrid,
     ]),
     backgroundField,
+    soundField,
     el('div', { class: 'btn-row' }, [applyAll]),
     el('div', { class: 'rule', text: 'This slide' }),
     el('p', {
@@ -3348,6 +3747,245 @@ function buildElementInspector(slide, element) {
       ])
     );
   }
+
+  return panel;
+}
+
+// ------------------------------------------------ many elements at once ---
+
+/**
+ * Which kinds carry which shared property.
+ *
+ * Named sets rather than a per-kind list of rows, because the question the panel
+ * asks is "do all of these have it?" — and that is the same question whatever
+ * the property is.
+ */
+const LETTERING_KINDS = new Set(['text', 'button', 'video']);
+const WORD_BOX_KINDS = new Set(['text', 'button']);
+const SHAPE_FIT_KINDS = new Set(['image', 'video']);
+const TARGETABLE_KINDS = new Set(['button', 'image']);
+
+/**
+ * The panel for a multiple selection.
+ *
+ * It offers only what every selected element has, and every change goes to all
+ * of them. A property some of them lack is left out entirely rather than shown
+ * disabled: a control that quietly does nothing to part of the selection is the
+ * kind of thing that makes an editor feel broken.
+ *
+ * Where the values differ the row says so and shows nothing definite, because
+ * showing the first element's value would be a lie about the others — and if she
+ * then changed something else, the panel would look as though they had already
+ * agreed.
+ */
+function buildMultiElementInspector(elements) {
+  const panel = el('div', {});
+
+  panel.append(
+    el('div', { class: 'rail-title', text: `${elements.length} elements` })
+  );
+
+  /** Every selected element has this key. */
+  const allHave = (key) => elements.every((e) => key in e);
+  /** Every selected element is one of these kinds. */
+  const allAre = (kinds) => elements.every((e) => kinds.has(e.kind));
+
+  const values = (key) => elements.map((e) => e[key]);
+  const mixed = (key) => values(key).some((v) => v !== values(key)[0]);
+  const first = (key) => values(key)[0];
+
+  /** Apply a change to every selected element, then save and redraw once. */
+  const change = (mutate) => {
+    for (const element of elements) mutate(element);
+    persistDeck();
+    refreshCanvasOnly();
+  };
+
+  /**
+   * A number row that writes to all of them.
+   *
+   * A geometric value is clamped per element rather than once, so a group pushed
+   * against the safe area keeps its shape instead of taking the first element's
+   * limit for everybody.
+   */
+  const numberRow = (name, label, key, options = {}) => {
+    const differs = mixed(key);
+    const input = propNumber(
+      differs ? 0 : first(key),
+      (v) => change((element) => {
+        element[key] = v;
+        if (key === 'height' && element.kind === 'text') element.autoHeight = false;
+        clampElementInPlace(element);
+      }),
+      options
+    );
+    if (differs) {
+      input.value = '';
+      input.placeholder = 'mixed';
+      input.title = 'These are not all the same';
+    }
+    return propRow(name, input, label);
+  };
+
+  const selectRow = (name, label, choices, key) => {
+    const differs = mixed(key);
+    const options = differs
+      ? [{ value: '', label: '\u2014 different \u2014' }].concat(choices)
+      : choices;
+    return propRow(
+      name,
+      propSelect(options, differs ? '' : first(key), (value) => {
+        if (differs && value === '') return;
+        change((element) => { element[key] = value; });
+      }),
+      label
+    );
+  };
+
+  /**
+   * The text size, which is not quite a plain number.
+   *
+   * What is shown is the size each element is actually drawn at, because a
+   * named size and a typed one are two ways of saying the same thing and the
+   * panel should not pretend the second does not exist. What is written is
+   * always the typed size, which is the one that wins.
+   */
+  const textSizeRow = () => {
+    const sizes = elements.map((e) => elementFontPx(e));
+    const differs = sizes.some((v) => v !== sizes[0]);
+    const input = propNumber(differs ? 0 : sizes[0], (value) => {
+      change((element) => { element.textPx = value; });
+    }, textSizeBounds());
+    if (differs) {
+      input.value = '';
+      input.placeholder = 'mixed';
+      input.title = 'These are not all the same';
+    }
+    return propRow('TextSize', input, 'TextSize');
+  };
+
+  const groups = [];
+
+  groups.push({
+    title: 'Position and size',
+    rows: [
+      numberRow('PositionX', 'X', 'x', { min: 0 }),
+      numberRow('PositionY', 'Y', 'y', { min: 0 }),
+      numberRow('Width', 'Width', 'width', { min: MIN_ELEMENT_WIDTH }),
+      numberRow('Height', 'Height', 'height', { min: MIN_ELEMENT_HEIGHT }),
+    ],
+  });
+
+  groups.push({
+    title: 'Layering',
+    rows: [
+      numberRow('Priority', 'Priority', 'priority', { min: -99, max: 99 }),
+      numberRow('Roundness', 'Roundness', 'roundness', { min: 0, max: 200 }),
+    ],
+  });
+
+  if (allAre(LETTERING_KINDS)) {
+    const fonts = (state.presets && state.presets.fonts) || [];
+    const theme = currentTheme();
+    const colorChoices = Object.keys(theme || {})
+      .filter((key) => typeof theme[key] === 'string' && /^#/.test(theme[key]))
+      .map((key) => ({ value: key, label: key, color: theme[key] }));
+
+    groups.push({
+      title: 'Lettering',
+      rows: [
+        selectRow(
+          'Lettering',
+          'Lettering',
+          fonts.map((f) => ({ value: f.id, label: f.label })),
+          'fontId'
+        ),
+        textSizeRow(),
+        selectRow('TextAlign', 'TextAlign', [
+          { value: 'left', label: 'Left' },
+          { value: 'center', label: 'Centre' },
+          { value: 'right', label: 'Right' },
+        ], 'align'),
+        colorChoices.length
+          ? propRow(
+              'TextColor',
+              propColor(colorChoices, first('color'), (value) => {
+                change((element) => { element.color = value; });
+              }),
+              'TextColor'
+            )
+          : null,
+      ].filter(Boolean),
+    });
+  }
+
+  if (allAre(WORD_BOX_KINDS)) {
+    const theme = currentTheme();
+    const colorChoices = Object.keys(theme || {})
+      .filter((key) => typeof theme[key] === 'string' && /^#/.test(theme[key]))
+      .map((key) => ({ value: key, label: key, color: theme[key] }));
+
+    groups.push({
+      title: 'Box behind',
+      rows: [
+        selectRow('Background', 'Background', [{ value: 'none', label: 'None' }].concat(colorChoices), 'background'),
+        numberRow('BgTransparency', 'BgTransparency', 'backgroundTransparency', { min: 0, max: 1, step: 0.05 }),
+      ],
+    });
+  }
+
+  if (allAre(SHAPE_FIT_KINDS)) {
+    groups.push({
+      title: 'Picture',
+      rows: [
+        selectRow('Picture', 'Picture', [
+          { value: 'fit', label: 'Whole picture' },
+          { value: 'fill', label: 'Fill the frame' },
+        ], 'fit'),
+      ],
+    });
+  }
+
+  if (allAre(TARGETABLE_KINDS)) {
+    const slide = activeSlide();
+    groups.push({
+      title: 'Behaviour',
+      rows: [
+        selectRow(
+          'GoToSlide',
+          'Goes to',
+          [{ value: '', label: 'None \u2014 does nothing' }].concat(
+            state.deck.slides
+              .filter((other) => !slide || other.id !== slide.id)
+              .map((other) => ({ value: other.id, label: other.title }))
+          ),
+          'targetSlideId'
+        ),
+      ],
+    });
+  }
+
+  panel.append(propTable(groups));
+
+  panel.append(
+    el('p', {
+      class: 'prop-hint',
+      text:
+        'Every change here is applied to all of them. Drag one and the rest come ' +
+        'with it. Hold Cmd, Ctrl or Shift and click to add or remove one.',
+    })
+  );
+
+  panel.append(
+    el('div', { class: 'btn-row', style: 'margin-top:10px' }, [
+      el('button', {
+        class: 'btn btn-small btn-danger',
+        type: 'button',
+        text: `Delete all ${elements.length}`,
+        onclick: () => deleteElements(elements.map((e) => e.id)),
+      }),
+    ])
+  );
 
   return panel;
 }
@@ -3910,22 +4548,44 @@ function bindChrome() {
     const target = event.target;
     if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
 
-    if ((event.key === 'Backspace' || event.key === 'Delete') && state.selectedElementId) {
+    if ((event.key === 'Backspace' || event.key === 'Delete') && state.selectedElementIds.length) {
       event.preventDefault();
-      deleteElement(state.selectedElementId);
+      deleteElements(state.selectedElementIds);
     }
+
+    // Select everything on the slide, and let go of it again, the way every
+    // editor does. Cmd on a Mac, Ctrl everywhere else.
+    if ((event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === 'a') {
+      event.preventDefault();
+      const slide = activeSlide();
+      setElementSelection((slide ? slide.elements : []).map((e) => e.id));
+      renderInspector();
+      drawCanvas();
+    }
+
+    if (event.key === 'Escape' && state.selectedElementIds.length) {
+      // A modifier-click already dropped the context menu's copy of this; here it
+      // is the selection that goes.
+      clearElementSelection();
+      renderInspector();
+      drawCanvas();
+    }
+
     if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'ArrowUp' || event.key === 'ArrowDown') {
-      const { element } = state.selectedElementId
-        ? findElement(state.selectedElementId)
-        : { element: null };
-      if (!element) return;
+      const targets = selectedElements();
+      if (!targets.length) return;
       event.preventDefault();
       const step = event.shiftKey ? 10 : 1;
-      if (event.key === 'ArrowLeft') element.x -= step;
-      if (event.key === 'ArrowRight') element.x += step;
-      if (event.key === 'ArrowUp') element.y -= step;
-      if (event.key === 'ArrowDown') element.y += step;
-      clampElementInPlace(element);
+      // Shift is the fine/coarse modifier here, so it cannot also mean "add to
+      // the selection" once something is selected — the arrow keys move whatever
+      // is selected, all of it together.
+      for (const element of targets) {
+        if (event.key === 'ArrowLeft') element.x -= step;
+        if (event.key === 'ArrowRight') element.x += step;
+        if (event.key === 'ArrowUp') element.y -= step;
+        if (event.key === 'ArrowDown') element.y += step;
+        clampElementInPlace(element);
+      }
       persistDeck();
       refreshCanvas();
     }
@@ -4671,6 +5331,30 @@ function openHelp() {
         'picture. Point either one at a slide holding a video and it plays that video ' +
         'straight away.',
     }),
+    el('h2', { text: 'Working on several things at once' }),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 18px',
+      text:
+        'Hold Cmd, Ctrl or Shift and click to select more than one thing on a slide. ' +
+        'The panel on the right then shows only the properties they all have, and ' +
+        'changing one changes it on all of them \u2014 line up three buttons, or give every ' +
+        'label the same size, in one go. Where they differ the row says "mixed". Drag ' +
+        'one of them and the rest come too. Delete removes the lot, and Escape lets go ' +
+        'of the selection.',
+    }),
+    el('h2', { text: 'Music on a menu page' }),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 18px',
+      text:
+        'Press "+ Sound" in the toolbar, or drop a sound file straight onto a slide, and ' +
+        'that page plays it while it is on screen. A DVD menu has one sound track, so it ' +
+        'is one per page \u2014 give another slide its own if you want something else there. ' +
+        'When the sound ends the page waits for the remote as usual, so a long song never ' +
+        'holds anything up. Music shows up in the DVD player on the Testing step, and a ' +
+        'small note appears on the slide in the list so you can see which pages have it.',
+    }),
     el('h2', { text: 'Moving things around' }),
     el('p', {
       class: 'hint',
@@ -4682,7 +5366,8 @@ function openHelp() {
         'gets stretched; hold Shift if you really do want to stretch one. Words and ' +
         'buttons are held inside the safe area, because some televisions crop the edge ' +
         'of the picture. A picture may be made larger than that and moved around within ' +
-        'it, so a photograph can fill the frame.',
+        'it, so a photograph can fill the frame. A background picture is removed by ' +
+        'pointing at it in the panel and pressing the cross that appears over it.',
     }),
     el('h2', { text: 'Right-clicking' }),
     el('p', {
@@ -4774,10 +5459,40 @@ function bindCanvas() {
     }
 
     const hit = hitTest(layout, point);
-    state.selectedElementId = hit ? hit.id : null;
+
+    /*
+      A modifier means "add this to what I have", not "start over".
+
+      Cmd, Ctrl and Shift all count, because the natural one differs by platform
+      and on a Mac Ctrl-click is the system's own right-click anyway — a feature
+      reachable only with Ctrl would be unreachable there.
+
+      A modifier press toggles and stops; it never begins a drag. Dragging is how
+      you move something, and doing it by accident while building a selection
+      would be worse than having to press once more to move it.
+    */
+    const additive = event.metaKey || event.ctrlKey || event.shiftKey;
+    if (additive) {
+      if (hit && !hit.generated) toggleElementSelection(hit.id);
+      renderInspector();
+      drawCanvas();
+      return;
+    }
+
+    /*
+      Pressing something already in a multiple selection keeps that selection, so
+      the whole group can be dragged. Whether it turns out to be a click or a drag
+      is only known on release — so the expansion is recorded here and undone
+      there if nothing moved.
+    */
+    const wasSelected = hit ? isElementSelected(hit.id) : false;
+    setElementSelectionIfOutside(hit);
     renderInspector();
 
     if (hit && !hit.generated) {
+      const group = selectedElements();
+      const origins = group.map((element) => ({ id: element.id, x: element.x, y: element.y }));
+
       drag = {
         mode: 'move',
         id: hit.id,
@@ -4785,6 +5500,15 @@ function bindCanvas() {
         startY: point.y,
         originX: hit.x,
         originY: hit.y,
+        // Every element that will move, with where it started.
+        group: origins.length > 1 ? origins : null,
+        /*
+          If this press kept a multiple selection alive and then nothing moves,
+          it was a plain click after all: "just this one". Collapsing on release
+          is what lets a click narrow the selection while a drag moves all of it,
+          without having to guess which one it is going to be.
+        */
+        collapseTo: wasSelected && state.selectedElementIds.length > 1 ? hit.id : null,
         moved: false,
       };
       canvas.setPointerCapture(event.pointerId);
@@ -4838,6 +5562,24 @@ function bindCanvas() {
       if (element.kind === 'text') element.autoHeight = false;
       clampElementInPlace(element);
       state.snapGuides = [];
+    } else if (drag.group) {
+      /*
+        Several elements moving as one.
+
+        Each keeps the offset it started with and is clamped on its own, so a
+        group dragged into the edge of the safe area stacks up against it instead
+        of the whole group stopping dead the moment its leading element does.
+        Snapping and guides are left out here for the same reason: they describe
+        one box, and there is no single box to describe.
+      */
+      for (const start of drag.group) {
+        const moving = findElement(start.id).element;
+        if (!moving) continue;
+        moving.x = start.x + dx;
+        moving.y = start.y + dy;
+        clampElementInPlace(moving);
+      }
+      state.snapGuides = [];
     } else if (layout) {
       // Line it up with the safe area and with everything else on the slide.
       const snapped = snapBox(
@@ -4876,6 +5618,11 @@ function bindCanvas() {
       // The guides are part of the drag, not of the slide.
       state.snapGuides = [];
       drawCanvas();
+    } else if (drag.collapseTo) {
+      // It never moved, so it was a click on one of several: narrow to it.
+      setElementSelection([drag.collapseTo], drag.collapseTo);
+      renderInspector();
+      drawCanvas();
     }
     drag = null;
   });
@@ -4896,7 +5643,7 @@ function bindCanvas() {
     const hit = hitTest(layout, canvasPoint(event));
     if (!hit) return;
 
-    state.selectedElementId = hit.id;
+    setElementSelection([hit.id]);
     renderInspector();
     drawCanvas();
 
@@ -4920,12 +5667,12 @@ function bindCanvas() {
     const hit = hitTest(layout, point);
 
     if (hit) {
-      state.selectedElementId = hit.id;
+      setElementSelection([hit.id]);
       renderInspector();
       drawCanvas();
       openElementMenu(event, hit, layout);
     } else {
-      state.selectedElementId = null;
+      clearElementSelection();
       renderInspector();
       drawCanvas();
       openCanvasMenu(event);
@@ -5217,7 +5964,7 @@ function duplicateElement(elementId) {
   copy.generated = undefined;
   slide.elements.push(copy);
   clampElementInPlace(copy);
-  state.selectedElementId = copy.id;
+  setElementSelection([copy.id]);
   persistDeck();
   render();
 }
@@ -5306,6 +6053,8 @@ const sim = {
   showsHighlight: true,
   message: null,
   messageUntil: 0,
+  /** The page's sound, while it is playing. Stopped whenever the page is left. */
+  menuAudio: null,
 };
 
 /**
@@ -5484,6 +6233,7 @@ function closeSimulator() {
   sim.open = false;
   sim.model = null;
   sim.title = null;
+  stopMenuSound();
 
   // The video element lives inside the player, so it goes with it; pause first
   // so a film does not keep playing invisibly.
@@ -5534,6 +6284,46 @@ function enterMenu(pageNumber) {
   sim.title = null;
   sim.focus = page.buttons.length ? page.buttons[0].name : null;
   sim.showsHighlight = true;
+  playMenuSound(page);
+}
+
+/**
+ * Play the sound a menu page carries, if it has one.
+ *
+ * Straight from the source file rather than from the encoded AC-3, like the
+ * films: what she hears is the song, not a second-generation copy of it. The
+ * disc plays it for the same length, because the length was settled in the disc
+ * model before either of them got hold of it.
+ */
+async function playMenuSound(page) {
+  stopMenuSound();
+  const sound = page && page.sound;
+  if (!sound || !sound.path) return;
+
+  try {
+    const urls = await api.files.mediaUrls([sound.path]);
+    const url = urls && urls[sound.path];
+    if (!url) return;
+
+    const audio = new Audio(url);
+    audio.volume = 0.85;
+    sim.menuAudio = audio;
+    const attempt = audio.play();
+    if (attempt && attempt.catch) attempt.catch(() => {});
+  } catch {
+    // A sound that will not play is not worth interrupting the preview over: the
+    // picture, the buttons and the navigation are all still correct.
+  }
+}
+
+function stopMenuSound() {
+  if (!sim.menuAudio) return;
+  try {
+    sim.menuAudio.pause();
+  } catch {
+    /* already stopped */
+  }
+  sim.menuAudio = null;
 }
 
 /**
@@ -5554,6 +6344,8 @@ function enterTitle(titleNumber) {
   if (!sim.model) return;
   const title = sim.model.titles.find((t) => t.number === titleNumber);
   if (!title) return;
+  // The page's music belongs to the page. A film starting is the page ending.
+  stopMenuSound();
   sim.domain = 'title';
   sim.title = title.number;
   sim.focus = null;
@@ -6112,7 +6904,30 @@ async function importPathsOntoSlide(paths) {
     }
   }
 
-  const videos = paths.filter((path) => !looksLikeImage(path));
+  /*
+    A sound becomes this page's sound, the same as pressing + Sound.
+
+    One per page, because a DVD menu page carries a single sound track — so a
+    drop of several uses the first and says so rather than silently discarding
+    the rest.
+  */
+  const sounds = paths.filter((path) => !looksLikeImage(path) && looksLikeAudio(path));
+  if (sounds.length) {
+    await setSlideSoundFromPath(activeSlide(), sounds[0]);
+    if (sounds.length > 1) {
+      setBanner(
+        'info',
+        'One sound per page',
+        `A menu page has a single sound track, so "${basename(sounds[0])}" was used and ` +
+          'the rest were left out. Add another slide to use one of those.'
+      );
+      render();
+    }
+  }
+
+  const videos = paths.filter(
+    (path) => !looksLikeImage(path) && !looksLikeAudio(path)
+  );
   if (!videos.length) return;
 
   const added = await addVideoPaths(videos);
@@ -6253,17 +7068,48 @@ function installTestHooks() {
     importPathsOntoFilmstrip: (paths) => importPathsOntoFilmstrip(paths),
     clampElement: (element) => clampElementInPlace({ ...element }),
     banner: () => (state.banner ? { kind: state.banner.kind, title: state.banner.title } : null),
+    // The multiple selection, and what each selected element was told to be.
+    selection: () => state.selectedElementIds.slice(),
+    elements: () =>
+      (activeSlide() ? activeSlide().elements : []).map((e) => ({
+        id: e.id,
+        kind: e.kind,
+        x: e.x,
+        y: e.y,
+        width: e.width,
+        height: e.height,
+        fontId: e.fontId,
+        color: e.color,
+        fit: e.fit,
+        targetSlideId: e.targetSlideId,
+      })),
+    // The sound and the background picture on a slide, which are properties of
+    // the page rather than elements on it.
+    setSlideSound: (path) => setSlideSoundFromPath(activeSlide(), path),
+    slideAudio: (slideId) => {
+      const slide = slideId
+        ? state.deck.slides.find((s) => s.id === slideId)
+        : activeSlide();
+      return slide && slide.audio ? { ...slide.audio } : null;
+    },
+    setSlideBackground: (path) => setSlideBackgroundFromPath(activeSlide(), path),
+    hasSlideBackground: (slideId) => {
+      const slide = slideId
+        ? state.deck.slides.find((s) => s.id === slideId)
+        : activeSlide();
+      return Boolean(slide && slide.backgroundImage);
+    },
     // The slide being edited, and what the disc makes of the deck as it stands —
     // the same model the burn and the simulator are both built from.
     goToSlide: (slideId) => {
       if (!state.deck.slides.some((s) => s.id === slideId)) return false;
       state.activeSlideId = slideId;
-      state.selectedElementId = null;
+      clearElementSelection();
       render();
       return true;
     },
     selectElement: (elementId) => {
-      state.selectedElementId = elementId;
+      setElementSelection([elementId]);
       renderInspector();
       return state.selectedElementId;
     },
@@ -6420,7 +7266,7 @@ function installTestHooks() {
     },
     closeElementMenu: () => closeElementMenu(),
     selectElement: (id) => {
-      state.selectedElementId = id;
+      setElementSelection([id]);
       drawCanvas();
       renderInspector();
     },

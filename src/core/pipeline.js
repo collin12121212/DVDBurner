@@ -409,6 +409,7 @@ async function prepare(project, { tools, workDir, onProgress, onLog, signal, Bro
     root,
     BrowserWindow,
     signal,
+    onLog,
   });
 
   // ---- author ------------------------------------------------------------
@@ -657,7 +658,7 @@ function readBuildRecord(workDir) {
  * that knows both the title numbering (position in the prepared video list) and
  * the menu numbering (position among the slides that actually have buttons).
  */
-async function buildMenus({ project, videos, tools, root, BrowserWindow, signal }) {
+async function buildMenus({ project, videos, tools, root, BrowserWindow, signal, onLog }) {
   // The whole navigation graph — pages, buttons, rectangles, arrow-key
   // movement and jump commands — comes from one place, so the disc that gets
   // burned and the simulator that previews it are derived from the same data.
@@ -699,15 +700,52 @@ async function buildMenus({ project, videos, tools, root, BrowserWindow, signal 
     }
 
     const stillPath = path.join(menuDir, `menu_still_${page.slideIndex + 1}.mpg`);
-    await runFfmpeg(
-      tools.ffmpeg,
+
+    /*
+      The page's own sound, if it has one.
+
+      A menu page with audio is a motion menu: the still is held on screen for as
+      long as the sound lasts and the player waits for the remote afterwards,
+      exactly as it does for a silent page. Everything that decides the length —
+      including the trim to what the format can afford — was settled in the disc
+      model, so this only has to encode it.
+
+      A file that has been moved or deleted since it was chosen falls back to a
+      silent page, and so does one this ffmpeg cannot decode. The menu is the
+      thing that has to work: losing the music is a disappointment, losing the
+      disc is a failure, and it must never be the second one.
+    */
+    const sound = page.sound;
+    const soundUsable = Boolean(sound && sound.path && fs.existsSync(sound.path));
+    if (sound && !soundUsable && onLog) {
+      onLog(
+        `The sound chosen for "${page.title}" is no longer at ${sound.path}, ` +
+          `so that page will be silent.`
+      );
+    }
+
+    const stillArgs = (withSound) =>
       author.buildMenuStillArgs({
         inputPng: pngPath,
         outputVob: stillPath,
         videoFormat: project.videoFormat,
         aspect: project.titleAspect || '16:9',
-      })
-    );
+        audioPath: withSound ? sound.path : null,
+        seconds: withSound ? sound.seconds : 1,
+      });
+
+    try {
+      await runFfmpeg(tools.ffmpeg, stillArgs(soundUsable));
+    } catch (err) {
+      if (!soundUsable) throw err;
+      if (onLog) {
+        onLog(
+          `The sound for "${page.title}" could not be used (${String(err.message || err)}), ` +
+            `so that page will be silent.`
+        );
+      }
+      await runFfmpeg(tools.ffmpeg, stillArgs(false));
+    }
 
     /*
       The layer the player puts over the menu to show which button is lit.
@@ -767,6 +805,10 @@ async function buildMenus({ project, videos, tools, root, BrowserWindow, signal 
       pngPath,
       vobPath: buttonedPath,
       buttons: page.buttons,
+      // Carried through so what was actually built can be reported — a page
+      // whose music was dropped for a missing file should be visible afterwards,
+      // not only in the log at the moment it happened.
+      sound: page.sound || null,
     });
   }
 

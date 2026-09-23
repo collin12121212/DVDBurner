@@ -136,6 +136,60 @@ async function probeVideo(ffprobePath, filePath) {
   };
 }
 
+/**
+ * Read the facts out of a sound file.
+ *
+ * Kept apart from probeVideo because a sound file has no video stream and
+ * probeVideo refuses anything without one — asking it about an MP3 fails with
+ * "has no video track", which says nothing useful about the file.
+ */
+async function probeAudio(ffprobePath, filePath) {
+  if (!ffprobePath) throw new Error('ffprobe is not available.');
+
+  const args = [
+    '-v', 'error',
+    '-print_format', 'json',
+    '-show_format',
+    '-show_streams',
+    '-select_streams', 'a:0',
+    '-i', filePath,
+  ];
+
+  let raw;
+  try {
+    raw = await run(ffprobePath, args);
+  } catch (err) {
+    throw new Error(`Could not read "${basename(filePath)}": ${summariseProbeError(err)}`);
+  }
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`Could not read "${basename(filePath)}": ffprobe returned unreadable output.`);
+  }
+
+  const stream = (Array.isArray(data.streams) ? data.streams : [])
+    .find((s) => s.codec_type === 'audio');
+  if (!stream) {
+    throw new Error(`"${basename(filePath)}" has no sound in it.`);
+  }
+
+  const format = data.format || {};
+  const duration =
+    numberOrNull(format.duration) ?? numberOrNull(stream.duration) ?? 0;
+
+  return {
+    path: filePath,
+    name: basename(filePath),
+    duration: duration || 0,
+    codec: stream.codec_name || 'unknown',
+    channels: numberOrNull(stream.channels) || 0,
+    sampleRate: numberOrNull(stream.sample_rate) || 0,
+    sizeBytes: numberOrNull(format.size) || 0,
+  };
+}
+
 function pickFrameRate(video) {
   const avg = parseRational(video.avg_frame_rate);
   const real = parseRational(video.r_frame_rate);
@@ -251,6 +305,7 @@ function round(n, places) {
 
 module.exports = {
   probeVideo,
+  probeAudio,
   looksLikeVideo,
   displayAspectOf,
   VIDEO_EXTENSIONS,

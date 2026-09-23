@@ -58,6 +58,56 @@ function withTimeout(promise, ms, message) {
 }
 
 /**
+ * Open the offscreen window that holds the drawing code.
+ *
+ * The load is retried once, in a fresh window, if it fails. Creating a window
+ * directly after another was destroyed can fail with ERR_FAILED while the first
+ * is still being torn down — observed when two renders happen back to back, and
+ * it is entirely transient. Its only other outcome is a failed build, so it is
+ * worth one more try rather than an error about a file that plainly exists.
+ */
+async function openHelperWindow({ BrowserWindow, helperPath, width, height }) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const window = new BrowserWindow({
+      show: false,
+      width,
+      height,
+      // Not `offscreen`: a normal hidden window still gets a real GPU-backed
+      // canvas and still runs canvas.toDataURL, which is what is read back.
+      // Offscreen rendering would work too but is far more fragile across macOS
+      // versions, and this has to work on a 2017 machine.
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        backgroundThrottling: false,
+      },
+    });
+
+    try {
+      await window.loadFile(helperPath);
+      return window;
+    } catch (err) {
+      lastError = err;
+      try {
+        window.destroy();
+      } catch {
+        /* already gone */
+      }
+      // Let the previous window finish going away before opening another.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+  }
+
+  throw new Error(
+    `The window that draws slides could not be opened. ${
+      (lastError && lastError.message) || 'No reason given.'
+    }`
+  );
+}
+
+/**
  * Render every slide in a laid-out deck.
  *
  * @param {object} options
@@ -73,26 +123,16 @@ async function renderDeck({ layout, outputDir, BrowserWindow, parent = null, tim
   fs.mkdirSync(outputDir, { recursive: true });
 
   const helperPath = path.join(__dirname, '..', 'renderer', 'slide_still.html');
-  const window = new BrowserWindow({
-    show: false,
+  const window = await openHelperWindow({
+    BrowserWindow,
+    helperPath,
     width: layout.slides[0] ? layout.slides[0].width : 720,
     height: layout.slides[0] ? layout.slides[0].height : 480,
-    // Not `offscreen`: a normal hidden window still gets a real GPU-backed
-    // canvas and still runs canvas.toDataURL, which is what is read back.
-    // Offscreen rendering would work too but is far more fragile across macOS
-    // versions, and this has to work on a 2017 machine.
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      backgroundThrottling: false,
-    },
   });
 
   const files = [];
 
   try {
-    await window.loadFile(helperPath);
-
     for (let i = 0; i < layout.slides.length; i += 1) {
       const slideLayout = layout.slides[i];
 

@@ -310,6 +310,53 @@ function normaliseElement(raw) {
 // Slides
 // ---------------------------------------------------------------------------
 
+/**
+ * How long a menu page's sound is allowed to run, in seconds.
+ *
+ * A DVD menu holds one still frame, and the sound is what gives the page its
+ * length. Ninety seconds is far more than any menu needs, and it bounds what one
+ * page can cost on the disc: at the bitrates used for a held still that is a few
+ * megabytes, which cannot push a full disc over its edge. A longer file is
+ * trimmed rather than refused, because a song is still the obvious thing to
+ * choose and stopping at ninety seconds is not a surprise worth an error over.
+ */
+const MENU_SOUND_MAX_SECONDS = 90;
+
+/**
+ * The sound on a slide, or null.
+ *
+ * Held as a path rather than a data URL, unlike a background picture: a song is
+ * megabytes, and a data URL would put the whole track inside the project file
+ * and inside every save. The build reads the file directly, and the editor and
+ * the preview ask the main process for a playable URL.
+ *
+ * It belongs to the slide rather than to an element on it because that is what
+ * the format can do — a DVD menu page has exactly one sound track. An element
+ * would imply several per page, or a position on the picture, and neither means
+ * anything on a disc.
+ */
+function normaliseSlideAudio(raw) {
+  const path = raw && typeof raw.path === 'string' ? raw.path.trim() : '';
+  if (!path) return null;
+
+  const duration = Math.max(0, num(raw.duration, 0));
+  const wanted = num(raw.seconds, 0);
+  const seconds = wanted > 0
+    ? Math.min(MENU_SOUND_MAX_SECONDS, wanted)
+    : duration > 0
+      ? Math.min(MENU_SOUND_MAX_SECONDS, duration)
+      : MENU_SOUND_MAX_SECONDS;
+
+  return {
+    path,
+    fileName: raw.fileName ? String(raw.fileName) : '',
+    // How long the file is, as read from it. Zero means it could not be measured.
+    duration,
+    // How much of it the disc will actually play.
+    seconds: Math.round(seconds * 100) / 100,
+  };
+}
+
 function makeSlide(patch = {}) {
   return {
     id: keepId(patch.id, 'slide'),
@@ -332,6 +379,8 @@ function makeSlide(patch = {}) {
     // `cover` fills the frame and crops whatever spills over, which is what a
     // background picture almost always wants. `contain` shows all of it.
     backgroundFit: patch.backgroundFit === 'contain' ? 'contain' : 'cover',
+    // A sound to play while this page is on screen, or null for a silent page.
+    audio: normaliseSlideAudio(patch.audio),
     // `menu` slides are navigation hubs; `content` slides hold playable things.
     // The distinction only affects the automatically added navigation row.
     role: patch.role === 'menu' ? 'menu' : 'content',
@@ -525,6 +574,7 @@ module.exports = {
   RASTER,
   SAFE_MARGIN,
   VIDEO_BOTTOM,
+  MENU_SOUND_MAX_SECONDS,
   MAX_BUTTONS_PER_SLIDE,
   THEMES,
   DEFAULT_THEME_ID,

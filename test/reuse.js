@@ -19,6 +19,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const { app, BrowserWindow } = require('electron');
 
 const pipeline = require('../src/core/pipeline');
@@ -112,8 +113,49 @@ function projectWith(root, videos, overrides = {}) {
   });
 }
 
+/**
+ * A menu slide with a button on it, which is the least a page needs to exist.
+ *
+ * The editor builds these from the video list; a headless build has to do the
+ * same, because a slide with no button is not a menu page at all and there would
+ * be nothing to attach a sound to.
+ */
+function menuDeck({ title = 'Menu' } = {}) {
+  const deckModel = require('../src/core/deck');
+  const slide = deckModel.episodeListSlide(
+    [{ id: 'v1', name: 'Episode One', duration: 3 }],
+    { id: 'menu-slide', title, themeId: 'charcoal' }
+  );
+  return { discTitle: 'Reuse Test', themeId: 'charcoal', buttonStyle: 'bar', slides: [slide] };
+}
+
+/** The menu VOB dvdauthor wrote, whichever title set it numbered. */
+function findMenuVob(videoTsDir) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(videoTsDir);
+  } catch {
+    return null;
+  }
+  const name = entries.find((entry) => /_0\.VOB$/i.test(entry));
+  return name ? path.join(videoTsDir, name) : null;
+}
+
 app.whenReady().then(async () => {
   console.log('\nBurnhouse reuse\n');
+
+  /*
+    A window that stays open for the whole run.
+
+    Electron quits when the last window closes, and rendering a slide opens and
+    closes its own offscreen window each time. Without something else open, the
+    app would quit between two builds — invisibly, and only when nothing happened
+    to reopen a window quickly enough, which is why this showed up as a suite that
+    stopped halfway with a success code. The real application always has its main
+    window open, so this is the test catching up with reality rather than a
+    workaround.
+  */
+  const keeper = new BrowserWindow({ show: false, width: 400, height: 300 });
 
   const tools = detectTools({});
   const missing = ['ffmpeg', 'ffprobe', 'dvdauthor', 'spumux'].filter((name) => !tools[name]);
@@ -206,6 +248,98 @@ app.whenReady().then(async () => {
       const after = await pipeline.prepare(projectWith(root, videos), { ...quietIn(root), force: true });
       assertEqual(after.reusedTitles, 0, 'Nothing may be reused when a rebuild is forced');
       assertEqual(after.encodedTitles, 2, 'Both titles should have been prepared again');
+    });
+
+    await test('a menu page with a sound is built into the disc with it', async () => {
+      /*
+        The whole feature, end to end: a sound chosen for a page has to reach the
+        authored VIDEO_TS as a decodable audio stream. Everything before this
+        test checks a piece of it; this checks that a real disc comes out the
+        other end with the music in it.
+      */
+      const root = tmpdir('reuse-sound');
+      /*
+        WAV rather than MP3: writing an MP3 needs an external library that not
+        every ffmpeg build carries, and decoding one needs nothing extra. The
+        pipeline suite covers the MP3 case where the build can write one.
+      */
+      const song = path.join(root, 'menu-song.wav');
+      const made = spawnSync(
+        tools.ffmpeg,
+        [
+          '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
+          '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100:duration=8',
+          '-c:a', 'pcm_s16le', song,
+        ],
+        { windowsHide: true }
+      );
+      assertEqual(made.status, 0, 'Could generate a sound to put on the menu');
+
+      const project = projectWith(root, [
+        { id: 'v1', path: FIXTURE, name: 'Episode One.mp4', duration: info.duration },
+      ]);
+      /*
+        A real menu slide, with a button on it.
+
+        The default deck for a project is an empty episode list, which has no
+        buttons and so is not a menu page at all — the editor fills it from the
+        video list, and a headless build has to do the same to have a page to put
+        a sound on.
+      */
+      project.deck = menuDeck({ title: 'Menu' });
+      project.deck.slides[0].audio = { path: song, fileName: 'menu-song.wav', duration: 8 };
+
+      const prepared = await pipeline.prepare(project, quietIn(root));
+      const menu = prepared.menus[0];
+      assert(menu, 'A menu page was built');
+      assert(menu.sound, 'And it kept the sound it was given');
+      assertEqual(menu.sound.seconds, 8, 'For as long as the file runs');
+
+      const menuVob = findMenuVob(prepared.videoTsDir);
+      assert(menuVob, 'The authored menu VOB is there');
+
+      const probed = await probeMod.probeAudio(tools.ffprobe, menuVob);
+      assertEqual(probed.codec, 'ac3', 'And it carries AC-3, the sound a DVD menu may have');
+      assertEqual(Number(probed.sampleRate), 48000, 'Resampled to the 48 kHz a DVD requires');
+      assert(probed.duration > 5, `And it is not silent: ${probed.duration}s of audio`);
+    });
+
+    await test('a sound that has been moved makes the page silent, not the build fail', async () => {
+      /*
+        A path in a saved project can point at a file that is no longer there —
+        an album tidied up, a drive unplugged. Losing the music is a
+        disappointment; losing the disc because of it would be a failure, so the
+        page falls back to silence and the build carries on.
+      */
+      const root = tmpdir('reuse-nosound');
+      const project = projectWith(root, [
+        { id: 'v1', path: FIXTURE, name: 'Episode One.mp4', duration: info.duration },
+      ]);
+      project.deck = menuDeck({ title: 'Menu' });
+      project.deck.slides[0].audio = {
+        path: path.join(root, 'gone.wav'),
+        fileName: 'gone.wav',
+        duration: 10,
+      };
+
+      const logs = [];
+      const prepared = await pipeline.prepare(project, {
+        ...quietIn(root),
+        onLog: (line) => logs.push(String(line)),
+      });
+
+      assertEqual(prepared.menus.length, 1, 'The disc was still built');
+      assert(fs.existsSync(path.join(prepared.videoTsDir, 'VIDEO_TS.IFO')), 'With a real VIDEO_TS');
+      assert(
+        logs.some((line) => /no longer at/.test(line)),
+        `The log should say the sound was missing, got: ${logs.join(' | ')}`
+      );
+
+      const menuVob = findMenuVob(prepared.videoTsDir);
+      assert(menuVob, 'A menu VOB was still produced');
+      const probed = await probeMod.probeAudio(tools.ffprobe, menuVob);
+      assertEqual(probed.codec, 'ac3', 'And the page is silent rather than broken');
+      assertEqual(Number(probed.sampleRate), 48000, 'Still legal for a DVD menu');
     });
 
     await test('a source that is already a DVD title is copied, not encoded', async () => {

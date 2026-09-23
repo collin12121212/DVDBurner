@@ -1255,6 +1255,162 @@ async function main() {
       fs.rmSync(dir, { recursive: true, force: true });
     });
 
+    await test('a menu page with sound becomes a motion menu that is still small', async () => {
+      /*
+        The page's sound replaces the silent track, and the still is held for as
+        long as the sound runs. Two things have to be true or the feature is worse
+        than not having it: the audio has to survive into the menu VOB as
+        something a DVD player will decode, and the held still must not be encoded
+        all-intra — at the maximum still bitrate that is nine megabits *per frame*,
+        which for a minute of music would be hundreds of megabytes of disc for a
+        picture that never changes.
+
+        The size check is the guard on the second: an all-intra encode of twelve
+        seconds is around fifteen megabytes, and this must be a small fraction of
+        that.
+      */
+      const dir = tmpdir('menusound');
+      const png = path.join(dir, 'menu.png');
+      const madePng = run(tools.ffmpeg, [
+        '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'color=c=0x1c1b19:s=720x480',
+        '-frames:v', '1', png,
+      ]);
+      assertEqual(madePng.code, 0, 'Could generate a test menu picture');
+
+      /*
+        A real sound file, in a shape no DVD would accept as it stands: 44.1 kHz
+        stereo, which has to be resampled to the 48 kHz a DVD requires.
+
+        WAV rather than MP3 deliberately. Encoding an MP3 needs an external
+        library that not every ffmpeg build carries — the bundled one on the Mac
+        included — and a test that only passes where that happens to be present is
+        worse than no test. Decoding an MP3 needs nothing extra, and that is
+        checked separately below.
+      */
+      const song = path.join(dir, 'song.wav');
+      const madeSong = run(tools.ffmpeg, [
+        '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100:duration=12',
+        '-c:a', 'pcm_s16le', song,
+      ]);
+      assertEqual(madeSong.code, 0, 'Could generate a test sound');
+      assert(fs.statSync(song).size > 1000, 'The test sound has content');
+
+      const menuVob = path.join(dir, 'menu_sound.mpg');
+      const args = author.buildMenuStillArgs({
+        inputPng: png,
+        outputVob: menuVob,
+        videoFormat: 'ntsc',
+        audioPath: song,
+        seconds: 12,
+      });
+      const encoded = run(tools.ffmpeg, args);
+      assertEqual(encoded.code, 0, `Menu with sound failed:\n${encoded.stderr}`);
+
+      const info = await probeMod.probeVideo(tools.ffprobe, menuVob);
+      assertEqual(info.width, 720, 'Still a DVD raster');
+      assertEqual(info.height, 480, 'Still 480 lines');
+      assertEqual(info.videoCodec, 'mpeg2video', 'Still MPEG-2');
+      assertEqual(info.hasAudio, true, 'The menu now carries a sound track');
+      assertEqual(info.audioCodec, 'ac3', 'Which is AC-3, the codec a DVD menu may carry');
+      assertEqual(Number(info.audioSampleRate), 48000, 'At the 48 kHz a DVD requires');
+
+      const bytes = fs.statSync(menuVob).size;
+      assert(
+        bytes < 3 * 1024 * 1024,
+        `A twelve-second menu took ${(bytes / 1024 / 1024).toFixed(1)} MB, which means the ` +
+          `still is being encoded all-intra at the full bitrate for every frame.`
+      );
+
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    await test('the sound of a menu page is read from the file it names', async () => {
+      const dir = tmpdir('audioprobe');
+      const song = path.join(dir, 'tune.wav');
+      const made = run(tools.ffmpeg, [
+        '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'sine=frequency=330:sample_rate=48000:duration=7',
+        '-c:a', 'pcm_s16le', song,
+      ]);
+      assertEqual(made.code, 0, 'Could generate a test sound');
+
+      const info = await probeMod.probeAudio(tools.ffprobe, song);
+      assertEqual(info.codec, 'pcm_s16le', 'The codec is read');
+      assert(Number(info.channels) >= 1, 'So are the channels');
+      assertClose(info.duration, 7, 0.5, 'And the length, which decides how long the page runs');
+
+      // A file with no sound in it must give a clear reason, not a length of
+      // zero that would silently make the page run for the maximum.
+      const picture = path.join(dir, 'notsound.png');
+      run(tools.ffmpeg, [
+        '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'color=c=black:s=64x64', '-frames:v', '1', picture,
+      ]);
+      let failed = '';
+      try {
+        await probeMod.probeAudio(tools.ffprobe, picture);
+      } catch (err) {
+        failed = String(err.message || err);
+      }
+      assert(/no sound/i.test(failed), `A picture should be refused as a sound, got: ${failed}`);
+
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    await test('an MP3 chosen as a menu sound is read and used', async () => {
+      /*
+        What she will actually pick most of the time.
+
+        Conditional on purpose: writing an MP3 needs an external library that
+        some ffmpeg builds do not carry, and this must not fail a build on a
+        machine that simply lacks it. Decoding an MP3 needs nothing extra, which
+        is the half that matters here — and if this ffmpeg cannot encode one, it
+        says so rather than passing quietly.
+      */
+      const dir = tmpdir('mp3sound');
+      const song = path.join(dir, 'tune.mp3');
+      const made = run(tools.ffmpeg, [
+        '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100:duration=5',
+        '-c:a', 'libmp3lame', '-b:a', '128k', song,
+      ]);
+
+      if (made.code !== 0 || !fs.existsSync(song)) {
+        skip('an MP3 chosen as a menu sound', 'this ffmpeg cannot write MP3');
+      } else {
+        const info = await probeMod.probeAudio(tools.ffprobe, song);
+        assertEqual(info.codec, 'mp3', 'The MP3 is recognised as sound');
+        assertClose(info.duration, 5, 0.5, 'With its length');
+
+        const png = path.join(dir, 'menu.png');
+        run(tools.ffmpeg, [
+          '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
+          '-f', 'lavfi', '-i', 'color=c=0x1c1b19:s=720x480', '-frames:v', '1', png,
+        ]);
+
+        const menuVob = path.join(dir, 'menu.mp3sound.mpg');
+        const encoded = run(
+          tools.ffmpeg,
+          author.buildMenuStillArgs({
+            inputPng: png,
+            outputVob: menuVob,
+            videoFormat: 'ntsc',
+            audioPath: song,
+            seconds: 5,
+          })
+        );
+        assertEqual(encoded.code, 0, `A menu with an MP3 failed:\n${encoded.stderr}`);
+
+        const menu = await probeMod.probeVideo(tools.ffprobe, menuVob);
+        assertEqual(menu.audioCodec, 'ac3', 'And it comes out of the menu as AC-3');
+        assertEqual(Number(menu.audioSampleRate), 48000, 'At 48 kHz, resampled from 44.1');
+      }
+
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
     await test('the menu fills the whole frame instead of being pillarboxed', async () => {
       /*
         The menu design is drawn on the DVD raster already, so it must be

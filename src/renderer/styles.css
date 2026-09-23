@@ -1613,6 +1613,60 @@ body.wide-stage .rail {
   background-repeat: no-repeat;
 }
 
+/*
+   The way out of a chosen background picture.
+
+   Removing it used to be a grey button underneath, indistinguishable from the
+   ones beside it and nowhere near the thing it removed. Hovering the picture now
+   covers it with a cross: the control sits on what it acts on, and it cannot be
+   pressed by accident because it is not there until the pointer is.
+*/
+.bg-preview-wrap {
+  position: relative;
+  display: block;
+}
+
+.bg-preview-remove {
+  position: absolute;
+  inset: 0 0 8px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: rgba(16, 15, 14, 0.72);
+  color: var(--paper);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 110ms ease, border-color 110ms ease;
+}
+
+.bg-preview-wrap:hover .bg-preview-remove,
+.bg-preview-remove:focus-visible {
+  opacity: 1;
+}
+
+.bg-preview-remove:hover {
+  border-color: var(--danger);
+}
+
+.bg-preview-x {
+  font-size: 22px;
+  line-height: 1;
+  font-weight: 600;
+  /* A disc, so the cross reads as a button rather than as a letter on the
+     picture — which is exactly how it looked without this. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgba(196, 104, 92, 0.92);
+  color: #fff;
+}
+
 /* The background picture block doubles as a drop target. It is given a dashed
    edge all the time so it reads as somewhere a file can land, not only while
    something is already being dragged. */
@@ -1634,6 +1688,72 @@ body.wide-stage .rail {
 
 .bg-drop-active .bg-preview {
   border-color: var(--amber);
+}
+
+/* ------------------------------------------------------------- menu sound --- */
+
+.sound-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 9px;
+  margin-bottom: 8px;
+  border: 1px solid var(--ink-line);
+  border-radius: var(--radius);
+  background: var(--ink-sunken);
+}
+
+.sound-mark {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--amber-dim);
+  color: var(--paper);
+  font-size: 14px;
+}
+
+.sound-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.sound-name {
+  display: block;
+  font-size: 12.5px;
+  /* A filename is long and the panel is narrow. Cut it rather than wrap it: the
+     full path is in the tooltip, and a two-line filename would push the buttons
+     off the panel. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sound-meta {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted-dim);
+}
+
+/* The note on a slide card in the filmstrip, for a page that has a sound. */
+.slide-card-sound {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--amber-dim);
+  color: var(--paper);
+  font-size: 11px;
+  line-height: 1;
 }
 
 /* ==========================================================================

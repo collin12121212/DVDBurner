@@ -899,6 +899,355 @@ async function run() {
     `its slide was a page ${unlinked.before} time, then ${unlinked.after}`
   );
 
+  // ------------------------------------------------- selecting several ---
+  console.log('\nSelecting several elements at once');
+
+  await js(`window.__burnhouseTest.createNewProject('Multi', 'charcoal')`);
+  await settle(700);
+
+  const placed = await js(`(() => {
+    const a = window.__burnhouseTest.addElement('text', { text: 'One', x: 60, y: 120, width: 200, height: 60 });
+    const b = window.__burnhouseTest.addElement('text', { text: 'Two', x: 60, y: 220, width: 200, height: 60 });
+    const c = window.__burnhouseTest.addElement('text', { text: 'Three', x: 60, y: 320, width: 200, height: 60 });
+    return { a: a.id, b: b.id, c: c.id };
+  })()`);
+  await settle(900);
+
+  /**
+   * Press a point on the canvas, optionally with a modifier.
+   *
+   * `mods` is injected as source text — `'ctrlKey: true'` — rather than as an
+   * object, because it has to end up inside the event the page constructs.
+   */
+  const pressCanvas = (x, y, mods = '') => js(`(() => {
+    const canvas = document.getElementById('slideCanvas');
+    const rect = canvas.getBoundingClientRect();
+    const at = {
+      clientX: rect.left + (${x} / 720) * rect.width,
+      clientY: rect.top + (${y} / 480) * rect.height,
+    };
+    canvas.dispatchEvent(new PointerEvent('pointerdown', {
+      bubbles: true, pointerId: 1, isPrimary: true, button: 0, buttons: 1, ...at, ${mods}
+    }));
+    document.dispatchEvent(new PointerEvent('pointerup', {
+      bubbles: true, pointerId: 1, isPrimary: true, button: 0, ...at, ${mods}
+    }));
+    return window.__burnhouseTest.selection();
+  })()`);
+
+  const firstPick = await pressCanvas(120, 150);
+  record(
+    firstPick.length === 1 && firstPick[0] === placed.a,
+    'a plain click selects one element',
+    firstPick.join(', ')
+  );
+
+  /*
+    The gesture the whole feature is for: hold a modifier and click a second
+    thing. Ctrl on Windows, Cmd on a Mac, and Shift on both — all three are
+    accepted, because Ctrl-click is the system's right-click on macOS and a
+    feature reachable only that way would be unreachable there.
+  */
+  const withCtrl = await pressCanvas(120, 250, 'ctrlKey: true');
+  record(
+    withCtrl.length === 2 && withCtrl.includes(placed.a) && withCtrl.includes(placed.b),
+    'ctrl-click adds a second element to the selection',
+    withCtrl.join(', ')
+  );
+
+  const withShift = await pressCanvas(120, 350, 'shiftKey: true');
+  record(withShift.length === 3, 'shift-click adds a third', withShift.join(', '));
+
+  const toggledOff = await pressCanvas(120, 250, 'ctrlKey: true');
+  record(
+    toggledOff.length === 2 && !toggledOff.includes(placed.b),
+    'clicking a selected element again takes it back out',
+    toggledOff.join(', ')
+  );
+
+  // A plain click starts over, which is how you get out of a multiple selection.
+  const reset = await pressCanvas(120, 150);
+  record(reset.length === 1, 'a plain click clears the rest', reset.join(', '));
+
+  // ------------------------------------ changing a property on all of them ---
+  console.log('\nChanging a property they all have');
+
+  await js(`(async () => {
+    const ids = ${JSON.stringify([placed.a, placed.b, placed.c])};
+    const canvas = document.getElementById('slideCanvas');
+    const rect = canvas.getBoundingClientRect();
+    const press = (x, y, mods) => {
+      const at = {
+        clientX: rect.left + (x / 720) * rect.width,
+        clientY: rect.top + (y / 480) * rect.height,
+      };
+      canvas.dispatchEvent(new PointerEvent('pointerdown', {
+        bubbles: true, pointerId: 1, isPrimary: true, button: 0, buttons: 1, ...at, ...mods,
+      }));
+      document.dispatchEvent(new PointerEvent('pointerup', {
+        bubbles: true, pointerId: 1, isPrimary: true, button: 0, ...at, ...mods,
+      }));
+    };
+    press(120, 150, {});
+    press(120, 250, { ctrlKey: true });
+    press(120, 350, { ctrlKey: true });
+    return ids.length;
+  })()`);
+  await settle(700);
+
+  const panel = await js(`(() => {
+    const rows = [...document.querySelectorAll('#inspector .prop-row')];
+    return {
+      heading: (document.querySelector('#inspector .rail-title') || {}).textContent || '',
+      props: rows.map((r) => r.dataset.prop),
+      hint: (document.querySelector('#inspector .prop-hint') || {}).textContent || '',
+    };
+  })()`);
+
+  record(panel.heading === '3 elements', 'the panel says how many are selected', panel.heading);
+  record(panel.props.includes('width'), 'and offers a property they all have', panel.props.join(', '));
+  record(
+    !panel.props.includes('text'),
+    'but not one that is each element\u2019s own'
+  );
+
+  // Change the width through the real control, and it must land on all three —
+  // and only on those three. A new project's menu slide carries a title, so
+  // there is a fourth text element that was never selected and must not move.
+  const applied = await js(`(async () => {
+    const row = [...document.querySelectorAll('#inspector .prop-row')]
+      .find((r) => r.dataset.prop === 'width');
+    const input = row.querySelector('input');
+    input.value = '321';
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 500));
+    return window.__burnhouseTest.elements().filter((e) => e.kind === 'text');
+  })()`);
+  await settle(400);
+
+  const resized = applied.filter((e) => [placed.a, placed.b, placed.c].includes(e.id));
+  const untouched = applied.filter((e) => ![placed.a, placed.b, placed.c].includes(e.id));
+
+  record(
+    resized.length === 3 && resized.every((e) => e.width === 321),
+    'and changing it sets it on every selected element',
+    resized.map((e) => e.width).join(', ')
+  );
+  record(
+    untouched.every((e) => e.width !== 321),
+    'while leaving the element that was not selected alone',
+    untouched.map((e) => e.width).join(', ') || 'none'
+  );
+
+  // Dragging one of a selection takes the rest with it.
+  const moved = await js(`(async () => {
+    const ids = ${JSON.stringify([placed.a, placed.b, placed.c])};
+    const read = () =>
+      window.__burnhouseTest.elements()
+        .filter((e) => ids.includes(e.id))
+        .map((e) => ({ id: e.id, x: e.x }));
+    const before = read();
+
+    const canvas = document.getElementById('slideCanvas');
+    const rect = canvas.getBoundingClientRect();
+    const to = (x, y) => ({
+      clientX: rect.left + (x / 720) * rect.width,
+      clientY: rect.top + (y / 480) * rect.height,
+    });
+    const from = to(120, 150);
+    const dest = to(200, 150);
+    const pointer = (type, at, extra) => new PointerEvent(type, {
+      bubbles: true, pointerId: 1, isPrimary: true, ...at, ...extra,
+    });
+    canvas.dispatchEvent(pointer('pointerdown', from, { button: 0, buttons: 1 }));
+    document.dispatchEvent(pointer('pointermove', dest, { buttons: 1 }));
+    document.dispatchEvent(pointer('pointerup', dest, { button: 0 }));
+    await new Promise((r) => setTimeout(r, 400));
+
+    return { before, after: read(), id: ids[0] };
+  })()`);
+  await settle(400);
+
+  const movedIds = moved.after.map((e) => e.id);
+  record(
+    movedIds.length === 3 && movedIds.includes(moved.id),
+    'the selection survives being dragged',
+    movedIds.join(', ')
+  );
+  record(
+    moved.after.every((e) => {
+      const was = moved.before.find((b) => b.id === e.id);
+      return was && e.x === was.x + 80;
+    }),
+    'and every selected element moves by the same amount',
+    `${moved.before.map((e) => e.x).join(',')} then ${moved.after.map((e) => e.x).join(',')}`
+  );
+
+  // ------------------------------------------------------------------------
+  // ------------------------------------------- putting a sound on a page ---
+  console.log('\nPutting a sound on a menu page');
+
+  await js(`window.__burnhouseTest.createNewProject('Sounding', 'charcoal')`);
+  await settle(700);
+
+  /*
+    A real sound file, written where the app can read it.
+
+    WAV for the same reason as the other suites: writing an MP3 needs an external
+    library that not every ffmpeg build carries, and this must pass on any of them.
+  */
+  const tunePath = path.join(sandbox, 'tune.wav');
+  const tuneMade = spawnSync(
+    process.env.BURNHOUSE_FFMPEG || 'ffmpeg',
+    [
+      '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100:duration=6',
+      '-c:a', 'pcm_s16le', tunePath,
+    ],
+    { windowsHide: true }
+  );
+
+  if (tuneMade.status !== 0 || !fs.existsSync(tunePath)) {
+    record(true, 'a sound file to test with', 'ffmpeg could not make one, skipping the sound checks');
+  } else {
+    const toolbar = await js(
+      `[...document.querySelectorAll('#editorToolbar button')].map((b) => b.textContent.trim())`
+    );
+    record(
+      toolbar.some((label) => /sound/i.test(label)),
+      'the toolbar offers a sound',
+      toolbar.join(' | ')
+    );
+
+    // Nothing chosen yet.
+    const beforeSound = await js(`window.__burnhouseTest.slideAudio()`);
+    record(beforeSound === null, 'a new slide is silent', String(beforeSound));
+
+    /*
+      Dropping the file on the slide, which is the gesture asked for — it goes
+      through the same path a drop from Finder takes, minus the drag itself.
+    */
+    const afterDropSound = await js(
+      `(async () => {
+         await window.__burnhouseTest.importPathsOntoSlide([${JSON.stringify(tunePath)}]);
+         await new Promise((r) => setTimeout(r, 600));
+         return window.__burnhouseTest.slideAudio();
+       })()`
+    );
+    await settle(500);
+
+    record(
+      afterDropSound && afterDropSound.path === tunePath,
+      'dropping a sound file on a slide sets the page sound',
+      afterDropSound ? afterDropSound.fileName : 'nothing'
+    );
+    record(
+      afterDropSound && afterDropSound.seconds > 5,
+      'with the length of the file, so the page knows how long it runs',
+      afterDropSound ? `${afterDropSound.seconds}s` : 'nothing'
+    );
+
+    const soundNotice = await js(`window.__burnhouseTest.banner()`);
+    record(
+      !soundNotice || !/not videos/i.test(soundNotice.title || ''),
+      'and a sound is not mistaken for a video',
+      soundNotice ? soundNotice.title : 'no notice'
+    );
+
+    // The panel shows it, with a way to hear it and a way to remove it.
+    const soundPanel = await js(`(() => {
+      const name = document.querySelector('#inspector .sound-name');
+      const buttons = [...document.querySelectorAll('#inspector .btn-row button')].map((b) => b.textContent.trim());
+      const mark = document.querySelector('.slide-card-sound');
+      return { name: name ? name.textContent : null, buttons, hasMark: Boolean(mark) };
+    })()`);
+    record(soundPanel.name === 'tune.wav', 'the panel names the sound', String(soundPanel.name));
+    record(
+      soundPanel.buttons.some((b) => /listen/i.test(b)),
+      'offers to play it',
+      soundPanel.buttons.join(' | ')
+    );
+    record(soundPanel.hasMark, 'and the slide in the list is marked as having a sound');
+
+    // It reaches the disc model, which is what the burn is built from.
+    const onDisc = await js(`window.__burnhouseTest.discButtons().then(() => window.__burnhouseTest.slideAudio())`);
+    record(
+      onDisc && onDisc.path === tunePath,
+      'and it is still there when the deck is turned into a disc',
+      onDisc ? onDisc.fileName : 'nothing'
+    );
+  }
+
+  // ------------------------------------- taking a background picture off ---
+  console.log('\nTaking a custom background picture off');
+
+  const background = await js(`(() => {
+    // A real picture, made in the page so it is genuinely decodable. Only the
+    // data URL comes back: the page may not fetch it (its content policy allows
+    // no connections at all), and the file is written from here instead.
+    const canvas = document.createElement('canvas');
+    canvas.width = 320; canvas.height = 200;
+    const c = canvas.getContext('2d');
+    c.fillStyle = '#7a4a2c';
+    c.fillRect(0, 0, 320, 200);
+    return canvas.toDataURL('image/png');
+  })()`);
+
+  const backgroundPath = path.join(sandbox, 'backdrop.png');
+  fs.writeFileSync(backgroundPath, Buffer.from(String(background).split(',')[1], 'base64'));
+
+  const setBackground = await js(
+    `(async () => {
+       const ok = await window.__burnhouseTest.setSlideBackground(${JSON.stringify(backgroundPath)});
+       await new Promise((r) => setTimeout(r, 500));
+       return { ok, has: window.__burnhouseTest.hasSlideBackground() };
+     })()`
+  );
+  await settle(500);
+
+  record(
+    setBackground.has === true,
+    'a picture can be set as the slide background',
+    String(setBackground.has)
+  );
+
+  /*
+    The control asked for: hovering the picture covers it with a cross, and
+    pressing that takes the picture away. Nothing else on the panel removes it,
+    so if this button is missing there is no way out.
+  */
+  const removeButton = await js(`(() => {
+    const button = document.querySelector('#inspector .bg-preview-remove');
+    if (!button) return { present: false };
+    return {
+      present: true,
+      label: button.getAttribute('aria-label'),
+      text: button.textContent.trim(),
+      // It sits on the picture, which is the whole point: the control is on the
+      // thing it acts on rather than being another grey button underneath.
+      insidePreview: Boolean(button.closest('.bg-preview-wrap')),
+    };
+  })()`);
+
+  record(removeButton.present, 'the background picture has a remove control');
+  record(
+    removeButton.insidePreview === true,
+    'and it sits on the picture itself'
+  );
+
+  const removed = await js(`(async () => {
+    document.querySelector('#inspector .bg-preview-remove').click();
+    await new Promise((r) => setTimeout(r, 500));
+    return {
+      has: window.__burnhouseTest.hasSlideBackground(),
+      buttonGone: !document.querySelector('#inspector .bg-preview-remove'),
+    };
+  })()`);
+  await settle(500);
+
+  record(removed.has === false, 'pressing it removes the custom background');
+  record(removed.buttonGone, 'and the control goes with it');
+
   // --------------------------------------------- one folder per project ---
   //
   // The prepared disc is looked up by project, so the two things that decide

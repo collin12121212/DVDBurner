@@ -1169,6 +1169,165 @@ test('a picture pointed at a slide holding a film plays the film', () => {
   assertEqual(model.menus[0].buttons[1].command, 'jump menu 3;', 'The other opens the page');
 });
 
+// ------------------------------------------------------------ menu sound ---
+
+section('A sound on a menu page');
+
+test('a slide with no sound has none, and one with a sound keeps it', () => {
+  const deckModel = require('../src/core/deck');
+
+  const silent = deckModel.makeSlide({ title: 'Silent' });
+  assertEqual(silent.audio, null, 'A new slide is silent');
+
+  const withSound = deckModel.makeSlide({
+    title: 'Music',
+    audio: { path: '/music/song.mp3', fileName: 'song.mp3', duration: 42 },
+  });
+  assertEqual(withSound.audio.path, '/music/song.mp3', 'The file is remembered');
+  assertEqual(withSound.audio.fileName, 'song.mp3', 'And its name, for the panel');
+  assertEqual(withSound.audio.seconds, 42, 'A short sound plays in full');
+
+  // Through normalising, which is what a saved deck and every main-process view
+  // does — a sound dropped on the way in would be a silent disc.
+  const round = deckModel.normaliseDeck({ slides: [withSound] });
+  assertEqual(round.slides[0].audio.path, '/music/song.mp3', 'And survives normalising');
+});
+
+test('a sound longer than a menu may run is trimmed, not refused', () => {
+  const deckModel = require('../src/core/deck');
+  const cap = deckModel.MENU_SOUND_MAX_SECONDS;
+
+  const long = deckModel.makeSlide({
+    audio: { path: '/music/album.flac', duration: cap * 4 },
+  });
+  assertEqual(long.audio.duration, cap * 4, 'The real length is kept, so it can be said');
+  assertEqual(long.audio.seconds, cap, 'But only the cap will play');
+
+  // A length that could not be read at all still yields a usable page rather
+  // than a zero-length motion menu, which is a disc that misbehaves.
+  const unknown = deckModel.makeSlide({ audio: { path: '/music/odd.ogg' } });
+  assertEqual(unknown.audio.duration, 0, 'An unreadable length is zero');
+  assertEqual(unknown.audio.seconds, cap, 'And the page runs for the cap');
+});
+
+test('a sound with no file is the same as no sound', () => {
+  const deckModel = require('../src/core/deck');
+  for (const audio of [null, undefined, {}, { fileName: 'x.mp3' }, { path: '   ' }]) {
+    assertEqual(
+      deckModel.makeSlide({ audio }).audio,
+      null,
+      `audio ${JSON.stringify(audio)} should not become a sound`
+    );
+  }
+});
+
+test('a menu page carries its slide sound, and a silent one carries none', () => {
+  const deckModel = require('../src/core/deck');
+  const dvdModel = require('../src/core/dvd_model');
+
+  const slides = [
+    deckModel.makeSlide({
+      id: 'one',
+      title: 'One',
+      role: 'menu',
+      audio: { path: '/music/a.mp3', fileName: 'a.mp3', duration: 30 },
+      elements: [deckModel.makeButtonElement({ id: 'b1', label: 'Next', targetSlideId: 'two' })],
+    }),
+    deckModel.makeSlide({
+      id: 'two',
+      title: 'Two',
+      role: 'menu',
+      elements: [deckModel.makeButtonElement({ id: 'b2', label: 'Back', targetSlideId: 'one' })],
+    }),
+  ];
+
+  const model = dvdModel.buildDiscModel({
+    deck: { discTitle: 'T', themeId: 'charcoal', slides },
+    videos: [],
+  });
+
+  assertEqual(model.menus.length, 2, 'Both slides are pages');
+  assertEqual(model.menus[0].sound.path, '/music/a.mp3', 'The first page has its sound');
+  assertEqual(model.menus[0].sound.seconds, 30, 'With the length that will play');
+  assertEqual(model.menus[1].sound, null, 'The silent page has none');
+
+  // And a page whose sound has no usable length is treated as silent rather than
+  // becoming a motion menu of no length.
+  assertEqual(dvdModel.soundFor({ audio: { path: '/x.mp3', seconds: 0, duration: 0 } }), null, 'No length, no sound');
+  assertEqual(dvdModel.soundFor({}), null, 'No audio at all, no sound');
+});
+
+test('the menu encoder holds the still with prediction when there is sound', () => {
+  const author = require('../src/core/author');
+
+  const silent = author.buildMenuStillArgs({
+    inputPng: 'menu.png',
+    outputVob: 'menu.mpg',
+    videoFormat: 'ntsc',
+  }).join(' ');
+
+  const sounded = author.buildMenuStillArgs({
+    inputPng: 'menu.png',
+    outputVob: 'menu.mpg',
+    videoFormat: 'ntsc',
+    audioPath: '/music/song.mp3',
+    seconds: 90,
+  }).join(' ');
+
+  // Silent pages stay all-intra: instant to seek, and at one second it costs
+  // nothing. A sounded page held for a minute and a half at that rate would be
+  // hundreds of megabytes, so it uses ordinary prediction instead.
+  assert(silent.includes('-bf 0'), 'A silent menu is encoded all-intra');
+  assert(silent.includes('anullsrc'), 'And carries a silent track so the DVD muxer can work');
+  assert(!silent.includes('-map 1:a:0'), 'With nothing else mapped in');
+
+  assert(sounded.includes('-bf 2'), 'A menu with sound predicts from the previous frame');
+  assert(sounded.includes('-map 1:a:0'), 'And takes its audio from the chosen file');
+  assert(!sounded.includes('anullsrc'), 'Instead of generating silence');
+  assert(sounded.includes('-c:a ac3'), 'The sound is AC-3, which is what a DVD menu may carry');
+  assert(sounded.includes('-ar 48000'), 'At 48 kHz, which is mandatory');
+  assert(sounded.includes('-t 90'), 'And runs for the length the disc model settled on');
+
+  // The picture quality of the one frame that matters is not given up for it.
+  assert(sounded.includes('-b:v 9800000'), 'The still is still encoded at the maximum still rate');
+});
+
+test('a sound does not change the disc fingerprint by being played once', () => {
+  const deckModel = require('../src/core/deck');
+
+  // The sound lives in the deck, and the deck is fingerprinted — so choosing or
+  // removing one makes a prepared disc out of date, which is what has to happen
+  // for the change to reach a burned disc.
+  const root = tmpdir('sound-fingerprint');
+  const file = sourceFile(root, 'a.mp4');
+  const video = { path: file, duration: 600, name: 'a.mp4', menuLabel: '' };
+  const base = () => ({
+    id: 'proj',
+    videos: [video],
+    discTitle: 'Trip',
+    deck: {
+      discTitle: 'Trip',
+      themeId: 'charcoal',
+      slides: [
+        deckModel.makeSlide({
+          id: 's1',
+          title: 'Menu',
+          role: 'menu',
+          elements: [deckModel.makeButtonElement({ id: 'b', label: 'Go', targetSlideId: 's2' })],
+        }),
+        deckModel.makeSlide({ id: 's2', title: 'Two', role: 'menu' }),
+      ],
+    },
+  });
+
+  const without = pipeline.projectFingerprint(pipeline.normaliseProject(base()));
+  const payload = base();
+  payload.deck.slides[0].audio = { path: '/music/a.mp3', duration: 30 };
+  const withSound = pipeline.projectFingerprint(pipeline.normaliseProject(payload));
+
+  assert(withSound !== without, 'Adding a sound must make a prepared disc out of date');
+});
+
 // --------------------------------------------------------------------- go ---
 
 console.log('');

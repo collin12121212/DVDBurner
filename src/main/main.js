@@ -302,6 +302,22 @@ function registerIpc() {
     return { canceled: false, path: result.filePaths[0] };
   });
 
+  handle('dialog:pick-audio', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose a sound for this menu page',
+      buttonLabel: 'Use This Sound',
+      properties: ['openFile'],
+      filters: [
+        {
+          name: 'Sounds',
+          extensions: ['mp3', 'm4a', 'aac', 'wav', 'aif', 'aiff', 'ogg', 'oga', 'opus', 'flac', 'wma'],
+        },
+      ],
+    });
+    if (result.canceled) return { canceled: true, path: null };
+    return { canceled: false, path: result.filePaths[0] };
+  });
+
   handle('dialog:save-image', async (defaultName) => {
     const result = await dialog.showSaveDialog(mainWindow, {
       title: 'Save the disc image',
@@ -323,6 +339,36 @@ function registerIpc() {
   handle('files:read-image', async (target) => {
     if (!target) throw new Error('No picture was chosen.');
     return deckRender.readImageAsDataUrl(target);
+  });
+
+  /**
+   * How long a sound is, so the editor can say what will play and the build can
+   * work out how long the menu page will be.
+   *
+   * Read here rather than in the renderer because it needs ffprobe, and reported
+   * as a plain duration rather than an error the moment anything is odd: a sound
+   * whose length cannot be measured is still usable, it just becomes a menu page
+   * at the longest length that is allowed.
+   */
+  handle('files:probe-audio', async (target) => {
+    if (!target) throw new Error('No sound was chosen.');
+    const settings = settingsStore.read();
+    tools = detectTools(settings);
+    if (!tools.ffprobe) {
+      return { path: target, name: path.basename(target), duration: 0, codec: null, unreadable: true };
+    }
+    try {
+      return await probeMod.probeAudio(tools.ffprobe, target);
+    } catch (err) {
+      return {
+        path: target,
+        name: path.basename(target),
+        duration: 0,
+        codec: null,
+        unreadable: true,
+        error: String(err.message || err),
+      };
+    }
   });
 
   /**
@@ -392,6 +438,9 @@ function registerIpc() {
     textSizes: deckModel.TEXT_SIZES,
     buttonStyles: slideLayout.BUTTON_STYLES,
     maxButtonsPerSlide: deckModel.MAX_BUTTONS_PER_SLIDE,
+    // How long a menu page's sound may run. The deck enforces it on the way in
+    // and the editor quotes it, so the two cannot disagree about what will play.
+    menuSoundMaxSeconds: deckModel.MENU_SOUND_MAX_SECONDS,
     safeMargin: deckModel.SAFE_MARGIN,
     raster: deckModel.RASTER,
     // The bounds a typed text size is clamped to. The editor shows them on the

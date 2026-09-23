@@ -428,8 +428,21 @@ function even(n) {
  * `interlace=tff` matches the titles' field order. A menu that disagrees with
  * the titles makes some televisions re-sync between the menu and the film,
  * which shows up as a black flicker.
+ *
+ * With `audioPath` the page becomes a motion menu: the same still frame is held
+ * for as long as the sound runs, and the player waits for the remote afterwards
+ * exactly as it did before. That changes one thing about the encoder — see the
+ * note on the GOP below — because a still held for a minute and a half is a very
+ * different thing to encode from a still held for one second.
  */
-function buildMenuStillArgs({ inputPng, outputVob, videoFormat, seconds = 1, aspect = '16:9' }) {
+function buildMenuStillArgs({
+  inputPng,
+  outputVob,
+  videoFormat,
+  seconds = 1,
+  aspect = '16:9',
+  audioPath = null,
+}) {
   const isPal = String(videoFormat).toLowerCase() === 'pal';
   const width = 720;
   const height = isPal ? 576 : 480;
@@ -439,36 +452,65 @@ function buildMenuStillArgs({ inputPng, outputVob, videoFormat, seconds = 1, asp
   // 4:3 displays the same raster as 640x480, so 8/9.
   const sar = is169 ? (isPal ? '64/45' : '32/27') : (isPal ? '16/15' : '8/9');
 
-  return [
+  const hold = Math.max(1, Math.round(Number(seconds) || 1));
+  const hasSound = Boolean(audioPath);
+
+  const args = [
     '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
     '-loop', '1',
     '-framerate', String(fps),
     '-i', inputPng,
-    /*
-      A silent audio track, so the menu can go through the DVD muxer.
+  ];
 
-      This is not decoration: the DVD muxer is what writes the navigation packs
-      that make a file a VOB, and dvdauthor locates its VOBUs by those packs. A
-      video-only program stream has no nav packs at all, so dvdauthor walked the
-      file, found nothing it recognised and stopped with "no VOBUs found" — the
-      whole reason a menu could never be built. A menu with a silent track is
-      also what every commercial disc has.
+  if (hasSound) {
+    /*
+      The chosen sound, in place of the silence.
+
+      A menu page has one sound track, so this is the whole of what a menu can
+      do with audio — no mixing, no second track.
     */
-    '-f', 'lavfi',
-    '-t', String(seconds),
-    '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
-    // Menu stills are encoded all-intra at the maximum legal still rate:
-    // instant to seek, no motion artefacts around text, and the headroom is
-    // free since a still is kilobytes.
+    args.push('-i', audioPath, '-map', '0:v:0', '-map', '1:a:0');
+  } else {
+    args.push(
+      /*
+        A silent audio track, so the menu can go through the DVD muxer.
+
+        This is not decoration: the DVD muxer is what writes the navigation packs
+        that make a file a VOB, and dvdauthor locates its VOBUs by those packs. A
+        video-only program stream has no nav packs at all, so dvdauthor walked the
+        file, found nothing it recognised and stopped with "no VOBUs found" — the
+        whole reason a menu could never be built. A menu with a silent track is
+        also what every commercial disc has.
+      */
+      '-f', 'lavfi',
+      '-t', String(hold),
+      '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000'
+    );
+  }
+
+  args.push(
     '-vf',
     `scale=${width}:${height}:flags=lanczos:in_range=tv:out_range=tv,` +
       `setsar=${sar},format=yuv420p,interlace=tff`,
     '-c:v', 'mpeg2video',
+    /*
+      The headline bitrate stays at the maximum legal still rate either way, and
+      that is deliberate: it is what the one frame that carries the whole design
+      is encoded at, so the menu is as sharp as a DVD allows.
+
+      What changes with sound is the GOP. A one-second menu is encoded all-intra,
+      which is instant to seek and cost nothing at that length. Held for a minute
+      and a half it would cost the same nine megabits *per frame* — hundreds of
+      megabytes of disc for a picture that never changes. With ordinary
+      prediction the first frame still gets the full bitrate and every frame after
+      it is the same picture again, so it costs almost nothing and looks
+      identical.
+    */
     '-b:v', '9800000',
     '-maxrate', '9800000',
     '-bufsize', '1835008',
     '-g', isPal ? '15' : '18',
-    '-bf', '0',
+    '-bf', hasSound ? '2' : '0',
     '-intra_dc_precision', '2',
     '-intra_vlc', '1',
     '-non_linear_quant', '1',
@@ -482,10 +524,13 @@ function buildMenuStillArgs({ inputPng, outputVob, videoFormat, seconds = 1, asp
     '-b:a', '192000',
     '-ar', '48000',
     '-ac', '2',
+    '-t', String(hold),
     '-shortest',
     '-f', 'dvd',
-    outputVob,
-  ];
+    outputVob
+  );
+
+  return args;
 }
 
 /** Run dvdauthor over a prepared tree, returning the VIDEO_TS directory. */

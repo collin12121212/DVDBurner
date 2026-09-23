@@ -69,6 +69,28 @@ function commandFor(action) {
 }
 
 /**
+ * The sound a menu page plays, or null for a silent page.
+ *
+ * Resolved here rather than at each consumer so the burn, the preview and the
+ * editor all quote the same length — including the trim, which is applied once
+ * and then never recomputed. A page whose sound has no usable length is treated
+ * as silent rather than turned into a zero-length motion menu.
+ */
+function soundFor(slide) {
+  const audio = slide && slide.audio;
+  if (!audio || !audio.path) return null;
+
+  const seconds = Number(audio.seconds) > 0 ? Number(audio.seconds) : Number(audio.duration);
+  if (!(seconds > 0)) return null;
+
+  return {
+    path: audio.path,
+    fileName: audio.fileName || '',
+    seconds: Math.round(seconds * 100) / 100,
+  };
+}
+
+/**
  * Build the disc's navigation graph.
  *
  * @param {object} options
@@ -146,6 +168,9 @@ function buildDiscModel({ deck, videos, aspect = '16:9' }) {
         title: entry.slide.title,
         buttons,
         navigation: dvdNav.navigationObject(buttons),
+        // The page's sound, if the slide has one. Carried on the page because
+        // that is what it belongs to on a disc.
+        sound: soundFor(entry.slide),
       });
     }
 
@@ -236,4 +261,5 @@ module.exports = {
   buildDiscModel,
   actionFor,
   commandFor,
+  soundFor,
 };
