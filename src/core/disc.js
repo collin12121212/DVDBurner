@@ -49,7 +49,7 @@ const exec = (file, args, opts = {}) =>
  * product as "DVDRAM GP65NB60 DH61 USB", and then refused the drive because the
  * support level it compared against was the wrong word entirely.
  */
-const DRUTIL_COLUMNS = ['Vendor', 'Product', 'Rev', 'Bus', 'SupportLevel', 'DeviceNode'];
+const DRUTIL_COLUMNS = ['Vendor', 'Product', 'Rev', 'Bus', 'SupportLevel'];
 
 function drutilColumnStarts(headerLine) {
   const starts = [];
@@ -68,6 +68,7 @@ function drutilColumnStarts(headerLine) {
 
 /** One `drutil list` row, cut into its columns by the header's own positions. */
 function parseDrutilRow(line, starts) {
+  if (!starts || !starts.length) return {};
   const field = {};
   for (let i = 0; i < starts.length; i += 1) {
     const from = starts[i].at;
@@ -107,54 +108,63 @@ function bsdDeviceNode(value) {
 
 function parseDrutilXml(xml) {
   const text = String(xml || '');
-  if (!/<plist|<dict/i.test(text)) return [];
+  if (!/<deviceList|<device/i.test(text)) return [];
+
+  // Just match the attribute in the tag text, e.g. name="hp" in <vendor name="hp"/>.
+  const attr = (tagText, name) => {
+    if (!tagText) return '';
+    const m = new RegExp(`\\b${name}\\s*=\\s*"([^"]*)"`, 'i').exec(tagText);
+    return m ? m[1].trim() : '';
+  };
+
+  /*
+    The tag name has to be interpolated, so this is RegExp() and not a literal.
+
+    Writing `/<${tag}\b.../` looks like interpolation and is not: a regex literal
+    matches those characters verbatim, so it searched for a literal "<${tag}" and
+    found nothing, in every device, on every Mac.
+  */
+  const tagFor = (body, tag) => {
+    const m = new RegExp(`<${tag}\\b[^>]*/?>`, 'i').exec(body);
+    return m ? m[0] : '';
+  };
 
   const drives = [];
-  const dictRe = /<dict>([\s\S]*?)<\/dict>/g;
-  let dictMatch;
+  const deviceRe = /<device\b([^>]*)>([\s\S]*?)<\/device>/gi;
+  let match;
 
-  while ((dictMatch = dictRe.exec(text))) {
-    const fields = {};
-    const pairRe = /<key>([^<]*)<\/key>\s*<([a-zA-Z][a-zA-Z0-9]*)(?:\s[^>]*)?>([\s\S]*?)<\/\2>/g;
-    let pair;
-    while ((pair = pairRe.exec(dictMatch[1]))) {
-      fields[pair[1].trim()] = pair[3].trim();
-    }
-    if (!Object.keys(fields).length) continue;
+  while ((match = deviceRe.exec(text))) {
+    const body = match[2];
 
-    // Key names are matched loosely: macOS has used Vendor/Product/Revision for
-    // years, but the device node in particular has appeared under several names.
-    const pick = (...names) => {
-      for (const name of names) {
-        const key = Object.keys(fields).find((k) => k.toLowerCase() === name.toLowerCase());
-        if (key && fields[key]) return fields[key];
-      }
-      return '';
-    };
+    const vendor = attr(tagFor(body, 'vendor'), 'name');
+    const product = attr(tagFor(body, 'product'), 'name');
+    const revision = attr(tagFor(body, 'firmware'), 'revision');
+    const bus = attr(tagFor(body, 'interconnect'), 'name');
+    const support = attr(tagFor(body, 'support'), 'level');
 
-    let node = bsdDeviceNode(pick('DeviceNode', 'BSDName', 'IOBSDName', 'Device'));
-    if (!node) {
-      // Last resort: any value anywhere in the record that names a disk.
-      for (const value of Object.values(fields)) {
-        node = bsdDeviceNode(value);
-        if (node) break;
-      }
-    }
+    /*
+      The support levels are appleShipping, appleSupported, vendorSupported,
+      unSupported and notSupported.
 
-    const vendor = pick('Vendor', 'VendorName');
-    const product = pick('Product', 'ProductName');
-    const support = pick('SupportLevel', 'Support');
+      Only the last two are a refusal. `vendorSupported` is a third-party drive
+      macOS knows how to write to, and treating an unfamiliar spelling as a
+      refusal is what hid this drive for several rounds: drutil listed it, the
+      app disagreed, and the page said no burner was attached.
+    */
+    // NOT a reason to hide the drive. This very drive reports `unSupported` and
+    // still burns: hdiutil is the authority, and a burn that cannot proceed
+    // fails before writing anything. Gating on this is what greyed out the Burn
+    // button for a writer that works.
 
     drives.push({
-      // With no node we still list the drive: hdiutil picks the only attached
-      // writer itself when it is not told which to use, so a missing node costs
-      // nothing and hiding the drive would cost everything.
-      id: node || `drutil-${drives.length + 1}`,
-      device: node,
+      // drutil does not name a device node at all, so the index it does give is
+      // the only thing to identify a drive by.
+      id: attr(/<device\b([^>]*)>/i.exec(match[0])?.[0] || '', 'index') || `drutil-${drives.length + 1}`,
+      device: '',
       vendor,
       product,
-      rev: pick('Revision', 'Rev', 'ProductRevision'),
-      bus: pick('Bus', 'Protocol', 'PhysicalInterconnect'),
+      rev: revision,
+      bus,
       supportLevel: support,
       writeCapable: true,
       label: [vendor, product].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() || 'Disc writer',
@@ -314,66 +324,48 @@ function parseDrutilList(stdout) {
   const drives = [];
   const lines = String(stdout || '').split('\n');
   const headerLine = lines.find((l) => /Vendor\s+Product/i.test(l)) || '';
-  // Null when the header is not the shape we know, in which case the row
-  // parser below reads the fields by position from the end instead.
+  // Null when the header is not the shape we know. Without one there is no way
+  // to tell a drive row from a line of prose — "No drives found" was being read
+  // as a drive called "found" — so this gives up rather than inventing one. The
+  // XML form above is the one that matters; this is only a fallback.
   const starts = drutilColumnStarts(headerLine);
+  if (!starts) return drives;
 
   for (const line of lines) {
-    if (!/\/dev\/disk\d+/.test(line)) continue;
+    // The real table has no DeviceNode column at all:
+    //   Vendor   Product           Rev   Bus       SupportLevel
+    // so a row is recognised by its shape, not by a device path that is never
+    // there. Requiring /dev/diskN matched nothing, on any Mac, ever.
     if (/^\s*Vendor\s+Product/i.test(line)) continue;
+    if (!/\S/.test(line)) continue;
 
-    const nodeMatch = /(\/dev\/disk\d+)/.exec(line);
-    if (!nodeMatch) continue;
+    // Rows start with the vendor; anything indented past the header's own
+    // "Vendor" column but carrying text is a drive.
+    const fields = starts ? parseDrutilRow(line, starts) : null;
+    const support = fields ? fields.SupportLevel || '' : (/(\S+)\s*$/.exec(line.trim()) || [])[1] || '';
+    const vendor = fields ? fields.Vendor || '' : line.trim().split(/\s+/)[0] || '';
+    const product = fields ? fields.Product || '' : '';
 
-    let vendor = '';
-    let product = '';
-    let rev = '';
-    let bus = '';
-    let support = '';
+    // A header row has no support level worth the name, and a stray line of
+    // prose is not a drive.
+    if (!vendor || /^Vendor$/i.test(vendor)) continue;
+    if (!support && !product) continue;
 
-    if (starts) {
-      const field = parseDrutilRow(line, starts);
-      vendor = field.Vendor || '';
-      product = field.Product || '';
-      rev = field.Rev || '';
-      bus = field.Bus || '';
-      support = field.SupportLevel || '';
-    } else {
-      // No usable header: take the device node off, and the four fields before
-      // it are vendor, product, rev and bus, with the product being everything
-      // between the first token and the last three.
-      const beforeNode = line.slice(0, nodeMatch.index).trim();
-      const supportMatch = /(Apple Shipping|Apple Supported|Unsupported)\s*$/i.exec(beforeNode);
-      support = supportMatch ? supportMatch[1] : '';
-      const head = supportMatch ? beforeNode.slice(0, supportMatch.index).trim() : beforeNode;
-      const parts = head.split(/\s+/);
-      vendor = parts[0] || '';
-      bus = parts.length >= 2 ? parts[parts.length - 1] : '';
-      rev = parts.length >= 3 ? parts[parts.length - 2] : '';
-      product = parts.length >= 4 ? parts.slice(1, parts.length - 2).join(' ') : '';
-    }
-
-    /*
-      A drive drutil lists is a drive it can write to, unless it says otherwise.
-
-      This used to require the support level to read "Apple Shipping" or "Apple
-      Supported" before the drive counted as usable. Anything else — including a
-      level this does not recognise, or none at all — silently made a perfectly
-      good burner invisible, which is a bad failure for a button whose whole job
-      is to write a disc. Only an explicit "Unsupported" is taken at its word.
-    */
-    const unsupported = /Unsupported/i.test(support);
+    // NOT a reason to hide the drive. This very drive reports `unSupported` and
+    // still burns: hdiutil is the authority, and a burn that cannot proceed
+    // fails before writing anything. Gating on this is what greyed out the Burn
+    // button for a writer that works.
 
     drives.push({
-      id: nodeMatch[1],
-      device: nodeMatch[1],
+      id: vendor + (product ? ` ${product}` : ''),
+      device: '',
       vendor,
       product,
-      rev,
-      bus,
+      rev: fields ? fields.Rev || '' : '',
+      bus: fields ? fields.Bus || '' : '',
       supportLevel: support,
-      writeCapable: !unsupported,
-      label: [vendor, product].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() || nodeMatch[1],
+      writeCapable: true,
+      label: [vendor, product].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() || vendor,
     });
   }
 
@@ -732,23 +724,35 @@ async function burnIso({ isoPath, device, hdiutil, onProgress, signal, verify = 
       signal.addEventListener('abort', onAbort, { once: true });
     }
 
+    /*
+      The bar is driven by a clock, not by hdiutil's output.
+
+      hdiutil reports progress as a run of dots rather than percentages, so the
+      estimate below only ever ran when a chunk of output happened to arrive. It
+      advanced once, early, and then sat still for the rest of the burn —
+      reported as frozen at 25% while the disc was writing perfectly well. A
+      timer moves it whatever hdiutil chooses to print, and a real percentage,
+      when there is one, takes precedence.
+    */
+    const assumedBytesPerSecond = 1.35 * 1024 * 1024; // about 1x DVD write
+    let realFraction = 0;
+    const timer = setInterval(() => {
+      if (!onProgress || totalBytes <= 0) return;
+      const elapsed = (Date.now() - started) / 1000;
+      const estimated = (elapsed * assumedBytesPerSecond) / totalBytes;
+      // Never backwards, never finished while still writing, and always
+      // creeping — a bar that stops moving reads as a hang.
+      onProgress(Math.min(0.98, Math.max(realFraction, estimated)));
+    }, 500);
+
     const handle = (chunk) => {
       const text = chunk.toString();
       out = (out + text).slice(-8000);
 
-      // Percentages when hdiutil provides them.
       const pct = /(\d{1,3}(?:\.\d+)?)\s*%/.exec(text);
-      if (pct && onProgress) {
-        return onProgress(Math.min(0.99, Number(pct[1]) / 100));
-      }
-
-      // Otherwise estimate from the CD/DVD write speed. A conservative
-      // "half real speed" estimate keeps the bar from finishing early and
-      // then sitting still, which looks like a hang.
-      if (onProgress && totalBytes > 0) {
-        const elapsed = (Date.now() - started) / 1000;
-        const assumedBytesPerSecond = 1.35 * 1024 * 1024; // ~1x DVD write
-        onProgress(Math.min(0.97, (elapsed * assumedBytesPerSecond) / totalBytes));
+      if (pct) {
+        realFraction = Math.max(realFraction, Math.min(0.99, Number(pct[1]) / 100));
+        if (onProgress) onProgress(realFraction);
       }
     };
 
@@ -758,6 +762,9 @@ async function burnIso({ isoPath, device, hdiutil, onProgress, signal, verify = 
     child.on('error', (err) => reject(new Error(`Could not start burning: ${err.message}`)));
 
     child.on('close', (code) => {
+      // The progress timer outlives the child otherwise, and keeps the process
+      // alive after the burn has finished.
+      clearInterval(timer);
       if (signal && signal.aborted) {
         return reject(new AbortError('Burning was stopped. The disc in the drive may be unusable.'));
       }
