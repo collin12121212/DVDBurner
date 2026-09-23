@@ -108,6 +108,13 @@ contextBridge.exposeInMainWorld('burnhouse', {
     onLog: (handler) => subscribe('job:log', handler),
   },
 
+  // The prepared disc kept on disk between builds: how much room it takes, and
+  // how to get that room back.
+  work: {
+    info: () => call('work:info'),
+    clear: () => call('work:clear'),
+  },
+
   server: {
     start: (payload) => call('server:start', payload),
     stop: () => call('server:stop'),

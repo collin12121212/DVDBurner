@@ -1159,6 +1159,78 @@ async function main() {
       fs.rmSync(dir, { recursive: true, force: true });
     });
 
+    /*
+      The copy path, end to end and against real ffmpeg.
+
+      A title produced by this encoder is, by definition, a legal DVD title — so
+      feeding it back in must take the copy branch, and the picture inside the
+      result must be byte-identical to the picture that went in. That identity is
+      the whole claim being made: same picture, no second generation, no time
+      spent. Anything that quietly re-encoded would still probe as MPEG-2 at
+      720x480 and fail here.
+    */
+    await test('an existing DVD title is copied, not encoded again', async () => {
+      const dir = tmpdir('remux');
+
+      const first = path.join(dir, 'VTS_01_1.VOB');
+      // A long-disc plan, so the source's own bitrate sits comfortably inside
+      // the budget of the disc it is about to go on.
+      const sourcePlan = spec.planBitrate({ totalSeconds: 5400, formatId: 'ntsc' });
+      await encode.encodeTitle({
+        ffmpegPath: tools.ffmpeg,
+        input: fixture,
+        outputVob: first,
+        plan: { ...sourcePlan, hasAudio: true },
+        durationSeconds: 3,
+        aspect: { ratio: '16:9' },
+      });
+
+      const sourceInfo = await probeMod.probeVideo(tools.ffprobe, first);
+      assertEqual(sourceInfo.videoCodec, 'mpeg2video', 'The source really is MPEG-2');
+      assertEqual(sourceInfo.displayAspect, '16:9', 'And it says so in its own stream');
+      assert(sourceInfo.bitrate > 0, `Its bitrate must be readable (got ${sourceInfo.bitrate})`);
+
+      const second = path.join(dir, 'copy.VOB');
+      const result = await encode.encodeTitle({
+        ffmpegPath: tools.ffmpeg,
+        input: first,
+        outputVob: second,
+        // A short disc, so there is plainly room for it.
+        plan: { ...spec.planBitrate({ totalSeconds: 3, formatId: 'ntsc' }), hasAudio: true, probe: sourceInfo },
+        durationSeconds: 3,
+        aspect: { ratio: '16:9' },
+      });
+
+      assertEqual(result.mode, 'copy', `It should have been copied, but: ${result.copyReason}`);
+      assert(fs.existsSync(second), 'A VOB came out the other side');
+
+      const copied = await probeMod.probeVideo(tools.ffprobe, second);
+      assertEqual(copied.width, 720, 'Still 720 wide');
+      assertEqual(copied.height, 480, 'Still 480 tall');
+      assertEqual(copied.videoCodec, 'mpeg2video', 'Still MPEG-2');
+      assertEqual(copied.displayAspect, '16:9', 'Still the shape it was');
+      assertEqual(copied.hasAudio, true, 'And it still has its sound');
+      assertEqual(copied.audioCodec, 'ac3', 'Which is still AC-3');
+      assertEqual(Number(copied.audioSampleRate), 48000, 'At 48 kHz');
+
+      // The picture, stream for stream. This is the assertion that proves the
+      // encoder was not involved: a re-encode cannot reproduce these bytes.
+      const digest = (file) => {
+        const out = spawnSync(
+          tools.ffmpeg,
+          ['-nostdin', '-hide_banner', '-loglevel', 'error', '-i', file, '-map', '0:v:0', '-c:v', 'copy', '-f', 'md5', '-'],
+          { encoding: 'utf8', windowsHide: true }
+        );
+        return String(out.stdout || '').trim();
+      };
+      const before = digest(first);
+      const after = digest(second);
+      assert(/^MD5=/.test(before), `Could not digest the source picture (${before})`);
+      assertEqual(after, before, 'The picture must be identical, bit for bit');
+
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
     await test('the menu still encodes to a legal single-frame stream', async () => {
       // A 720x480 PNG with recognisable blocks, standing in for the canvas.
       const dir = tmpdir('menustill');

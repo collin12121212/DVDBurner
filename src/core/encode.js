@@ -1,21 +1,47 @@
 'use strict';
 
 /**
- * Turning an arbitrary video into a DVD-legal MPEG-2 program stream.
+ * Turning an arbitrary video into a DVD-legal MPEG-2 program stream — or, when
+ * it already is one, not turning it into anything at all.
  *
- * This is the step that used to blow up. Two rules keep it honest:
+ * Three rules keep it honest:
  *
  *   - Every parameter is computed from dvd_spec.js and recorded before the
  *     process starts, so there is no mid-flight decision making.
  *   - ffmpeg is driven directly with an argument array. No shell, no quoting,
  *     so a filename containing an apostrophe cannot break the job.
+ *   - Nothing is done twice. A source that is already a DVD title is copied
+ *     rather than encoded (canRemux), and a title that was prepared on an
+ *     earlier run and has not changed since is not prepared again at all
+ *     (titleFingerprint and the cache below). Both are the difference between
+ *     minutes and seconds, and neither changes a byte of the result.
  */
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 const VIDEO_EXTS = new Set(['.vob', '.mpg', '.mpeg', '.m2v', '.ts', '.mpv']);
+
+/**
+ * The revision of the encoding recipe.
+ *
+ * Bump this whenever buildVideoFilter or buildEncodeArgs changes in a way that
+ * changes the bytes they produce.
+ *
+ * Cached title output is stamped with it and ignored when it does not match, so
+ * a fix in the encoder takes effect on the next build instead of being quietly
+ * skipped because the source file happened to be unchanged. The ghosting fix is
+ * exactly the kind of change that would otherwise have been defeated by its own
+ * cache: same input, same settings, different — correct — output.
+ *
+ *   1  initial
+ *   2  NTSC encodes bottom-field-first, PAL top-field-first
+ */
+const ENCODE_REVISION = 2;
+
+const TITLE_CACHE_FILE = '.encode.json';
 
 /**
  * Remove previous encode output for a title without touching anything else.
@@ -24,6 +50,11 @@ const VIDEO_EXTS = new Set(['.vob', '.mpg', '.mpeg', '.m2v', '.ts', '.mpv']);
  * intermediate from an interrupted run would otherwise still be sitting there
  * when the next run lists the parts, and the disc would be built with a stale
  * file silently appended to it.
+ *
+ * The cache record is deliberately left alone: it is a claim about the files,
+ * not one of them, and readTitleCache refuses any claim whose files do not
+ * match. Deleting it here would only mean the next run cannot tell a finished
+ * encode from an abandoned one.
  */
 function resetOutputDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -32,6 +63,239 @@ function resetOutputDir(dir) {
       fs.rmSync(path.join(dir, entry), { force: true });
     }
   }
+}
+
+/**
+ * Everything that decides what one title's encoded output will be.
+ *
+ * This is the cache key, and it has to be exactly right in both directions.
+ * Too narrow and a changed setting reuses output that no longer matches the
+ * disc — a wrong bitrate, the wrong shape, a stale picture. Too wide and nothing
+ * is ever reused, which is the behaviour this exists to fix.
+ *
+ * It therefore covers the source file and its own measurements, plus every
+ * number buildEncodeArgs reads. It deliberately does NOT cover the disc title,
+ * the slides, the work folder, the tool paths or the app version: none of those
+ * change the bytes of a title, and covering them would re-encode an hour of
+ * video because someone renamed the disc.
+ */
+function titleFingerprint({ input, probe, options, durationSeconds }) {
+  let size = 0;
+  let mtime = 0;
+  try {
+    const stat = fs.statSync(input);
+    size = stat.size;
+    mtime = Math.round(stat.mtimeMs);
+  } catch {
+    // A file that cannot be measured cannot be proven unchanged, and the
+    // fingerprint below will not match anything either way.
+  }
+
+  const canonical = JSON.stringify({
+    revision: ENCODE_REVISION,
+    input: String(input || ''),
+    size,
+    mtime,
+    // `-t` is the length the output is cut or padded to, so a re-measured
+    // duration is a different encode.
+    seconds: Math.max(1, Math.ceil(Number(durationSeconds) || 0)),
+    source: {
+      width: num(probe && probe.width),
+      height: num(probe && probe.height),
+      fps: num(probe && probe.fps),
+      videoCodec: (probe && probe.videoCodec) || null,
+      pixelFormat: (probe && probe.pixelFormat) || null,
+      // Picks the colour matrix conversion, so it changes the picture.
+      colorSpace: (probe && probe.colorSpace) || null,
+      // Decides whether the title can be copied instead of encoded.
+      displayAspect: (probe && probe.displayAspect) || null,
+      bitrate: num(probe && probe.bitrate),
+      audioCodec: (probe && probe.audioCodec) || null,
+      audioChannels: num(probe && probe.audioChannels),
+      audioSampleRate: num(probe && probe.audioSampleRate),
+      hasAudio: Boolean(probe && probe.hasAudio),
+    },
+    options: options || null,
+  });
+
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+function num(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * The encoded output already sitting in a title folder, if it is still good.
+ *
+ * Returns null unless every one of these is true: the record is for this exact
+ * recipe and this exact source, and every VOB it names is present at the length
+ * it was recorded with. That last check is what makes an interrupted run safe —
+ * a half-written VOB has the right name and the wrong size, and reusing it would
+ * put a truncated title on the disc with nothing to show anything was wrong.
+ */
+function readTitleCache(titleDir, fingerprint) {
+  if (!fingerprint) return null;
+
+  let record;
+  try {
+    record = JSON.parse(fs.readFileSync(path.join(titleDir, TITLE_CACHE_FILE), 'utf8'));
+  } catch {
+    return null;
+  }
+
+  if (!record || record.revision !== ENCODE_REVISION) return null;
+  if (record.fingerprint !== fingerprint) return null;
+  if (!Array.isArray(record.parts) || !record.parts.length) return null;
+
+  const parts = [];
+  for (const part of record.parts) {
+    const name = path.basename(String((part && part.name) || ''));
+    if (!name) return null;
+    const file = path.join(titleDir, name);
+
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      return null;
+    }
+    if (!stat.isFile() || stat.size <= 0) return null;
+    if (stat.size !== Number(part.bytes)) return null;
+
+    parts.push({ file, bytes: stat.size });
+  }
+
+  return { parts, mode: record.mode || 'encode', encodedAt: record.encodedAt || null };
+}
+
+/** Note down what is in a title folder, so the next build can skip the work. */
+function writeTitleCache(titleDir, { fingerprint, parts, mode }) {
+  const record = {
+    revision: ENCODE_REVISION,
+    fingerprint,
+    mode: mode || 'encode',
+    encodedAt: new Date().toISOString(),
+    parts: (parts || []).map((part) => ({
+      name: path.basename(part.file),
+      bytes: Number(part.bytes) || 0,
+    })),
+  };
+  try {
+    fs.writeFileSync(path.join(titleDir, TITLE_CACHE_FILE), JSON.stringify(record, null, 2));
+  } catch {
+    // A build that cannot be recorded is still a build. It just cannot be reused.
+  }
+  return record;
+}
+
+/**
+ * Throw away every prepared title, which is what makes the next build do all of
+ * the work again from scratch.
+ */
+function clearTitleCache(root) {
+  const dir = path.join(root, 'titles');
+  fs.rmSync(dir, { recursive: true, force: true });
+  return dir;
+}
+
+/**
+ * Remove title folders past the end of the video list.
+ *
+ * Removing a video from the middle of a project leaves the last folder with
+ * nothing referring to it — a gigabyte of VOBs that will never be looked at
+ * again, sitting in the folder the user was told holds their project.
+ */
+function pruneTitleDirs(root, keep) {
+  const dir = path.join(root, 'titles');
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+
+  let removed = 0;
+  for (const entry of entries) {
+    const m = /^title_(\d+)$/.exec(entry);
+    if (!m) continue;
+    if (Number(m[1]) <= keep) continue;
+    fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+    removed += 1;
+  }
+  return removed;
+}
+
+/**
+ * Whether a source can be copied into the disc instead of encoded.
+ *
+ * A file that already is a DVD title — a .vob out of a VIDEO_TS folder, or
+ * anything a DVD authoring tool produced — is already a legal MPEG-2 program
+ * stream. Its raster, frame rate, GOP structure and field order are what a DVD
+ * requires, because that is where it came from. Sending it back through the
+ * encoder costs the entire run time of the video and throws away a generation of
+ * picture to arrive at very nearly the same bytes.
+ *
+ * The test is deliberately strict, because a copy cannot fix anything. Every one
+ * of these has to be true or the source is encoded, which is only ever slower:
+ *
+ *   - it came from a DVD title file, judged by the extension. This is what
+ *     rules out an arbitrary .mpg whose GOP structure might be anything; a .vob
+ *     is compliant by construction.
+ *   - exactly this raster and frame rate, 4:2:0, and the same display shape,
+ *     because a copy cannot resize, re-time or re-flag any of them.
+ *   - its own bitrate already fits the budget worked out for this disc. A copy
+ *     cannot lower a bitrate, and one title above budget would push the others
+ *     off the disc.
+ *
+ * Field order is not checked because it is not touched: the stream is copied bit
+ * for bit, so whatever the source said, it still says. That is the point.
+ */
+function canRemux(probe, { format, aspect, muxrate } = {}) {
+  const no = (reason) => ({ ok: false, reason });
+  if (!probe || !format) return no('the source has not been read');
+
+  const fromVob =
+    /\.vob$/i.test(String(probe.path || '')) || /vob/i.test(String(probe.formatName || ''));
+  if (!fromVob) return no('not a DVD title file');
+
+  if (String(probe.videoCodec || '').toLowerCase() !== 'mpeg2video') return no('not MPEG-2');
+  if (Number(probe.width) !== Number(format.width) || Number(probe.height) !== Number(format.height)) {
+    return no(`it is ${probe.width}x${probe.height}, not ${format.width}x${format.height}`);
+  }
+  if (probe.pixelFormat && String(probe.pixelFormat).toLowerCase() !== 'yuv420p') {
+    return no(`it stores colour as ${probe.pixelFormat}`);
+  }
+  if (!probe.fps || Math.abs(Number(probe.fps) - Number(format.fps)) > 0.05) {
+    return no(`it runs at ${probe.fps || '?'} frames a second`);
+  }
+
+  const wanted = aspect === '4:3' ? '4:3' : '16:9';
+  if (!probe.displayAspect) return no('its shape could not be read');
+  if (probe.displayAspect !== wanted) return no(`it is ${probe.displayAspect} where this disc is ${wanted}`);
+
+  // Unknown is treated as too big. Guessing the other way would put a title on
+  // the disc at a rate nothing budgeted for.
+  const rate = Number(probe.bitrate) || 0;
+  if (!rate) return no('its bitrate could not be read');
+  /*
+    A little tolerance, because the thing being measured is a file the DVD muxer
+    padded to exactly this rate. A .vob that this program or any other DVD tool
+    produced carries an average bitrate of almost precisely its own mux rate, and
+    ffprobe's figure for it lands a fraction of a percent either side. Refusing
+    those would mean never copying the one kind of source this exists for.
+
+    Two percent of a 10 Mbit/s stream is 200 kbit/s — it can only ever admit a
+    source that is already at the ceiling, which is exactly on budget, and never
+    one that is genuinely over it.
+  */
+  const budget = muxrate ? muxrate * 1.02 : 0;
+  if (budget && rate > budget) {
+    return no('it is at a higher bitrate than this disc has room for');
+  }
+
+  return { ok: true };
 }
 
 /**
@@ -237,10 +501,88 @@ function buildEncodeArgs({ input, outputVob, plan, durationSeconds, aspect }) {
 }
 
 /**
- * Run one encode, reporting progress as a fraction.
+ * The ffmpeg argument list for a title that is copied rather than encoded.
  *
- * Resolves with the list of VOB parts produced, which is what the authoring
- * step needs in order to place chapters.
+ * The picture is passed through untouched. The sound is copied too when it is
+ * already something a DVD allows at the right rate and channel count, and
+ * converted to AC-3 when it is not — an hour of stereo AC-3 takes seconds, so an
+ * awkward soundtrack is never a reason to put the picture back through the
+ * encoder.
+ *
+ * There is no `-vf`, no `-r`, no `-s` and no `-aspect` here on purpose. All four
+ * describe a conversion, and a copy is the absence of one; ffmpeg accepts them
+ * and ignores them, which would leave a reader believing the geometry was being
+ * set when it is the source's own. canRemux has already established that they
+ * would all have been no-ops.
+ */
+function buildRemuxArgs({ input, outputVob, plan, durationSeconds }) {
+  const { muxrate, audioBitrate } = plan;
+  const hasAudio = plan.hasAudio !== false;
+  const wantedChannels = plan.audio.channels;
+  const probe = plan.probe || {};
+
+  const args = [
+    '-nostdin',
+    '-hide_banner',
+    '-y',
+    '-loglevel', 'error',
+    '-progress', 'pipe:1',
+    '-i', input,
+    '-map', '0:v:0',
+  ];
+
+  if (hasAudio) args.push('-map', '0:a:0');
+  args.push('-c:v', 'copy');
+
+  if (!hasAudio) {
+    // A silent track is multiplexed in afterwards by addSilenceTrack, exactly as
+    // it is for an encoded title.
+  } else {
+    const audioCodec = String(probe.audioCodec || '').toLowerCase();
+    const legalToCopy =
+      (audioCodec === 'ac3' || audioCodec === 'mp2') &&
+      Number(probe.audioSampleRate) === 48000 &&
+      Number(probe.audioChannels) === wantedChannels;
+
+    if (legalToCopy) {
+      args.push('-c:a', 'copy');
+    } else {
+      args.push(
+        '-af', buildAudioFilter({ channels: wantedChannels }),
+        '-c:a', 'ac3',
+        '-b:a', `${audioBitrate}`,
+        // 48 kHz is mandatory for DVD-Video, and getting it wrong is audible as
+        // a pitch shift.
+        '-ar', '48000',
+        '-ac', `${wantedChannels}`
+      );
+    }
+  }
+
+  args.push(
+    '-f', 'dvd',
+    '-muxrate', `${muxrate}`,
+    '-preload', '500000',
+    '-t', `${Math.max(1, Math.ceil(durationSeconds))}`,
+    '-shortest',
+    outputVob
+  );
+
+  return args;
+}
+
+/**
+ * Run one title, reporting progress as a fraction.
+ *
+ * Two ways to get there, chosen here rather than by the caller:
+ *
+ *   copy    the source already is a compliant DVD title, so it is remultiplexed
+ *           as it stands. Seconds instead of minutes, and bit for bit.
+ *   encode  anything else, through the full encoder described above.
+ *
+ * Resolves with the list of VOB parts produced, which is what the authoring step
+ * needs in order to place chapters, and with which of the two it was — so the
+ * build log can say what happened rather than leaving it to be inferred.
  */
 function encodeTitle({
   ffmpegPath,
@@ -253,7 +595,17 @@ function encodeTitle({
   signal,
 }) {
   return new Promise((resolve, reject) => {
-    const args = buildEncodeArgs({ input, outputVob, plan, durationSeconds, aspect });
+    const verdict = canRemux(plan.probe || null, {
+      format: plan.format,
+      aspect: aspect && aspect.ratio,
+      muxrate: plan.muxrate,
+    });
+
+    const mode = verdict.ok ? 'copy' : 'encode';
+    const args = verdict.ok
+      ? buildRemuxArgs({ input, outputVob, plan, durationSeconds })
+      : buildEncodeArgs({ input, outputVob, plan, durationSeconds, aspect });
+
     const child = spawn(ffmpegPath, args, { windowsHide: true });
 
     let stderrTail = '';
@@ -332,7 +684,7 @@ function encodeTitle({
       // failed", so surface them rather than discarding them.
       const warnings = extractWarnings(stderrTail);
 
-      resolve({ parts, stderr: stderrTail, warnings });
+      resolve({ parts, stderr: stderrTail, warnings, mode, copyReason: verdict.reason || null });
     });
   });
 }
@@ -441,6 +793,8 @@ class AbortError extends Error {
 module.exports = {
   encodeTitle,
   buildEncodeArgs,
+  buildRemuxArgs,
+  canRemux,
   buildVideoFilter,
   sourceMatrixFor,
   buildAudioFilter,
@@ -449,5 +803,13 @@ module.exports = {
   resetOutputDir,
   describeFfmpegFailure,
   extractWarnings,
+  // Per-title caching: the difference between rebuilding a disc in seconds and
+  // re-encoding every minute of video on it.
+  titleFingerprint,
+  readTitleCache,
+  writeTitleCache,
+  clearTitleCache,
+  pruneTitleDirs,
+  ENCODE_REVISION,
   AbortError,
 };

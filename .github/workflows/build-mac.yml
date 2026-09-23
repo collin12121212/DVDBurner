@@ -60,6 +60,15 @@ jobs:
       - name: Core pipeline tests
         run: npm run test:core
 
+      - name: Reuse and speed tests
+        # The caching that keeps a rebuild from re-encoding an unchanged disc is
+        # the part most likely to fail quietly: get it wrong and the disc is
+        # wrong, not slow. It also runs the real pipeline twice against real
+        # ffmpeg and dvdauthor, which nothing else here does.
+        run: |
+          npm run test:speed
+          npm run test:reuse
+
       - name: Sharing server tests
         run: npm run test:server
 
@@ -213,6 +222,11 @@ jobs:
             for (const k of ['ffmpeg', 'ffprobe', 'dvdauthor', 'spumux']) console.log(k, '->', t[k]);
           "
           npm run test:core
+          # And the same again for the reuse path, so "an unchanged disc is not
+          # re-encoded" is proven with the binaries that actually ship rather than
+          # with Homebrew's newer ones.
+          npm run test:speed
+          npm run test:reuse
 
       - name: Package version
         id: package

@@ -507,6 +507,9 @@ function registerIpc() {
         onLog: ctx.log,
         signal: ctx.signal,
         BrowserWindow,
+        // From the "Clear Working Files" repair in Setup, and available to
+        // anything else that needs to distrust what is on disk.
+        force: Boolean(payload && payload.force),
       });
 
       // Read the finished streams back and confirm they are what was asked for.
@@ -532,6 +535,11 @@ function registerIpc() {
         videoBitrate: built.plan.videoBitrate,
         verification,
         slideProblems: built.slideProblems || [],
+        // How much work this build actually had to do. A rebuild after a failed
+        // burn should be able to say it re-encoded nothing.
+        reusedTitles: built.reusedTitles || 0,
+        copiedTitles: built.copiedTitles || 0,
+        encodedTitles: built.encodedTitles || 0,
       };
     });
 
@@ -634,6 +642,48 @@ function registerIpc() {
       );
     });
     return true;
+  });
+
+  /*
+    How much room the working folder is taking, and a way to empty it.
+
+    It holds a full copy of every disc that has been prepared — the encoded
+    titles, the menu, and the authored VIDEO_TS — and, since titles are now kept
+    between builds rather than thrown away and rewritten, it keeps holding them.
+    On a laptop with a small drive that is worth being able to see, and worth
+    being able to reclaim.
+  */
+  handle('work:info', async () => {
+    const settings = settingsStore.read();
+    const dir = settingsStore.resolveWorkDir(settings);
+    return { dir, bytes: folderSizeDeep(dir), exists: fs.existsSync(dir) };
+  });
+
+  handle('work:clear', async () => {
+    const settings = settingsStore.read();
+    const dir = settingsStore.resolveWorkDir(settings);
+    const bytes = folderSizeDeep(dir);
+
+    const answer = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: ['Keep the Files', 'Delete Them'],
+      defaultId: 0,
+      cancelId: 0,
+      message: 'Delete the prepared disc files?',
+      detail:
+        `Burnhouse has kept ${formatBytes(bytes)} of prepared video in:\n${dir}\n\n` +
+        'Deleting it frees the space. The next build will take the full time again, ' +
+        'and any disc that was ready to burn will have to be built again first. ' +
+        'Nothing you made — your videos, your project, or a disc you have already ' +
+        'burned — is touched.',
+    });
+    if (answer.response !== 1) return { canceled: true, freed: 0 };
+
+    fs.rmSync(dir, { recursive: true, force: true });
+    // The in-session copy points at files that no longer exist. Forgetting it is
+    // what makes the next Build do the work rather than reuse a stale answer.
+    prepared = null;
+    return { canceled: false, freed: bytes, dir };
   });
 
   handle('shell:open', async (target) => {
@@ -745,6 +795,45 @@ function folderSize(dir) {
     /* a missing folder reports zero, which is honest */
   }
   return total;
+}
+
+/**
+ * The same, all the way down.
+ *
+ * The working folder is mostly directories — titles/title_1, menu/slides,
+ * author/VIDEO_TS — so the flat version above would report a few bytes of
+ * build.json and call a four gigabyte folder empty.
+ *
+ * Symlinks are counted as files rather than followed, so a link that happens to
+ * point at a parent cannot send this round the houses.
+ */
+function folderSizeDeep(dir) {
+  let total = 0;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    try {
+      if (entry.isDirectory()) total += folderSizeDeep(full);
+      else total += fs.statSync(full).size;
+    } catch {
+      // A file that vanished mid-walk contributes nothing rather than failing
+      // the whole measurement.
+    }
+  }
+  return total;
+}
+
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} bytes`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} kB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(0)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 function safeSize(file) {

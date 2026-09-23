@@ -105,8 +105,16 @@ async function probeVideo(ffprobePath, filePath) {
     height: height || 0,
     fps,
     interlaced: isInterlaced(video),
+    // "tt"/"bb" for interlaced material, "progressive" otherwise. Recorded
+    // because a source that is already a DVD title is copied rather than
+    // encoded, and then this is the only record of what its fields do.
+    fieldOrder: video.field_order || null,
     videoCodec: video.codec_name || 'unknown',
     pixelFormat: video.pix_fmt || null,
+    // The shape the picture is meant to be seen in, which for DVD is carried in
+    // the anamorphic sample aspect ratio rather than in the pixel count: a
+    // 720x480 frame is 16:9 or 4:3 depending only on that flag.
+    displayAspect: displayAspectOf(video),
     // Colour metadata, so the encoder can convert HD's BT.709 matrix to the
     // BT.601 matrix a DVD expects. Without this, HD sources come out with a
     // visible colour shift — reds go orange. Nulls mean "unknown", in which
@@ -154,6 +162,35 @@ function isInterlaced(video) {
   return order === 'tt' || order === 'bb' || order === 'tb' || order === 'bt';
 }
 
+/**
+ * The shape a video is meant to be displayed in, as "16:9", "4:3" or null.
+ *
+ * Two sources, in order of reliability. ffprobe usually works it out and calls
+ * it `display_aspect_ratio`, but it is absent often enough — an MPEG-2 stream
+ * with no sequence display extension, a container that never recorded one — that
+ * the sample aspect ratio has to be the fallback.
+ *
+ * For a DVD that flag is the whole answer: 720x480 pixels with a 32:27 sample
+ * aspect ratio is widescreen, and the same pixels at 8:9 are not. Multiplying it
+ * out and comparing against the two shapes a DVD can carry is what distinguishes
+ * them; anything that is neither — 2.39:1 scope, an odd square-pixel capture —
+ * reports null rather than being forced into a shape it does not have.
+ */
+function displayAspectOf(video) {
+  const stated = String(video.display_aspect_ratio || '').trim();
+  if (stated === '16:9' || stated === '4:3') return stated;
+
+  const sar = parseRational(video.sample_aspect_ratio);
+  const width = numberOrNull(video.width);
+  const height = numberOrNull(video.height);
+  if (!sar || !width || !height) return stated || null;
+
+  const value = (sar * width) / height;
+  if (Math.abs(value - 16 / 9) < 0.06) return '16:9';
+  if (Math.abs(value - 4 / 3) < 0.06) return '4:3';
+  return stated || null;
+}
+
 function buildWarnings({ video, audio, fps, width, height, duration, audioStreams }) {
   const out = [];
 
@@ -178,7 +215,9 @@ function buildWarnings({ video, audio, fps, width, height, duration, audioStream
     // Fine, just noting CD-style audio is common in old captures.
   }
   if (/mpeg2video/.test(String(video.codec_name)) && width === 720 && (height === 480 || height === 576)) {
-    out.push('Already DVD resolution. It will be re-wrapped without resizing.');
+    // Kept vague on purpose: whether it really is copied depends on the rest of
+    // the checks in encode.canRemux, and the build log says which happened.
+    out.push('Already DVD resolution. It can be copied rather than converted.');
   }
   return out;
 }
@@ -213,5 +252,6 @@ function round(n, places) {
 module.exports = {
   probeVideo,
   looksLikeVideo,
+  displayAspectOf,
   VIDEO_EXTENSIONS,
 };

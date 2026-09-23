@@ -3317,7 +3317,7 @@ function numberField(label, value, onChange) {
   return el('div', {}, [el('label', { class: 'label', text: label }), input]);
 }
 
-function switchRow({ checked, title, onChange }) {
+function switchRow({ checked, title, desc, onChange }) {
   const knob = el('button', {
     class: 'switch',
     type: 'button',
@@ -3332,7 +3332,10 @@ function switchRow({ checked, title, onChange }) {
   });
   return el('div', { class: 'switch-row' }, [
     knob,
-    el('div', { class: 'switch-text' }, [el('div', { class: 'switch-title', text: title })]),
+    el('div', { class: 'switch-text' }, [
+      el('div', { class: 'switch-title', text: title }),
+      desc ? el('div', { class: 'switch-desc', text: desc }) : null,
+    ].filter(Boolean)),
   ]);
 }
 
@@ -4040,10 +4043,26 @@ async function runBuild() {
       `${result.videoCount} ${result.videoCount === 1 ? 'video' : 'videos'}, ` +
         `${result.slideCount} ${result.slideCount === 1 ? 'menu page' : 'menu pages'}, ` +
         `${formatDuration(result.totalSeconds)}.`,
+      /*
+        Say when there was nothing to do.
+
+        Confirming that a rebuild was quick because it reused the last one is
+        worth a line: without it, a build that finishes in seconds looks like it
+        did not happen, and the honest answer to "did it work?" is that it did.
+      */
+      result.reusedTitles >= result.videoCount && result.videoCount > 0
+        ? 'Nothing had changed, so the videos already prepared were kept. That took seconds.'
+        : result.reusedTitles
+          ? `${result.reusedTitles} of ${result.videoCount} were already prepared and were kept.`
+          : null,
+      result.copiedTitles
+        ? `${result.copiedTitles} ${result.copiedTitles === 1 ? 'was' : 'were'} already DVD video, so ` +
+          `${result.copiedTitles === 1 ? 'it was' : 'they were'} copied rather than converted.`
+        : null,
       result.failed && result.failed.length
         ? `${result.failed.length} could not be prepared and were left off.`
         : 'Put in a blank disc and press Burn when you are ready.',
-    ]);
+    ].filter(Boolean));
   } catch (err) {
     if (err.aborted) setBanner('info', 'Stopped', 'Nothing was written to a disc.');
     else setBanner('error', 'The disc could not be built', String(err.message || err));
@@ -4148,6 +4167,31 @@ async function renderSetupDialog() {
   }
 
   const { tools, versions, workDir } = detected;
+
+  /*
+    How much room the prepared files are taking.
+
+    Burnhouse keeps the encoded videos and the authored disc between builds so
+    that rebuilding does not mean re-encoding an hour of footage. That is the
+    right trade for time and the wrong one for disk space unless it can be seen
+    and reclaimed, so the figure is shown here rather than discovered later.
+  */
+  let work = { dir: workDir, bytes: 0, exists: false };
+  try {
+    work = await api.work.info();
+  } catch {
+    // An unreadable folder is reported as nothing kept, which is what the
+    // Clear button below would leave behind anyway.
+  }
+
+  // The writing options below are stored settings, so they have to be read
+  // rather than assumed — this dialog is where they are the only copy.
+  try {
+    state.settings = await api.settings.get();
+  } catch {
+    /* the switches fall back to their defaults */
+  }
+
   const rows = [
     ['Video conversion', tools.ffmpeg, versions.ffmpeg, true],
     ['Video reading', tools.ffprobe, versions.ffprobe, true],
@@ -4183,6 +4227,15 @@ async function renderSetupDialog() {
       el('div', { class: 'stat' }, [
         el('span', { class: 'stat-key', text: 'Working folder' }),
         el('span', { class: 'stat-value mono', text: workDir }),
+      ]),
+      el('div', { class: 'stat' }, [
+        el('span', { class: 'stat-key', text: 'Prepared files' }),
+        el('span', {
+          class: 'stat-value',
+          text: work.bytes
+            ? `${formatBytes(work.bytes)} \u2014 kept so rebuilding does not re-encode`
+            : 'nothing kept',
+        }),
       ]),
     ]),
     table
@@ -4289,6 +4342,35 @@ async function renderSetupDialog() {
     );
   }
 
+  /*
+    The writing options that are worth a choice.
+
+    Checking a disc after writing it is the difference between knowing it is good
+    and hoping — and it is also the single biggest cost left in a burn, because
+    it reads the whole disc back and that takes about as long again as writing
+    it. It stays on, but it is hers to turn off, and the wording says what
+    turning it off actually costs rather than pretending it is free.
+  */
+  if (tools.canBurn) {
+    body.append(
+      el('div', { style: 'margin-top: 18px' }, [
+        el('div', { class: 'rule', text: 'Writing a disc' }),
+        switchRow({
+          checked: state.settings ? state.settings.verifyBurn !== false : true,
+          title: 'Check the disc after writing it',
+          desc:
+            'Reading the disc back proves it was written properly. It takes about as long ' +
+            'again as the writing did. Turn it off and the burn finishes in half the time, ' +
+            'but a bad disc is only found when you play it.',
+          onChange: async (next) => {
+            await api.settings.set({ verifyBurn: next });
+            state.settings = await api.settings.get();
+          },
+        }),
+      ])
+    );
+  }
+
   body.append(
     el('div', { class: 'btn-row', style: 'margin-top: 16px' }, [
       el('button', {
@@ -4309,7 +4391,39 @@ async function renderSetupDialog() {
         text: 'Open Working Folder',
         onclick: () => api.files.open(workDir).catch(() => {}),
       }),
-    ])
+      work.bytes
+        ? el('button', {
+            class: 'btn btn-small btn-quiet',
+            type: 'button',
+            text: 'Clear Working Files\u2026',
+            title:
+              'Deletes the prepared videos and disc structure. Your project and your ' +
+              'own video files are not touched.',
+            onclick: async () => {
+              try {
+                const answer = await api.work.clear();
+                if (answer && answer.canceled) return;
+                /*
+                  The page was told a disc was ready. It is not any more, and
+                  leaving that showing would offer a Burn that fails.
+                */
+                state.lastBuild = null;
+                state.buildState = null;
+                renderSetupDialog();
+                render();
+              } catch (err) {
+                body.prepend(
+                  buildBanner({
+                    kind: 'error',
+                    title: 'The working files could not be deleted',
+                    body: String(err.message || err),
+                  })
+                );
+              }
+            },
+          })
+        : null,
+    ].filter(Boolean))
   );
 }
 

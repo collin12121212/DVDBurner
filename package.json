@@ -1,7 +1,7 @@
 {
   "name": "burnhouse",
   "productName": "Burnhouse",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Make a DVD that plays. Drop in videos, design a menu, burn a disc.",
   "author": "Burnhouse",
   "license": "MIT",
@@ -10,11 +10,13 @@
   "scripts": {
     "start": "electron .",
     "app": "powershell -NoProfile -ExecutionPolicy Bypass -File ./build-and-start.ps1",
-    "test": "node test/run.js && node test/server.js",
+    "test": "node test/speed.js && node test/disc.js && node test/run.js && node test/server.js",
     "test:core": "node test/run.js",
     "test:disc": "node test/disc.js",
+    "test:speed": "node test/speed.js",
     "test:server": "node test/server.js",
     "test:menu": "electron test/menu.js",
+    "test:reuse": "electron test/reuse.js",
     "test:smoke": "electron test/smoke.js",
     "test:interact": "electron test/interact.js",
     "test:firstrun": "electron test/firstrun.js",

@@ -158,10 +158,16 @@ async function inspect(project, { tools, onProgress } = {}) {
 /**
  * Stage two: encode, design, author.
  *
- * Returns a `prepared` object that later stages consume. Encoding results are
- * cached on the project, so pressing Build twice does not re-encode.
+ * Returns a `prepared` object that later stages consume.
+ *
+ * Encoding is the expensive part — minutes per hour of video on the sort of
+ * laptop this is built for — and it is also the part that most often does not
+ * need doing again. Changing one slide, renaming the disc, or pressing Build a
+ * second time after a failed burn changes nothing about the video streams, so
+ * each title is cached against its own fingerprint and reused when it still
+ * matches. `force` skips the cache and prepares everything from scratch.
  */
-async function prepare(project, { tools, workDir, onProgress, onLog, signal, BrowserWindow }) {
+async function prepare(project, { tools, workDir, onProgress, onLog, signal, BrowserWindow, force = false }) {
   requireTools(tools, ['ffmpeg', 'ffprobe']);
   if (!tools.dvdauthor) {
     throw new Error(
@@ -196,14 +202,21 @@ async function prepare(project, { tools, workDir, onProgress, onLog, signal, Bro
   let doneWeight = 0;
 
   // ---- encode each title -------------------------------------------------
+  //
+  // What was reused and what was prepared from scratch are counted rather than
+  // assumed: the numbers are reported back so the page can say that a rebuild
+  // took seconds because there was nothing to do, instead of leaving it to be
+  // noticed. Between them they account for every title on the disc.
+  let reused = 0;
+  let copied = 0;
+  let encodedCount = 0;
   const encoded = [];
+
   for (let i = 0; i < videos.length; i += 1) {
     if (signal && signal.aborted) throw new encode.AbortError('Stopped.');
 
     const video = videos[i];
     const titleDir = path.join(root, 'titles', `title_${i + 1}`);
-    encode.resetOutputDir(titleDir);
-
     const outputVob = path.join(titleDir, 'VTS_01_1.VOB');
     const weight = weights[i];
     const baseWeight = doneWeight;
@@ -213,6 +226,66 @@ async function prepare(project, { tools, workDir, onProgress, onLog, signal, Bro
     const needsSilence = !video.probe || !video.probe.hasAudio;
 
     const displayName = video.menuLabel || video.name;
+    const titleAspect = project.titleAspect === '4:3' ? '4:3' : '16:9';
+
+    /*
+      Every number the encoder will read, written down as the cache key.
+
+      The bitrates come from the disc-wide plan, so adding a video or changing
+      the disc type invalidates all of them at once — which is correct: the plan
+      exists precisely because the budget is shared out by total duration, and a
+      title encoded at the old rate would either waste the disc or overflow it.
+      What does not move the plan — the slides, the disc's name, which menu page
+      a title sits on — leaves every title reusable.
+    */
+    const fingerprint = encode.titleFingerprint({
+      input: video.path,
+      probe: video.probe,
+      durationSeconds: video.duration,
+      options: {
+        format: plan.format.id,
+        width: plan.format.width,
+        height: plan.format.height,
+        fps: plan.format.fps,
+        gop: plan.gop,
+        videoBitrate: plan.videoBitrate,
+        audioBitrate: plan.audioBitrate,
+        muxrate: plan.muxrate,
+        audioChannels: plan.audio.channels,
+        aspect: titleAspect,
+        hasAudio: !needsSilence,
+      },
+    });
+
+    const cached = force ? null : encode.readTitleCache(titleDir, fingerprint);
+
+    if (cached) {
+      reused += 1;
+      if (onLog) {
+        onLog(
+          `${displayName}: already prepared, keeping what is there ` +
+            `(${cached.parts.length} ${cached.parts.length === 1 ? 'file' : 'files'}).`
+        );
+      }
+      if (onProgress) {
+        const overall = totalWeight > 0 ? (baseWeight + weight) / totalWeight : 0;
+        onProgress({
+          stage: 'encode',
+          fraction: Math.min(1, overall),
+          message: `Already prepared: ${displayName}`,
+        });
+      }
+      const parts = cached.parts;
+      encoded.push({ ...video, parts, chapters: chaptersFor(project, parts, video) });
+      doneWeight += weight;
+      continue;
+    }
+
+    // Nothing reusable, so this folder is about to be rewritten. Clearing only
+    // the video files means an interrupted run can never leave a stale part for
+    // the disc to pick up, while leaving the cache record to be replaced at the
+    // end of a run that actually finishes.
+    encode.resetOutputDir(titleDir);
 
     try {
       const result = await encode.encodeTitle({
@@ -223,11 +296,12 @@ async function prepare(project, { tools, workDir, onProgress, onLog, signal, Bro
           ...plan,
           hasAudio: !needsSilence,
           // The encoder needs the probe for per-source decisions: the colour
-          // matrix (BT.709 HD vs BT.601 SD) and nothing else it can't derive.
+          // matrix (BT.709 HD vs BT.601 SD), and whether the source is already
+          // a DVD title and can be copied rather than encoded.
           probe: video.probe || null,
         },
         durationSeconds: video.duration,
-        aspect: { ratio: project.titleAspect === '4:3' ? '4:3' : '16:9' },
+        aspect: { ratio: titleAspect },
         onProgress: (fraction) => {
           if (!onProgress) return;
           const overall = totalWeight > 0 ? (baseWeight + fraction * weight) / totalWeight : 0;
@@ -240,35 +314,55 @@ async function prepare(project, { tools, workDir, onProgress, onLog, signal, Bro
         signal,
       });
 
+      if (result.mode === 'copy') copied += 1;
+      else encodedCount += 1;
+
+      if (onLog) {
+        onLog(
+          result.mode === 'copy'
+            ? `${displayName}: already a DVD-quality file, copied as it is.`
+            : `${displayName}: converting to DVD video.`
+        );
+      }
+      if (onLog && result.mode !== 'copy' && result.copyReason) {
+        onLog(`  (converting rather than copying: ${result.copyReason})`);
+      }
+      for (const warning of result.warnings || []) {
+        if (onLog) onLog(`  ${warning}`);
+      }
+
       const parts = result.parts.map((file) => ({ file, bytes: safeSize(file) }));
 
       if (needsSilence) {
         // Replace the absent audio with silence by re-muxing. ffmpeg cannot add
         // an audio stream to an already-muxed DVD stream, so the title is
-        // encoded once more with a generated silent input. This is rare enough
-        // that the extra pass is not worth optimising away.
+        // written once more with a generated silent input. The picture is copied
+        // both times, so this costs a pass over the file rather than a second
+        // encode.
         await addSilenceTrack({
           ffmpegPath: tools.ffmpeg,
           parts,
           titleDir,
           plan,
           duration: video.duration,
-          aspect: { ratio: project.titleAspect === '4:3' ? '4:3' : '16:9' },
+          aspect: { ratio: titleAspect },
           signal,
         });
       }
 
-      const partsAfter = encode.listTitleParts(titleDir).map((file) => ({ file, bytes: safeSize(file) }));
+      const partsAfter = encode
+        .listTitleParts(titleDir)
+        .map((file) => ({ file, bytes: safeSize(file) }));
 
-      encoded.push({
-        ...video,
+      // Written only now, with the final files and their final lengths. A record
+      // that described the pre-silence parts would look valid and be wrong.
+      encode.writeTitleCache(titleDir, {
+        fingerprint,
         parts: partsAfter,
-        chapters: project.chaptersEnabled
-          ? author.distributeChapters(partsAfter, video.duration, {
-              intervalSeconds: project.chapterMinutes * 60,
-            })
-          : partsAfter.map(() => []),
+        mode: result.mode,
       });
+
+      encoded.push({ ...video, parts: partsAfter, chapters: chaptersFor(project, partsAfter, video) });
     } catch (err) {
       if (err && err.isAbort) throw err;
       // One bad file should not destroy the whole disc: the others are still
@@ -277,6 +371,13 @@ async function prepare(project, { tools, workDir, onProgress, onLog, signal, Bro
     }
 
     doneWeight += weight;
+  }
+
+  // A video removed from the project leaves its folder behind with nothing
+  // pointing at it. Nothing else will ever look at it again, so it goes.
+  const pruned = encode.pruneTitleDirs(root, videos.length);
+  if (pruned && onLog) {
+    onLog(`Removed ${pruned} title folder${pruned === 1 ? '' : 's'} left over from an earlier version of this project.`);
   }
 
   const good = encoded.filter((v) => v.parts && v.parts.length);
@@ -344,6 +445,12 @@ async function prepare(project, { tools, workDir, onProgress, onLog, signal, Bro
     volumeLabel: author.discLabel(project.discTitle),
     totalSeconds: good.reduce((sum, v) => sum + (v.duration || 0), 0),
     builtAt: new Date().toISOString(),
+    // Reported so a rebuild that had nothing to do can say so, rather than
+    // looking identical to one that re-encoded everything. Between them these
+    // three account for every title that made it onto the disc.
+    reusedTitles: reused,
+    copiedTitles: copied,
+    encodedTitles: encodedCount,
   };
 
   /*
@@ -382,6 +489,20 @@ async function prepare(project, { tools, workDir, onProgress, onLog, signal, Bro
   }
 
   return prepared;
+}
+
+/**
+ * Where the chapter stops go for one title.
+ *
+ * Pulled out because it is worked out the same way whether the title was just
+ * encoded or reused from the last build, and a reused title still has to come
+ * out with chapters in the same places.
+ */
+function chaptersFor(project, parts, video) {
+  if (!project.chaptersEnabled) return parts.map(() => []);
+  return author.distributeChapters(parts, video.duration, {
+    intervalSeconds: project.chapterMinutes * 60,
+  });
 }
 
 /** This app's version, for the build record. */
@@ -433,8 +554,23 @@ function projectFingerprint(project) {
     deck: project.deck,
     videos,
     videoFormat: project.videoFormat,
-    aspect: project.aspect,
+    /*
+      `titleAspect`, not `aspect`.
+
+      This read `project.aspect`, which normaliseProject never sets — it was
+      always undefined, so switching the whole disc between 4:3 and 16:9 left
+      the fingerprint untouched and a finished build was reported as still
+      matching the project. It would then have been burned as it was, at the old
+      shape, with the page saying nothing had changed.
+    */
+    titleAspect: project.titleAspect,
     audioMode: project.audioMode,
+    /*
+      And the disc type, which decides how much room there is and therefore the
+      bitrate every title is encoded at. Burning a DVD-5 plan at DVD-9 rates is
+      the fastest way to make a disc that does not fit.
+    */
+    discType: project.discType,
     chaptersEnabled: project.chaptersEnabled,
     chapterMinutes: project.chapterMinutes,
   });

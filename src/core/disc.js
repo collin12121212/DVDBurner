@@ -710,6 +710,32 @@ function describeIsoFailure(output) {
 }
 
 /**
+ * The argument list for `hdiutil burn`.
+ *
+ * Verification is stated outright, both ways, because hdiutil's own default is
+ * to verify — it reads the whole disc back and compares it, which for a 4 GB
+ * disc takes about as long again as writing it did.
+ *
+ * This used to add `-verifyburn` when verification was wanted and pass nothing
+ * when it was not, on the assumption that silence meant "do not". It does not:
+ * hdiutil verified anyway, so turning verification off in Settings saved nothing
+ * at all and the burn took twice as long as the setting promised. `-noverify` is
+ * the only way to say no.
+ *
+ * Two options are deliberately absent:
+ *
+ *   -speed max       already the default, so passing it would be a comment
+ *                    pretending to be code. Slower speeds are for marginal
+ *                    media, and a burn that is slow for a reason should be slow.
+ *   -device          the drive path cannot be reconstructed safely; see the note
+ *                    in burnIso. With no -device, hdiutil uses the only attached
+ *                    writer.
+ */
+function buildBurnArgs({ isoPath, verify = true }) {
+  return ['burn', isoPath, verify ? '-verifyburn' : '-noverify'];
+}
+
+/**
  * Burn an image to a real disc.
  *
  * `hdiutil burn` is the system path and uses the OS's own optical writer
@@ -729,8 +755,7 @@ async function burnIso({ isoPath, device, hdiutil, onProgress, signal, verify = 
   const totalBytes = stat.size;
 
   return new Promise((resolve, reject) => {
-    const args = ['burn', isoPath];
-    if (verify) args.push('-verifyburn');
+    const args = buildBurnArgs({ isoPath, verify });
 
     /*
       No `-device` on macOS.
@@ -888,6 +913,7 @@ module.exports = {
   listDrives,
   buildIso,
   burnIso,
+  buildBurnArgs,
   copyDiscFolder,
   freeSpace,
   platformDiscNote,
