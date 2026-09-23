@@ -2379,6 +2379,15 @@ body.dragging-video .slide-card {
   display: none;
 }
 
+/* A notice that is only a heading: tightened up so it does not take a block of
+   vertical space to say one short thing. */
+.banner-compact {
+  padding: 7px 12px;
+  margin-bottom: 12px;
+  align-items: center;
+  gap: 8px;
+}
+
 .banner-info {
   background: rgba(217, 163, 83, 0.08);
   border-color: var(--amber-dim);

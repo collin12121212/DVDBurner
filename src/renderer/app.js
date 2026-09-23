@@ -1457,7 +1457,11 @@ function renderBanner() {
 
 function buildBanner(banner) {
   const mark = banner.kind === 'error' ? '\u26a0' : banner.kind === 'good' ? '\u2713' : '\u2139';
-  return el('div', { class: `banner banner-${banner.kind}` }, [
+  // `compact` is for a notice that is only a heading — nothing beneath to
+  // space out, so it takes less room vertically.
+  const classes = ['banner', `banner-${banner.kind}`];
+  if (banner.compact) classes.push('banner-compact');
+  return el('div', { class: classes.join(' ') }, [
     el('span', { class: 'banner-mark', text: mark }),
     el('div', { class: 'banner-body' }, [
       el('strong', { text: banner.title }),
@@ -3348,13 +3352,7 @@ function renderFinishStep(stage) {
     state.buildState = 'checking';
     refreshBuiltState();
   }
-  stage.append(
-    el('h1', { text: 'Make the disc' }),
-    el('p', {
-      class: 'lede',
-      text: 'Everything is ready. Nothing is written to a disc until you ask for it.',
-    })
-  );
+  stage.append(el('h1', { text: 'Make the disc' }));
 
   if (!state.videos.length || !state.deck.slides.length) {
     stage.append(
@@ -3542,13 +3540,10 @@ function buildBurnPanel() {
     );
   } else if (!hasWriter) {
     panel.append(
-      buildBanner({
-        kind: 'info',
-        title: 'No disc burner found',
-        body:
-          'Plug your DVD writer in, put in a blank disc, then press Check Again. ' +
-          'You can still build a disc image without a burner.',
-      })
+      // Title only. The line under it explained what the writer is and what to
+      // do, which the heading already says in fewer words — and the drive list
+      // appears on its own the moment one is plugged in.
+      buildBanner({ kind: 'info', title: 'No disc burner found', compact: true })
     );
   } else {
     const list = el('div', { class: 'drive-list' });
@@ -3663,13 +3658,7 @@ function buildBurnPanel() {
         disabled: state.busy,
         onclick: () => goToStep('testing'),
       }),
-    ]),
-    el('p', {
-      class: 'hint',
-      text:
-        'Step 2 plays the disc the way a DVD player will: the real menus, the real ' +
-        'buttons and the same arrow-key movement. Nothing is written to a disc.',
-    })
+    ])
   );
 
   /*
@@ -3696,8 +3685,16 @@ function buildBurnPanel() {
           type: 'button',
           // Ejecting from here is the same thing the Finder's Eject does, and
           // saves leaving the app to fetch a disc out.
-          text: '\u23cf Eject the disc',
-          disabled: state.busy || !discInDrive,
+          text: '\u23cf Eject the tray',
+          /*
+            Never disabled for want of a disc.
+
+            Ejecting is about the tray, not the media — the Finder's Eject opens
+            an empty tray quite happily, and wanting to open it is exactly the
+            situation where the app cannot see a disc to begin with. Requiring
+            one made the button useless precisely when it was wanted.
+          */
+          disabled: state.busy,
           onclick: async () => {
             try {
               await api.drives.eject();
@@ -3706,12 +3703,6 @@ function buildBurnPanel() {
             }
             refreshDrives();
           },
-        }),
-        el('button', {
-          class: 'btn btn-small btn-quiet',
-          type: 'button',
-          text: 'Refresh the drive list',
-          onclick: refreshDrives,
         }),
       ]),
     ])
