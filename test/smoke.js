@@ -400,7 +400,7 @@ app.whenReady().then(async () => {
         );
         record(
           listed.every((e) => e.source === 'auto'),
-          'the listed buttons are marked as generated, so they stay in step'
+          'the listed buttons are marked automatic, so they stay in step'
         );
         record(
           listed.some((e) => e.videoId),
@@ -487,15 +487,21 @@ app.whenReady().then(async () => {
           `active is ${editorState.activeSlideId}`
         );
 
-        // A content slide must gain a navigation button, or a disc with several
-        // slides would be a dead end.
+        /*
+          A new slide is a blank page.
+
+          It used to arrive with a Back/Next row already on it, so that a disc
+          with several pages could not be a dead end. Those buttons went with the
+          generator that made them, and blank now means blank: what she puts on
+          the page is what ends up on the disc.
+        */
         const newLayout = editorState.layout && added
           ? editorState.layout.slides.find((s) => s.id === added.id)
           : null;
         record(
-          newLayout && newLayout.elements.some((e) => e.kind === 'button'),
-          'the new slide gained a way back',
-          newLayout ? `${newLayout.buttons} buttons` : 'no layout'
+          Boolean(newLayout) && newLayout.elements.every((e) => e.kind !== 'button'),
+          'the new slide is blank, with no button put on it for her',
+          newLayout ? `${newLayout.elements.length} elements` : 'no layout'
         );
 
         // The project handed to the pipeline must carry the deck.

@@ -24,7 +24,7 @@ const { THEMES, DEFAULT_THEME_ID } = require('./themes');
   Re-exported below, so everything that already reads them from this module
   keeps working.
 */
-const { RASTER, SAFE_MARGIN, VIDEO_BOTTOM } = require('./safe_area');
+const { RASTER, SAFE_MARGIN } = require('./safe_area');
 
 /**
  * The DVD-Video specification caps a menu at 36 buttons, but a menu with 36
@@ -87,6 +87,19 @@ function pixelSize(value) {
 function transparency(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
+
+/**
+ * How much a background picture is darkened: 0 untouched, 1 the full wash.
+ *
+ * Anything unreadable, including the absence of a value on every deck saved
+ * before this existed, gives 1 — the darkness every existing slide already has,
+ * so opening an old project changes nothing about how it looks.
+ */
+function dim(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 1;
   return Math.max(0, Math.min(1, n));
 }
 
@@ -379,10 +392,23 @@ function makeSlide(patch = {}) {
     // `cover` fills the frame and crops whatever spills over, which is what a
     // background picture almost always wants. `contain` shows all of it.
     backgroundFit: patch.backgroundFit === 'contain' ? 'contain' : 'cover',
+    /*
+      How much the background picture is darkened so words stay readable.
+
+      1 is the wash this has always applied and is the default; 0 leaves the
+      photograph exactly as it is. A picture that is already dark, or one that is
+      meant to be looked at rather than read over, needs less of it — and only
+      she can see which she has.
+    */
+    backgroundDim: dim(patch.backgroundDim),
     // A sound to play while this page is on screen, or null for a silent page.
     audio: normaliseSlideAudio(patch.audio),
-    // `menu` slides are navigation hubs; `content` slides hold playable things.
-    // The distinction only affects the automatically added navigation row.
+    /*
+      `menu` marks the page the disc opens on, and the one a player's Menu key
+      returns to; `content` is every other page. It is a label for the editor,
+      not a rule about what appears on the page — nothing is added to a slide for
+      being one or the other.
+    */
     role: patch.role === 'menu' ? 'menu' : 'content',
     elements: Array.isArray(patch.elements)
       ? patch.elements.map(normaliseElement).filter(Boolean)
@@ -544,6 +570,11 @@ function episodeCapacity() {
  * A series longer than one slide holds is normal, so this pages the list rather
  * than producing a menu with buttons off the bottom of the picture. Numbering
  * continues across pages, so the on-screen numbers still read 1, 2, 3, ...
+ *
+ * It only builds the pages. Nothing links them: the layout no longer adds a
+ * Back/Next row to anything, so a disc built from these needs a button of its
+ * own on each page pointing at the next one — and a full page has no room left
+ * for one, which is why the page size is worth checking before relying on this.
  */
 function episodeListSlides(videos, { title = 'Episodes', themeId, startNumber = 1 } = {}) {
   const capacity = episodeCapacity();
@@ -573,7 +604,6 @@ function stripExtension(name) {
 module.exports = {
   RASTER,
   SAFE_MARGIN,
-  VIDEO_BOTTOM,
   MENU_SOUND_MAX_SECONDS,
   MAX_BUTTONS_PER_SLIDE,
   THEMES,

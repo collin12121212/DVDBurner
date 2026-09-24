@@ -291,70 +291,6 @@ function resolveElement(element, theme) {
 }
 
 /**
- * The navigation row added to non-menu slides.
- *
- * A multi-page menu is useless if there is no way to move between pages, and
- * asking a non-technical user to place their own Back button would guarantee
- * some discs without one. So it is added automatically and placed where a
- * television-safe corner is.
- */
-function navigationElements(slide, slides) {
-  const index = slides.indexOf(slide);
-  const elements = [];
-  const isMenu = slide.role === 'menu';
-  if (isMenu || slides.length < 2) return elements;
-
-  const navWidth = 110;
-  const navHeight = 32;
-  const y = RASTER.height - SAFE_MARGIN - navHeight; // 480 - 40 - 32 = 408
-
-  if (index > 0) {
-    const isPrevMenu = slides[index - 1].role === 'menu' || index === 1;
-    elements.push({
-      ...deckModel.makeButtonElement({
-        label: isPrevMenu ? '\u2039  Menu' : '\u2039  Back',
-        fontSize: 'small',
-        buttonStyle: 'plain',
-        align: 'left',
-        x: SAFE_MARGIN,
-        y,
-        width: navWidth,
-        height: navHeight,
-        targetSlideId: slides[index - 1].id,
-      }),
-      id: `nav-back-${slide.id}`,
-      generated: 'back',
-    });
-  }
-
-  if (index < slides.length - 1) {
-    elements.push({
-      ...deckModel.makeButtonElement({
-        label: 'Next  \u203a',
-        fontSize: 'small',
-        buttonStyle: 'plain',
-        align: 'right',
-        x: RASTER.width - SAFE_MARGIN - navWidth,
-        y,
-        width: navWidth,
-        height: navHeight,
-        targetSlideId: slides[index + 1].id,
-      }),
-      id: `nav-next-${slide.id}`,
-      generated: 'next',
-    });
-  }
-
-  return elements;
-}
-
-/**
- * Resolve a whole slide.
- *
- * Returns the resolved elements, the buttons that must exist on this menu page
- * in the DVD structure, and any problems the user should be told about.
- */
-/**
  * Whether the remote can land on an element.
  *
  * A button always can. A video tile can, because pressing it plays the film. A
@@ -372,15 +308,24 @@ function isSelectable(element) {
   return false;
 }
 
+/**
+ * Resolve a whole slide.
+ *
+ * Returns the resolved elements, the buttons that must exist on this menu page
+ * in the DVD structure, and any problems the user should be told about.
+ *
+ * There is deliberately no automatic navigation row. A `‹ Menu` and `Next ›`
+ * pair used to be added to every slide that was not a menu hub, which meant
+ * every page she designed had two buttons on it she had not asked for, sitting
+ * over her own design in the bottom corners — and they could not be moved or
+ * deleted, because they were generated rather than saved. A page wants what she
+ * puts on it, so now it gets exactly that: buttons are hers to place, and the
+ * remote's own Menu key still returns to the disc's root menu on a real player.
+ */
 function layoutSlide(deck, slide) {
   const theme = getTheme(slide.themeId || deck.themeId);
-  const authored = slide.elements.map((element) => resolveElement(element, theme));
-  const nav = navigationElements(slide, deck.slides).map((element) => ({
-    ...resolveElement(element, theme),
-    generated: element.generated,
-  }));
+  const all = slide.elements.map((element) => resolveElement(element, theme));
 
-  const all = [...authored, ...nav];
   // A video tile plays something, and a picture that has been given a
   // destination goes somewhere, so both need a button region just as a button
   // does. Everything downstream then treats them exactly alike, which is what
@@ -416,10 +361,12 @@ function layoutSlide(deck, slide) {
           ? slide.backgroundImage
           : null,
       fit: slide.backgroundFit === 'contain' ? 'contain' : 'cover',
+      // How much the picture is darkened so words stay readable over it. Travels
+      // with the rest of the background so the editor, the off-screen renderer
+      // and the burned menu all apply the same amount.
+      dim: Number.isFinite(Number(slide.backgroundDim)) ? Math.max(0, Math.min(1, Number(slide.backgroundDim))) : 1,
     },
     backgroundKey: BACKGROUND_IMAGE_KEY,
-    authored,
-    navigation: nav,
     elements: all,
     buttons: buttonElements,
     problems,
@@ -460,21 +407,6 @@ function even(n) {
 }
 
 /**
- * Keep an element inside the television-safe area.
- *
- * The rule itself lives in safe_area.js, because the editor has to apply exactly
- * the same one while she is dragging. It used to be written out here as well,
- * and the two copies had drifted: this one capped an element's size and then
- * positioned it, so an element at the maximum size had exactly one legal
- * position and could not be moved, while the editor's copy capped nothing and
- * produced an inverted range. Only the editor's ran, so this one was a trap
- * waiting for whoever wired it up next.
- *
- * Exported for callers that have a single element in hand; `clampDeck` below is
- * what the pipeline uses.
- */
-
-/**
  * Apply safe-area limits to every element of every slide.
  *
  * Runs over the whole deck, so there is a single invariant: whatever is in the
@@ -507,10 +439,48 @@ function clampDeck(deck) {
   };
 }
 
-/** The whole deck, laid out. */
+/**
+ * The whole deck, laid out.
+ *
+ * Also the one place that can see across slides, which is what the check below
+ * needs: whether a button points at a page that will not exist.
+ */
 function layoutDeck(deck) {
   const slides = deck.slides.map((slide) => layoutSlide(deck, slide));
   const problems = slides.flatMap((layout) => layout.problems);
+
+  /*
+    A button that goes to a slide with nothing to press on it.
+
+    The disc numbers its pages by which slides have something usable on them, so
+    a slide with no buttons of its own is not a page at all — and a button aimed
+    at one is quietly dropped from the disc. Silence is the wrong answer there:
+    the disc simply does not do what it looks like it does, and nothing says so.
+
+    Not counted when the slide holds a film, because then the button plays the
+    film directly rather than opening the page, and not when the button has a
+    film of its own for the same reason.
+  */
+  const byId = new Map(slides.map((entry) => [entry.slide.id, entry]));
+  const pointedAt = new Set();
+  for (const entry of slides) {
+    for (const element of entry.elements) {
+      if (element.targetSlideId && !element.videoId) pointedAt.add(element.targetSlideId);
+    }
+  }
+
+  for (const slideId of pointedAt) {
+    const target = byId.get(slideId);
+    if (!target || target.buttons.length) continue;
+    const holdsAFilm = target.elements.some((e) => e.kind === 'video' && e.videoId);
+    if (holdsAFilm) continue;
+    problems.push(
+      `Something goes to "${target.slide.title}", but that slide has nothing to press ` +
+        `on it, so it would not be a page on the disc. Put a button on it \u2014 one ` +
+        `that goes back to the menu, for instance.`
+    );
+  }
+
   return { deck, slides, problems };
 }
 
@@ -525,7 +495,6 @@ module.exports = {
   wrapText,
   textBlockHeight,
   resolveElement,
-  navigationElements,
   isSelectable,
   layoutSlide,
   layoutDeck,

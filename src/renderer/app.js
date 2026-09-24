@@ -414,8 +414,8 @@ function ensureStarterSlides() {
 /**
  * The menu slide: a title and a list of buttons, one per video.
  *
- * Marked `role: 'menu'` so the layout knows it is a hub — a menu slide gets no
- * Back/Next row, because it is where the disc lives.
+ * Marked `role: 'menu'` so the layout knows it is a hub — the page the disc
+ * opens on, and the one the remote's Menu key comes back to.
  */
 function makeMenuSlide(title) {
   return {
@@ -1344,14 +1344,17 @@ function resizeBox(handle, origin, dx, dy, lockShape) {
  */
 const SNAP_TOLERANCE = 6;
 
-/** Every x and y an element could sensibly line up with. */
-function snapLines(layout, excludeId, kind) {
-  // A video tile is kept clear of the navigation row, so its own bottom limit is
-  // the line to snap to. Offering the safe-area bottom instead would draw a
-  // guide exactly where the tile is not allowed to go.
-  const bottom = kind === 'video' ? 396 : RASTER.height - SAFE_MARGIN;
+/**
+ * Every x and y an element could sensibly line up with.
+ *
+ * The kind is not asked for. A video tile used to have a bottom limit of its own
+ * to keep clear of the navigation row, and offering the safe-area bottom instead
+ * would have drawn a guide exactly where a tile was not allowed to go — but that
+ * row is gone, so every kind now shares the one bottom line.
+ */
+function snapLines(layout, excludeId) {
   const xs = [SAFE_MARGIN, RASTER.width - SAFE_MARGIN, RASTER.width / 2];
-  const ys = [SAFE_MARGIN, bottom, RASTER.height / 2];
+  const ys = [SAFE_MARGIN, RASTER.height - SAFE_MARGIN, RASTER.height / 2];
   for (const other of layout.elements) {
     if (!other.box || other.id === excludeId) continue;
     const box = other.box;
@@ -1368,8 +1371,8 @@ function snapLines(layout, excludeId, kind) {
  * left-to-left, centre-to-centre and right-to-left all work without her having
  * to think about which edge is which.
  */
-function snapBox(box, layout, excludeId, kind) {
-  const { xs, ys } = snapLines(layout, excludeId, kind);
+function snapBox(box, layout, excludeId) {
+  const { xs, ys } = snapLines(layout, excludeId);
   const guides = [];
 
   let bestX = null;
@@ -1449,9 +1452,9 @@ function drawEditorOverlay(ctx, layout) {
     ctx.strokeRect(box.x - 2, box.y - 2, box.width + 4, box.height + 4);
     ctx.restore();
 
-    // The resize handles. A generated element (the Back/Next row) has no
-    // handles because it is not hers to move — it is placed by the layout.
-    if (isPrimary && !element.generated) {
+    // The resize handles. Every element on the slide has them now: nothing is
+    // placed by the layout behind her back any more.
+    if (isPrimary) {
       ctx.save();
       for (const spot of Object.values(handlesFor(box))) {
         const half = HANDLE_DRAW / 2;
@@ -1532,12 +1535,18 @@ function canvasPoint(event) {
   };
 }
 
-/** The topmost element under a point, which is what a click should select. */
-function hitTest(layout, point) {
-  // Highest number wins, so a button on top of a panel is selected rather than
-  // the panel underneath it.
-  const order = { button: 5, video: 4, text: 3, image: 2, frame: 1 };
-  const candidates = layout.elements
+/**
+ * Every element under a point, front to back.
+ *
+ * Front first, so the first one is what a click should land on: it is the one
+ * drawn last and therefore the one being looked at. The order comes from the
+ * drawing code itself, because with two copies of that rule a picture that is
+ * visibly underneath a panel could be the thing a click selects, and nothing on
+ * screen would explain why.
+ */
+function stackAt(layout, point) {
+  if (!layout) return [];
+  return layout.elements
     .filter((element) => {
       const box = element.box;
       return (
@@ -1547,8 +1556,104 @@ function hitTest(layout, point) {
         point.y <= box.y + box.height
       );
     })
-    .sort((a, b) => (order[b.kind] || 0) - (order[a.kind] || 0));
-  return candidates[0] || null;
+    .sort(draw.compareStacking)
+    // Sorted back to front for drawing, so the front-most is the last one.
+    .reverse();
+}
+
+/** The element a click lands on: the one on top. */
+function hitTest(layout, point) {
+  return stackAt(layout, point)[0] || null;
+}
+
+/**
+ * Which element a second gesture means: the selected one if the pointer is on
+ * it, and otherwise the one on top.
+ *
+ * Double-clicking and right-clicking have to agree with the click-through, or
+ * it is only half a feature: having reached a small thing under a big picture,
+ * double-clicking it to edit its words would land on the picture again, and the
+ * panel would appear to forget what she had just chosen.
+ */
+function gestureTarget(layout, point) {
+  const selected = state.selectedElementId;
+  if (selected && layout) {
+    const element = layout.elements.find((e) => e.id === selected);
+    const box = element && element.box;
+    if (
+      box &&
+      point.x >= box.x &&
+      point.x <= box.x + box.width &&
+      point.y >= box.y &&
+      point.y <= box.y + box.height
+    ) {
+      return element;
+    }
+  }
+  return hitTest(layout, point);
+}
+
+/**
+ * What is stacked behind one element.
+ *
+ * Everything drawn before it whose box it overlaps, rather than everything
+ * sharing a point with its middle: a small picture tucked into one corner of a
+ * big one is exactly the case this is about, and its middle is nowhere near the
+ * middle of the big one.
+ *
+ * Used for the note in the panel that tells her more is hidden there, which is
+ * the only thing that makes the click-through discoverable.
+ */
+function elementsBeneath(element, layout) {
+  if (!layout || !element) return [];
+  const resolved = layout.elements.find((e) => e.id === element.id);
+  if (!resolved || !resolved.box) return [];
+
+  // Back to front, so everything before it is behind it.
+  const order = layout.elements.slice().sort(draw.compareStacking);
+  const at = order.findIndex((e) => e.id === element.id);
+  if (at === -1) return [];
+
+  const box = resolved.box;
+  return order.slice(0, at).filter((other) => {
+    const o = other.box;
+    if (!o) return false;
+    return (
+      o.x < box.x + box.width &&
+      box.x < o.x + o.width &&
+      o.y < box.y + box.height &&
+      box.y < o.y + o.height
+    );
+  });
+}
+
+/**
+ * Which element the pointer chooses, stepping down through a stack.
+ *
+ * A large picture with a transparent background is a wall: it covers everything
+ * on the slide, so a click anywhere lands on the picture and the smaller things
+ * under it can never be reached. Rather than a modifier nobody would discover,
+ * pressing the *same place* again takes the next element down and wraps round at
+ * the bottom, so every layer is reachable with the gesture everybody already
+ * uses. `previousAt` is where the last press was, which is the whole of the state
+ * this needs.
+ */
+function pickAt(layout, point, previousAt) {
+  const stack = stackAt(layout, point);
+  if (!stack.length) return { element: null, stack, at: null };
+
+  const here =
+    previousAt &&
+    Math.abs(previousAt.x - point.x) <= 4 &&
+    Math.abs(previousAt.y - point.y) <= 4;
+
+  if (!here || stack.length === 1) {
+    return { element: stack[0], stack, at: { x: point.x, y: point.y } };
+  }
+
+  const current = stack.findIndex((e) => e.id === state.selectedElementId);
+  const next = current === -1 ? 0 : (current + 1) % stack.length;
+  return { element: stack[next], stack, at: { x: point.x, y: point.y } };
 }
 
 // ------------------------------------------------------------- render ---
@@ -3107,6 +3212,50 @@ function buildSlideInspector(slide) {
       ])
     : null;
 
+  /*
+    How much the picture behind is darkened.
+
+    A picture put behind a slide has always been washed toward the theme colour
+    so the words and buttons on top of it stay readable. That wash is right for
+    a busy holiday photo and wrong for a dark, quiet one — so it is hers to move.
+    1 is the wash it has always had, 0 leaves the picture exactly as it came out
+    of the camera.
+
+    Dragging only redraws; the deck is written when she lets go, so a slider
+    being moved does not write the project file sixty times.
+  */
+  const dimValue = typeof slide.backgroundDim === 'number' ? slide.backgroundDim : 1;
+  const dimReadout = el('span', {
+    class: 'dim-readout',
+    text: dimValue === 0 ? 'Original' : Math.round(dimValue * 100) + '%',
+  });
+  const dimSlider = el('input', {
+    class: 'dim-range',
+    type: 'range',
+    min: '0',
+    max: '1',
+    step: '0.05',
+    value: String(dimValue),
+    'aria-label': 'How dark the background picture is',
+  });
+  dimSlider.addEventListener('input', () => {
+    slide.backgroundDim = Number(dimSlider.value);
+    dimReadout.textContent = slide.backgroundDim === 0 ? 'Original' : Math.round(slide.backgroundDim * 100) + '%';
+    refreshCanvas();
+  });
+  dimSlider.addEventListener('change', () => {
+    slide.backgroundDim = Number(dimSlider.value);
+    persistDeck();
+    refreshCanvas();
+  });
+
+  const backgroundDim = hasBackground
+    ? el('div', { class: 'field' }, [
+        el('label', { class: 'label', text: 'Darkening' }),
+        el('div', { class: 'dim-row' }, [dimSlider, dimReadout]),
+      ])
+    : null;
+
   const titleField = el('input', {
     class: 'input',
     type: 'text',
@@ -3144,10 +3293,11 @@ function buildSlideInspector(slide) {
     backgroundPreview,
     backgroundRow,
     backgroundFit,
+    backgroundDim,
     el('p', {
       class: 'hint',
       text: hasBackground
-        ? 'Drawn behind everything and darkened a little so the words stay readable. Point at it to remove it, or drop another picture here to swap it.'
+        ? 'Drawn behind everything. Darkening decides how far the picture is washed toward the background colour, so the words on top stay readable. Point at the picture to remove it, or drop another one here to swap it.'
         : 'Optional. Drag a picture straight onto this box, or press the button.',
     }),
   ]);
@@ -3420,6 +3570,30 @@ function buildElementInspector(slide, element) {
     element.kind === 'image' ? 'Picture' : 'Panel';
 
   panel.append(el('div', { class: 'rail-title', text: kindName }));
+
+  /*
+    "There is something under this."
+
+    A picture with a transparent background is a wall across the slide: it
+    catches every click, and the smaller things behind it look unreachable. The
+    click-through solves that, but nobody looks for a gesture whose need they
+    cannot see, so when there *is* something underneath, the panel says so.
+  */
+  const beneath = elementsBeneath(element, activeSlideLayout());
+  if (beneath.length) {
+    panel.append(
+      el('p', {
+        class: 'prop-hint',
+        text:
+          (beneath.length === 1
+            ? 'One thing is tucked behind this one'
+            : beneath.length + ' things are tucked behind this one') +
+          '. Press the same spot again to reach ' +
+          (beneath.length === 1 ? 'it' : 'them') +
+          '.',
+      })
+    );
+  }
 
   // Every change goes through here, so saving and redrawing cannot be forgotten
   // on one control out of twenty.
@@ -3755,18 +3929,22 @@ function buildElementInspector(slide, element) {
     );
   }
 
-  if (!element.generated) {
-    panel.append(
-      el('div', { class: 'btn-row', style: 'margin-top:10px' }, [
-        el('button', {
-          class: 'btn btn-small btn-danger',
-          type: 'button',
-          text: 'Delete',
-          onclick: () => deleteElement(element.id),
-        }),
-      ])
-    );
-  }
+  /*
+    Everything can be deleted. There used to be an exception here for the
+    Back/Next row, because it was placed by the layout rather than by her and
+    deleting it would have been a lie — the next redraw put it straight back.
+    That row is gone, so every element on the slide is hers to remove.
+  */
+  panel.append(
+    el('div', { class: 'btn-row', style: 'margin-top:10px' }, [
+      el('button', {
+        class: 'btn btn-small btn-danger',
+        type: 'button',
+        text: 'Delete',
+        onclick: () => deleteElement(element.id),
+      }),
+    ])
+  );
 
   return panel;
 }
@@ -5350,7 +5528,10 @@ function openHelp() {
       text:
         'A slide is one page of the disc menu \u2014 what appears on screen when the ' +
         'disc starts. Make as many as you like. Add one with "Add blank slide", or ' +
-        'press "Add menu slide" for a page that lists every video.',
+        'press "Add menu slide" for a page that lists every video. Nothing is ever ' +
+        'put on a page for you, so a page is exactly what you see on it: a way back ' +
+        'is a button you add and point at the page you want. The Menu key on any ' +
+        'DVD remote goes back to the first page from anywhere.',
     }),
     el('h2', { text: 'Putting a video on a slide' }),
     el('p', {
@@ -5375,6 +5556,28 @@ function openHelp() {
         'apart from an ordinary one. Leave it on "None" and the picture is just a ' +
         'picture. Point either one at a slide holding a video and it plays that video ' +
         'straight away.',
+    }),
+    el('h2', { text: 'Choosing something that is underneath something else' }),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 18px',
+      text:
+        'A big picture covers everything behind it, so it is what a click lands on. ' +
+        'Click the same spot again and the click goes to the next thing down, and ' +
+        'again for the one below that \u2014 so a small picture or a line of text under ' +
+        'a large one is always reachable, whichever one is on top. The panel says ' +
+        'when there is something under what you have selected, so you know to click ' +
+        'once more.',
+    }),
+    el('h2', { text: 'A picture behind the words' }),
+    el('p', {
+      class: 'hint',
+      style: 'margin-bottom: 18px',
+      text:
+        'A picture used as the background is darkened a little, so words and buttons ' +
+        'stay readable over it. The "Darkening" slider under it decides how much: all ' +
+        'the way to the left leaves the picture exactly as it came out of the camera, ' +
+        'all the way right is the usual amount. Each slide has its own.',
     }),
     el('h2', { text: 'Working on several things at once' }),
     el('p', {
@@ -5459,6 +5662,14 @@ function bindCanvas() {
   // Bound once, on the document, because the canvas is recreated on each
   // render. Handlers check whether the event is on the canvas.
   let drag = null;
+  /**
+   * Where the last press landed, so pressing the same place again can step down
+   * through whatever is stacked there.
+   *
+   * Nothing has to clear it: a press anywhere else fails the "same place" test,
+   * so the next press there starts at the top of the stack again.
+   */
+  let lastPress = null;
 
   document.addEventListener('pointerdown', (event) => {
     const canvas = event.target.closest && event.target.closest('#slideCanvas');
@@ -5481,7 +5692,7 @@ function bindCanvas() {
     const current = state.selectedElementId
       ? layout.elements.find((e) => e.id === state.selectedElementId)
       : null;
-    if (current && !current.generated) {
+    if (current) {
       const handle = handleAt(current.box, point);
       if (handle) {
         drag = {
@@ -5505,7 +5716,15 @@ function bindCanvas() {
       }
     }
 
-    const hit = hitTest(layout, point);
+    /*
+      What the press lands on, and where it landed.
+
+      Pressing the same place twice steps down through the stack, which is how a
+      smaller thing under a big transparent picture is reached at all.
+    */
+    const picked = pickAt(layout, point, lastPress);
+    lastPress = picked.at;
+    const hit = picked.element;
 
     /*
       A modifier means "add this to what I have", not "start over".
@@ -5520,7 +5739,7 @@ function bindCanvas() {
     */
     const additive = event.metaKey || event.ctrlKey || event.shiftKey;
     if (additive) {
-      if (hit && !hit.generated) toggleElementSelection(hit.id);
+      if (hit) toggleElementSelection(hit.id);
       renderInspector();
       drawCanvas();
       return;
@@ -5536,7 +5755,7 @@ function bindCanvas() {
     setElementSelectionIfOutside(hit);
     renderInspector();
 
-    if (hit && !hit.generated) {
+    if (hit) {
       const group = selectedElements();
       const origins = group.map((element) => ({ id: element.id, x: element.x, y: element.y }));
 
@@ -5575,7 +5794,7 @@ function bindCanvas() {
             (e) => e.id === state.selectedElementId
           )
         : null;
-      const handle = current && !current.generated ? handleAt(current.box, canvasPoint(event)) : null;
+      const handle = current ? handleAt(current.box, canvasPoint(event)) : null;
       canvas.style.cursor = handle ? HANDLE_CURSORS[handle] : 'default';
       return;
     }
@@ -5637,8 +5856,7 @@ function bindCanvas() {
           height: element.height,
         },
         layout,
-        element.id,
-        element.kind
+        element.id
       );
       element.x = snapped.x;
       element.y = snapped.y;
@@ -5687,7 +5905,7 @@ function bindCanvas() {
     const layout = activeSlideLayout();
     if (!layout) return;
 
-    const hit = hitTest(layout, canvasPoint(event));
+    const hit = gestureTarget(layout, canvasPoint(event));
     if (!hit) return;
 
     setElementSelection([hit.id]);
@@ -5711,7 +5929,7 @@ function bindCanvas() {
 
     event.preventDefault();
     const point = canvasPoint(event);
-    const hit = hitTest(layout, point);
+    const hit = gestureTarget(layout, point);
 
     if (hit) {
       setElementSelection([hit.id]);
@@ -5909,21 +6127,20 @@ function openElementMenu(event, element, layout) {
 
   entries.push({ separator: true });
 
-  if (element.generated) {
-    entries.push({
-      label: element.generated === 'back' ? 'Remove the Back button' : 'Remove the Next button',
-      disabled: true,
-      hint: 'placed automatically',
-      action: () => {},
-    });
-  } else {
-    entries.push({
-      label: 'Delete',
-      danger: true,
-      hint: 'Del',
-      action: () => deleteElement(element.id),
-    });
-  }
+  /*
+    Everything can be deleted, with nothing exempt.
+
+    The Back/Next row used to appear here as a disabled entry, because it was
+    placed by the layout rather than by her and removing it would have been a
+    lie — the next redraw would have put it back. That row is gone, so this is
+    the only case left.
+  */
+  entries.push({
+    label: 'Delete',
+    danger: true,
+    hint: 'Del',
+    action: () => deleteElement(element.id),
+  });
 
   void layout;
   void slide;
@@ -6008,7 +6225,6 @@ function duplicateElement(elementId) {
   copy.id = newId(element.kind);
   copy.x = element.x + 16;
   copy.y = element.y + 16;
-  copy.generated = undefined;
   slide.elements.push(copy);
   clampElementInPlace(copy);
   setElementSelection([copy.id]);
@@ -6846,15 +7062,19 @@ function dropVideoOnCanvas(video) {
  * is invisible here and obvious there.
  *
  * It fills the available space: the full safe height, then as wide as that
- * allows, exactly centred, with clean clearance above the navigation row so
- * nothing ever overlaps. Nothing to position or scale by hand.
+ * allows, exactly centred. Nothing to position or scale by hand.
  */
 function fitTileToSlide(video) {
   const margin = SAFE_MARGIN;
   const maxAvailWidth = RASTER.width - margin * 2;
-  // The navigation row (< Menu / Next >) occupies y = 408..440, so the tile
-  // stops at 396 to keep a clear gap above it.
-  const maxAvailHeight = 396 - margin;
+  /*
+    The whole safe height, top margin to bottom margin.
+
+    This stopped at 396 to leave the navigation row its band at y = 408..440 —
+    a row that no longer exists, so leaving the gap would now be a strip of the
+    picture reserved for nothing.
+  */
+  const maxAvailHeight = RASTER.height - margin * 2;
 
   const probe = (video && video.probe) || {};
   let displayAspect = probe.width && probe.height ? probe.width / probe.height : 16 / 9;
@@ -7083,7 +7303,6 @@ function installTestHooks() {
           width: e.width,
           height: e.height,
           fit: e.fit,
-          generated: e.generated,
           hasPoster: Boolean(e.src),
         })),
       })),
@@ -7146,6 +7365,28 @@ function installTestHooks() {
         : activeSlide();
       return Boolean(slide && slide.backgroundImage);
     },
+    /*
+      How far the background picture is washed toward the theme colour. The
+      number the slider writes, and what the drawing code is handed, are the same
+      one, so this reads back what would actually be drawn.
+    */
+    setSlideBackgroundDim: (value) => {
+      const slide = activeSlide();
+      if (!slide) return null;
+      slide.backgroundDim = Math.max(0, Math.min(1, Number(value)));
+      persistDeck();
+      refreshCanvas();
+      return slide.backgroundDim;
+    },
+    slideBackgroundDim: (slideId) => {
+      const slide = slideId
+        ? state.deck.slides.find((s) => s.id === slideId)
+        : activeSlide();
+      if (!slide) return null;
+      // The layout clamps and defaults this; asking it is asking what is drawn.
+      const layout = state.layout && state.layout.slides.find((s) => s.slide && s.slide.id === slide.id);
+      return layout && layout.background ? layout.background.dim : null;
+    },
     // The slide being edited, and what the disc makes of the deck as it stands —
     // the same model the burn and the simulator are both built from.
     goToSlide: (slideId) => {
@@ -7159,6 +7400,25 @@ function installTestHooks() {
       setElementSelection([elementId]);
       renderInspector();
       return state.selectedElementId;
+    },
+    /*
+      The hit test, as the canvas does it.
+
+      `stack` is everything under a point, front to back, and `press` is what a
+      press there reaches: the same call the canvas makes, with the caller
+      holding the "where was the last press" memory the closure would otherwise
+      keep. Both are here because the click-through is the whole fix for a big
+      transparent picture covering a small one, and it is invisible in a
+      screenshot.
+    */
+    stack: (point) => stackAt(activeSlideLayout(), point).map((e) => e.id),
+    press: (point, previous) => {
+      const picked = pickAt(activeSlideLayout(), point, previous);
+      return { id: picked.element ? picked.element.id : null, at: picked.at };
+    },
+    beneathSelected: () => {
+      const found = state.selectedElementId ? findElement(state.selectedElementId) : null;
+      return elementsBeneath(found && found.element, activeSlideLayout()).map((e) => e.id);
     },
     setImageTarget: (elementId, targetSlideId) => {
       const { element } = findElement(elementId);

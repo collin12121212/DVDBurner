@@ -33,15 +33,6 @@
    */
   const SAFE_MARGIN = 40;
 
-  /**
-   * The lowest a video tile may reach.
-   *
-   * The navigation row — `< Menu` and `Next >` — sits at y = 408..440, so a
-   * tile's bottom edge stops short of it. This is the one limit that is about
-   * something other than overscan.
-   */
-  const VIDEO_BOTTOM = 396;
-
   const MIN_WIDTH = 40;
   const MIN_HEIGHT = 24;
 
@@ -103,7 +94,15 @@
     const rasterWidth = Number(width) || RASTER.width;
     const rasterHeight = Number(height) || RASTER.height;
     const boxRight = rasterWidth - SAFE_MARGIN;
-    const boxBottom = element.kind === 'video' ? VIDEO_BOTTOM : rasterHeight - SAFE_MARGIN;
+    /*
+      One bottom for everything.
+
+      A video tile used to stop higher than the rest, to keep clear of the
+      navigation row that was drawn at y = 408..440 on every page it did not
+      belong to. That row is gone, so there is nothing to keep clear of and no
+      reason for a second number: the overscan margin is the only limit left.
+    */
+    const boxBottom = rasterHeight - SAFE_MARGIN;
 
     let w = Math.max(MIN_WIDTH, Math.round(Number(element.width) || MIN_WIDTH));
     let h = Math.max(MIN_HEIGHT, Math.round(Number(element.height) || MIN_HEIGHT));
@@ -167,7 +166,6 @@
   return {
     RASTER,
     SAFE_MARGIN,
-    VIDEO_BOTTOM,
     MIN_WIDTH,
     MIN_HEIGHT,
     SHAPE_LOCKED,

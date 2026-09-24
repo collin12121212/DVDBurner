@@ -317,9 +317,15 @@ async function main() {
   await test('an episode list slide is laid out as a menu, to be navigated', () => {
     const slide = deckModel.episodeListSlide(sampleVideos, { title: 'Episodes' });
     assertEqual(slide.role, 'menu', 'An episode list is a menu hub');
-    // A menu hub gets no Back/Next row: it is where the disc lives.
+    /*
+      Only the buttons she put there are on the slide. The layout used to add a
+      Back/Next row of its own to any slide it decided was not a hub; that is
+      gone, so a page can never grow furniture nobody asked for — and a deck
+      saved before that change loses the row too.
+    */
     const layout = slideLayout.layoutSlide({ slides: [slide], themeId: 'charcoal' }, slide);
-    assertEqual(layout.navigation.length, 0, 'A menu hub needs no navigation row');
+    const buttons = layout.elements.filter((e) => e.kind === 'button');
+    assertEqual(buttons.length, sampleVideos.length, 'The layout adds no buttons of its own');
   });
 
   await test('a full episode list slide keeps every button on the picture', () => {
@@ -422,7 +428,7 @@ async function main() {
     assertEqual(fineLayout.problems.length, 0, 'A normal slide reports no problems');
   });
 
-  await test('a container slide gains Back and Next automatically', () => {
+  await test('the layout never puts a button on a slide by itself', () => {
     const menu = deckModel.episodeListSlide(sampleVideos, { title: 'Menu' });
     const about = deckModel.makeSlide({ title: 'About', role: 'content' });
     about.elements = [deckModel.makeTextElement({ text: 'Hello' })];
@@ -432,38 +438,29 @@ async function main() {
     const deck = { themeId: 'charcoal', slides: [menu, about, second] };
     const layout = slideLayout.layoutDeck(deck);
 
-    // The first slide is a menu hub: it is where the disc lives, so it gets no
-    // navigation row at all.
-    assertEqual(layout.slides[0].navigation.length, 0, 'A menu hub gets no navigation row');
-
-    // The middle slide can go either way.
-    const middleNav = layout.slides[1].navigation.map((n) => n.generated).sort();
-    assertEqual(middleNav.join(','), 'back,next', 'The middle slide goes both ways');
-
-    // The last slide has nowhere forward to go, so it only offers Back.
-    const lastNav = layout.slides[2].navigation.map((n) => n.generated);
-    assertEqual(lastNav.join(','), 'back', 'The last slide only goes back');
-
-    // Every navigation button must point at a neighbouring slide, or pressing
-    // it would go somewhere unexpected.
-    for (const entry of layout.slides) {
-      const index = layout.slides.indexOf(entry);
-      for (const nav of entry.navigation) {
-        const targetIndex = deck.slides.findIndex((s) => s.id === nav.targetSlideId);
-        if (nav.generated === 'back') {
-          assertEqual(targetIndex, index - 1, 'Back goes to the previous slide');
-        } else {
-          assertEqual(targetIndex, index + 1, 'Next goes to the following slide');
-        }
-      }
+    /*
+      The Back/Next row used to be added here, to every page that was not the
+      hub. It is gone, so the buttons on the canvas are exactly the buttons in
+      the deck — on every page, not only on the first. That is the whole of what
+      "what she sees is what gets burned" means, and it is also why a project
+      saved before this change loses the row rather than keeping it.
+    */
+    for (const [index, entry] of layout.slides.entries()) {
+      const burned = entry.elements.filter((e) => e.kind === 'button').length;
+      const authored = deck.slides[index].elements.filter((e) => e.kind === 'button').length;
+      assertEqual(burned, authored, `Slide ${index} carries only the buttons that are in the deck`);
     }
   });
 
-  await test('a lone slide needs no navigation', () => {
+  await test('a lone slide invents nothing either', () => {
     const only = deckModel.makeSlide({ title: 'Only', role: 'content' });
     only.elements = [deckModel.makeTextElement({ text: 'Alone' })];
     const layout = slideLayout.layoutSlide({ themeId: 'charcoal', slides: [only] }, only);
-    assertEqual(layout.navigation.length, 0, 'Nothing to navigate to');
+    assertEqual(
+      layout.elements.filter((e) => e.kind === 'button').length,
+      0,
+      'Nothing to navigate to, and nothing invented for it'
+    );
   });
 
   await test('buttons are rounded to even coordinates for the highlight layer', () => {
@@ -689,7 +686,9 @@ async function main() {
     const displayAspect = 16 / 9;
     const rasterAspect = slideLayout.displayAspectToRaster(displayAspect);
 
-    const maxHeight = 396 - deckModel.SAFE_MARGIN;
+    // The whole safe height, which is what the editor now uses: a tile no longer
+    // stops short to leave room for a row of buttons that is not drawn.
+    const maxHeight = deckModel.RASTER.height - deckModel.SAFE_MARGIN * 2;
     const maxWidth = deckModel.RASTER.width - deckModel.SAFE_MARGIN * 2;
     let width = maxWidth;
     let height = Math.round(width / rasterAspect);
@@ -703,7 +702,7 @@ async function main() {
     assertClose(onScreen, displayAspect, 0.05, 'The tile must look 16:9 on the television');
 
     assert(width <= maxWidth, 'The tile fits the width');
-    assert(height <= maxHeight, 'The tile clears the navigation row');
+    assert(height <= maxHeight, 'The tile clears the bottom of the picture');
     assert(width % 2 === 0 && height % 2 === 0, 'Even dimensions for clean subpicture pixels');
   });
 

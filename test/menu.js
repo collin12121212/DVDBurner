@@ -214,6 +214,22 @@ app.whenReady().then(async () => {
         autoHeight: true,
       }),
       deckModel.makeImageElement({ x: 220, y: 200, width: 280, height: 180 }),
+      /*
+        A way back that she made herself.
+
+        The layout used to add this button for her, which is why the deck here
+        did not need one. It no longer does — nothing appears on a page that is
+        not in the deck — so a page she wants to leave has to carry its own
+        button pointing at the page it goes back to.
+      */
+      deckModel.makeButtonElement({
+        label: 'Back to the menu',
+        targetSlideId: menu.id,
+        x: 60,
+        y: 400,
+        width: 240,
+        height: 46,
+      }),
     ];
 
     const multi = await renderAndInspect({
@@ -226,19 +242,19 @@ app.whenReady().then(async () => {
       },
     });
 
-    // The About slide is not a menu hub, so it must have gained a Back button
-    // automatically. Without one the disc would be a dead end.
+    // The About slide carries exactly the one button it was given and no
+    // others: a page no longer gains a row of its own, so what the inspector
+    // lists is what the disc gets.
     const aboutLayout = multi.slides[1];
-    const generated = aboutLayout.navigation.filter((n) => n.generated);
     record(
-      generated.length > 0,
-      'multi-slide: a navigation button was added automatically',
-      `${generated.length} generated`
+      aboutLayout.buttons.length === 1,
+      'multi-slide: the page carries the button she put on it, and only that one',
+      `${aboutLayout.buttons.length} buttons`
     );
     record(
-      aboutLayout.buttons.length >= 1,
-      'multi-slide: the navigable slide has a usable button',
-      `${aboutLayout.buttons.length} buttons`
+      aboutLayout.buttons[0] && aboutLayout.buttons[0].targetSlideId === menu.id,
+      'multi-slide: that button goes back to the menu',
+      `${aboutLayout.buttons[0] && aboutLayout.buttons[0].targetSlideId}`
     );
 
     // ---- the densely packed case ----------------------------------------

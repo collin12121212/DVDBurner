@@ -460,8 +460,17 @@ test('a button pointing at a slide showing a film plays that film', () => {
 });
 
 test('a slide with a film and its own buttons still plays the film', () => {
-  // The episode slide carries the automatic Back/Next row as well as the film,
-  // and that must not change what a button aimed at it does.
+  /*
+    A page can hold a film and buttons at once, and that must not change what a
+    button aimed at it does: aimed at the film, it plays the film; aimed at a
+    page, it opens the page.
+
+    Every page here carries its own button, because that is the only way a page
+    gets one now. The layout used to add a Back/Next row to any slide it judged
+    not to be a hub, which is what made the words-only slide below a menu page in
+    the first place; with that gone, a page with no buttons on it is not a page
+    the disc can reach, so the test has to author the button a person would.
+  */
   const deck = {
     discTitle: 'Play through',
     themeId: 'charcoal',
@@ -471,6 +480,7 @@ test('a slide with a film and its own buttons still plays the film', () => {
         id: 'menu-1', title: 'First', role: 'menu', themeId: 'charcoal',
         elements: [
           { id: 'g1', kind: 'button', label: 'Watch', targetSlideId: 'ep-1', x: 48, y: 100, width: 300, height: 54 },
+          { id: 'g2', kind: 'button', label: 'Words', targetSlideId: 'ep-2', x: 48, y: 180, width: 300, height: 54 },
         ],
       },
       {
@@ -483,6 +493,7 @@ test('a slide with a film and its own buttons still plays the film', () => {
         id: 'ep-2', title: 'Another', role: 'content', themeId: 'charcoal',
         elements: [
           { id: 't1', kind: 'text', text: 'Words only', x: 48, y: 60, width: 400, height: 50 },
+          { id: 'b1', kind: 'button', label: 'Back', targetSlideId: 'menu-1', x: 48, y: 380, width: 200, height: 54 },
         ],
       },
     ],
@@ -496,6 +507,11 @@ test('a slide with a film and its own buttons still plays the film', () => {
   // the page rather than jumping somewhere unrelated.
   const pageForWords = model.menus.find((m) => m.slideId === 'ep-2');
   assert(pageForWords, 'The slide with buttons is a menu page of its own');
+  assertEqual(
+    pageForWords.buttons.length,
+    1,
+    'Carrying the one button it was given, and nothing added for it'
+  );
 });
 
 // ------------------------------------------------- the disc writer on macOS ---

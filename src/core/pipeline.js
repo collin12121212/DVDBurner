@@ -99,13 +99,21 @@ function normaliseProject(input = {}) {
  * choose between episodes — a disc that skips straight into a video is a disc
  * someone has to sit through.
  *
- * The menu slide starts with no buttons on purpose. Its buttons are generated
- * from the video list and kept in step by the editor, so a video added later
- * appears on the menu without anyone having to remember to add it.
+ * The videos are listed on it here, which is the opposite of what the editor
+ * does. In the editor a menu slide starts empty and its buttons are hers to add,
+ * because a button appearing because a file was dropped in is not what dropping
+ * a file in means. This deck is the one used when there is no editor session at
+ * all, and there a menu with nothing on it is not a menu: it would not be a page,
+ * there would be nothing to choose, and the menu key would have nowhere to go.
  */
 function defaultDeck(discTitle, videos, input) {
   const themeId = (input && input.themeId) || 'charcoal';
-  const slides = [deckModel.episodeListSlide([], { title: discTitle, themeId })];
+  const slides = [
+    deckModel.episodeListSlide(
+      (videos || []).map((v) => ({ id: v.id, name: v.name, menuLabel: v.menuLabel })),
+      { title: discTitle, themeId }
+    ),
+  ];
   return { discTitle, themeId, buttonStyle: 'bar', slides };
 }
 

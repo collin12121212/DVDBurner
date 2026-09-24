@@ -912,6 +912,17 @@ body.wide-stage .rail {
      controls column behind a tab, because four columns left the slide — the
      thing she is actually working on — squeezed to a thumbnail. */
   grid-template-columns: 156px minmax(0, 1fr) 268px;
+  /*
+    One row, and it takes the height it is given rather than the height its
+    contents want.
+
+    Without this the row is sized `auto`, so a long list of slides made the row
+    taller than the window: the list never scrolled because it was never
+    constrained, everything past the sixth slide was off the bottom of a stage
+    that clips, and the canvas in the middle stretched to fill the extra height.
+    `minmax(0, 1fr)` is what lets the columns inside scroll instead.
+  */
+  grid-template-rows: minmax(0, 1fr);
   flex: 1 1 auto;
   min-height: 0;
 }
@@ -1737,6 +1748,76 @@ body.wide-stage .rail {
   margin-top: 2px;
   font-size: 11px;
   color: var(--muted-dim);
+}
+
+/* The darkening slider under the background picture. A range input is drawn by
+   the browser and looks nothing like the rest of the panel until it is told to,
+   so the track and the thumb are both stated here. */
+.dim-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dim-range {
+  flex: 1 1 auto;
+  min-width: 0;
+  appearance: none;
+  height: 18px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.dim-range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--ink-line);
+}
+
+.dim-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  border: 1px solid var(--ink-sunken);
+  background: var(--amber);
+}
+
+.dim-range:hover::-webkit-slider-thumb {
+  background: var(--paper);
+}
+
+.dim-range:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Firefox, which draws the track as the element itself. */
+.dim-range::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--ink-line);
+}
+
+.dim-range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid var(--ink-sunken);
+  background: var(--amber);
+}
+
+/* Fixed width, so the slider does not jump sideways as the number changes. */
+.dim-readout {
+  flex: 0 0 auto;
+  width: 54px;
+  text-align: right;
+  font-size: 11px;
+  color: var(--muted-dim);
+  font-variant-numeric: tabular-nums;
 }
 
 /* The note on a slide card in the filmstrip, for a page that has a sound. */

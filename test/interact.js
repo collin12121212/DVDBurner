@@ -790,6 +790,214 @@ async function run() {
     dragResult.after ? String(dragResult.after.width) : '?'
   );
 
+  // ---------------------------- reaching under a picture that covers one ---
+  console.log('\nReaching the thing underneath a picture');
+
+  /*
+    The reported problem: a big picture with a transparent background sits over
+    a smaller one, and the smaller one can never be selected because every press
+    lands on the big one. The fix is that pressing the *same spot* again steps
+    down through whatever is stacked there.
+
+    Both are pictures, so the tie is broken by which was added last — the big one
+    is on top, which is exactly the reported arrangement.
+  */
+  await js(`window.__burnhouseTest.createNewProject('Stacked', 'charcoal')`);
+  await settle(700);
+
+  const pile = await js(`(() => {
+    const small = window.__burnhouseTest.addElement('image', {
+      x: 140, y: 150, width: 180, height: 120,
+    });
+    const big = window.__burnhouseTest.addElement('image', {
+      x: 60, y: 60, width: 600, height: 380,
+    });
+    return { smallId: small.id, bigId: big.id };
+  })()`);
+  await settle(900);
+
+  // A point inside both.
+  const inside = { x: 220, y: 210 };
+  const stack = await js(
+    `window.__burnhouseTest.stack(${JSON.stringify(inside)})`
+  );
+  record(
+    Array.isArray(stack) && stack[0] === pile.bigId && stack[1] === pile.smallId,
+    'under a point are both pictures, the covering one first',
+    JSON.stringify(stack)
+  );
+
+  /*
+    Two presses in the same place, with the memory of the first handed to the
+    second — which is what the canvas does between one press and the next.
+  */
+  const pressTrail = await js(`(() => {
+    const at = ${JSON.stringify(inside)};
+    const T = window.__burnhouseTest;
+    // Between one press and the next the canvas selects what was reached, and
+    // the step down is counted from that — so the trail does the same.
+    const first = T.press(at, null);
+    T.selectElement(first.id);
+    const second = T.press(at, first.at);
+    T.selectElement(second.id);
+    const third = T.press(at, second.at);
+    // A press somewhere else forgets the trail, so the next press there starts
+    // at the top again rather than continuing where the last one left off.
+    const elsewhere = T.press({ x: 100, y: 90 }, null);
+    const backToStart = T.press(at, elsewhere.at);
+    return { first: first.id, second: second.id, third: third.id, backToStart: backToStart.id };
+  })()`);
+
+  record(
+    pressTrail.first === pile.bigId,
+    'the first press takes the picture on top',
+    String(pressTrail.first)
+  );
+  record(
+    pressTrail.second === pile.smallId,
+    'pressing the same spot again reaches the one underneath',
+    String(pressTrail.second)
+  );
+  record(
+    pressTrail.third === pile.bigId,
+    'and a third press comes back round to the top',
+    String(pressTrail.third)
+  );
+  record(
+    pressTrail.backToStart === pile.bigId,
+    'a press elsewhere starts again from the top',
+    String(pressTrail.backToStart)
+  );
+
+  // The panel has to say so, or the gesture is one nobody would look for.
+  const beneath = await js(`(() => {
+    window.__burnhouseTest.selectElement(${JSON.stringify(pile.bigId)});
+    const ids = window.__burnhouseTest.beneathSelected();
+    const hint = [...document.querySelectorAll('.prop-hint')]
+      .map((n) => n.textContent.trim())
+      .find((t) => /behind this one/.test(t));
+    window.__burnhouseTest.selectElement(${JSON.stringify(pile.smallId)});
+    return { ids, hint, onTopCount: window.__burnhouseTest.beneathSelected().length };
+  })()`);
+
+  record(
+    Array.isArray(beneath.ids) && beneath.ids.length === 1 && beneath.ids[0] === pile.smallId,
+    'the panel knows what is under the picture on top',
+    JSON.stringify(beneath.ids)
+  );
+  record(
+    Boolean(beneath.hint),
+    'and says so, so the press-through can be found',
+    beneath.hint || 'no note'
+  );
+  record(
+    beneath.onTopCount === 0,
+    'with nothing said about the picture on top of the pile',
+    String(beneath.onTopCount)
+  );
+
+  // ------------------------------------- how dark the background picture is ---
+  console.log('\nDarkening the background picture');
+
+  await js(`window.__burnhouseTest.createNewProject('Darkening', 'charcoal')`);
+  await settle(700);
+
+  const noPicture = await js(`window.__burnhouseTest.slideBackgroundDim()`);
+  record(
+    noPicture === 1,
+    'with no picture behind, the darkening is the usual amount',
+    String(noPicture)
+  );
+
+  const darkPath = path.join(sandbox, 'darkening.png');
+  fs.writeFileSync(
+    darkPath,
+    await js(`(() => {
+      const swatch = document.createElement('canvas');
+      swatch.width = 320; swatch.height = 240;
+      const c = swatch.getContext('2d');
+      c.fillStyle = '#8f6a3f';
+      c.fillRect(0, 0, 320, 240);
+      return swatch.toDataURL('image/png');
+    })()`).then((url) => Buffer.from(url.split(',')[1], 'base64'))
+  );
+
+  const dim = await js(`(async () => {
+    await window.__burnhouseTest.setSlideBackground(${JSON.stringify(darkPath)});
+    const has = window.__burnhouseTest.hasSlideBackground();
+    const original = window.__burnhouseTest.slideBackgroundDim();
+    const half = window.__burnhouseTest.setSlideBackgroundDim(0.5);
+    await new Promise((r) => setTimeout(r, 300));
+    const readHalf = window.__burnhouseTest.slideBackgroundDim();
+    window.__burnhouseTest.setSlideBackgroundDim(0);
+    await new Promise((r) => setTimeout(r, 300));
+    const readNone = window.__burnhouseTest.slideBackgroundDim();
+    window.__burnhouseTest.setSlideBackgroundDim(9);
+    await new Promise((r) => setTimeout(r, 300));
+    const readOver = window.__burnhouseTest.slideBackgroundDim();
+    return { has, original, half, readHalf, readNone, readOver };
+  })()`);
+
+  record(dim.has, 'a picture was put behind the slide');
+  record(
+    dim.original === 1,
+    'a picture starts as dark as it has always been',
+    String(dim.original)
+  );
+  record(
+    dim.readHalf === 0.5 && dim.half === 0.5,
+    'the slider reaches the drawing code as what was chosen',
+    `set ${dim.half}, drawn ${dim.readHalf}`
+  );
+  record(
+    dim.readNone === 0,
+    'zero leaves the picture at its original brightness',
+    String(dim.readNone)
+  );
+  record(
+    dim.readOver === 1,
+    'and it cannot be pushed past the usual amount',
+    String(dim.readOver)
+  );
+
+  /*
+    And the control itself, drawn in the panel. A setting nobody can find is the
+    same as no setting, so this asks the rendered panel rather than the model —
+    in its own round trip, because the inspector is rebuilt once the layout
+    request comes back rather than in the same tick.
+  */
+  await js(`(() => {
+    const T = window.__burnhouseTest;
+    T.setSlideBackgroundDim(0.5);
+    T.goToSlide(T.getState().activeSlideId);
+    return true;
+  })()`);
+  await settle(700);
+
+  const dimPanel = await js(`(() => {
+    const slider = document.querySelector('.dim-range');
+    const readout = document.querySelector('.dim-readout');
+    return {
+      slider: Boolean(slider),
+      min: slider ? slider.min : null,
+      max: slider ? slider.max : null,
+      shown: slider ? slider.value : null,
+      readout: readout ? readout.textContent : null,
+    };
+  })()`);
+
+  record(dimPanel.slider, 'the background block carries a slider for the darkening');
+  record(
+    dimPanel.min === '0' && dimPanel.max === '1',
+    'which runs from the original picture to the usual wash',
+    `${dimPanel.min} to ${dimPanel.max}`
+  );
+  record(
+    dimPanel.shown === '0.5' && dimPanel.readout === '50%',
+    'and shows what the slide is set to',
+    `${dimPanel.shown} / ${dimPanel.readout}`
+  );
+
   // ------------------------------- a picture that goes to another slide ---
   console.log('\nMaking a picture clickable');
 

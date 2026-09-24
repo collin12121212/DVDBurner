@@ -959,12 +959,20 @@ test('a video tile is pulled back without being squashed', () => {
   const box = dragged('video', 0, 0, 1600, 900);
   const before = 1600 / 900;
 
-  assert(box.width <= 640 && box.height <= safeArea.VIDEO_BOTTOM - safeArea.SAFE_MARGIN, 'It fits the safe area');
+  assert(box.width <= 640, 'It fits the safe area across');
   assertClose(box.width / box.height, before, 0.01, 'A stretched face on the disc is what this prevents');
+  /*
+    And it uses the whole safe height. A tile used to stop at 396 to leave the
+    navigation row its band, which capped this one at 356 tall even though it was
+    nowhere near the bottom guide; with the row gone the width is what limits it,
+    so it is the full 640 across and 360 down.
+  */
   assert(
-    box.y + box.height <= safeArea.VIDEO_BOTTOM,
-    'And it still stops short of the navigation row'
+    box.y + box.height <= safeArea.RASTER.height - safeArea.SAFE_MARGIN,
+    'And it stays inside the bottom guide'
   );
+  assertEqual(box.width, 640, 'It fills the safe width, which is what limits it now');
+  assertEqual(box.height, 360, 'Rather than stopping short of a row that is gone');
 });
 
 test('the editor and the authoring side share one clamp', () => {

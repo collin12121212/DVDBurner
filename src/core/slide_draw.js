@@ -140,12 +140,23 @@
         white menu text over a bright sky is unreadable from a sofa. Washing it
         with the theme's colour keeps whichever theme she picked in charge of how
         the words look.
+
+        How much is up to her, and 1 — the default — is the wash this has always
+        applied. At 0 the photograph is left exactly as it is, which is the right
+        answer for a picture that is already dark, or for a background that is
+        meant to be looked at rather than read over.
       */
-      ctx.save();
-      ctx.globalAlpha = 0.42;
-      ctx.fillStyle = theme.background;
-      ctx.fillRect(0, 0, width, height);
-      ctx.restore();
+      const dim = layout.background && Number.isFinite(layout.background.dim)
+        ? Math.max(0, Math.min(1, layout.background.dim))
+        : 1;
+
+      if (dim > 0) {
+        ctx.save();
+        ctx.globalAlpha = 0.42 * dim;
+        ctx.fillStyle = theme.background;
+        ctx.fillRect(0, 0, width, height);
+        ctx.restore();
+      }
     }
 
     // A plain background means no glow and no vignette: "none" is the theme
@@ -566,6 +577,28 @@
   }
 
   /**
+   * The order elements are drawn in, which is also the order they are stacked.
+   *
+   * Back to front: the last one drawn is the one on top. Exported because the
+   * editor has to decide which element a click lands on, and it has to agree with
+   * what is actually visible — with two copies of this rule, clicking a picture
+   * that looks like it is underneath a panel would select the picture and
+   * nothing on screen would explain why.
+   *
+   * Priority first, and the lower number is nearer the front — which means drawn
+   * last. Kind order still breaks ties, so an element that has never been given a
+   * priority behaves exactly as it did before priorities existed: buttons on top,
+   * then text, then pictures.
+   */
+  const STACK_ORDER = { frame: 0, image: 1, video: 2, text: 3, button: 4 };
+
+  function compareStacking(a, b) {
+    const byPriority = (Number(b.priority) || 0) - (Number(a.priority) || 0);
+    if (byPriority !== 0) return byPriority;
+    return (STACK_ORDER[a.kind] || 0) - (STACK_ORDER[b.kind] || 0);
+  }
+
+  /**
    * Draw a whole slide, in the order a reader would expect: background, then
    * frames, then pictures and text, then buttons on top.
    *
@@ -580,18 +613,7 @@
 
     drawBackground(ctx, layout, images);
 
-    const order = { frame: 0, image: 1, video: 2, text: 3, button: 4 };
-    const sorted = layout.elements.slice().sort((a, b) => {
-      /*
-        Priority first, and the lower number is nearer the front — which means
-        drawn last. Kind order still breaks ties, so an element that has never
-        been given a priority behaves exactly as it did before priorities
-        existed: buttons on top, then text, then pictures.
-      */
-      const byPriority = (Number(b.priority) || 0) - (Number(a.priority) || 0);
-      if (byPriority !== 0) return byPriority;
-      return (order[a.kind] || 0) - (order[b.kind] || 0);
-    });
+    const sorted = layout.elements.slice().sort(compareStacking);
 
     for (const element of sorted) {
       drawElement(ctx, element, layout, images || {});
@@ -614,5 +636,7 @@
     hexToRgba,
     mix,
     isLight,
+    compareStacking,
+    STACK_ORDER,
   };
 });
