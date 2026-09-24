@@ -703,13 +703,29 @@ async function run() {
     `${pinnedLeft.width} then ${pinnedRight.width}`
   );
 
-  const smallPicture = await js(
+  /*
+    A picture is not clamped at all — not to the guide, not to the slide. This
+    used to assert the opposite, in the days when a small picture was held
+    inside the margin; the margin turned out to be the wall somebody kept
+    hitting, so there is no wall for pictures any more. What the editor must do
+    is keep the position it was handed, however far out it is.
+  */
+  const offTheSlide = await js(
     `window.__burnhouseTest.clampElement({ kind: 'image', x: -9999, y: -9999, width: 260, height: 190 })`
   );
   record(
-    smallPicture.x === 40 && smallPicture.y === 40,
-    'while a picture that fits is still held inside the guide',
-    `${smallPicture.x},${smallPicture.y}`
+    offTheSlide.x === -9999 && offTheSlide.y === -9999,
+    'a picture keeps the position it is given, even clear off the slide',
+    `${offTheSlide.x},${offTheSlide.y}`
+  );
+
+  const heldIn = await js(
+    `window.__burnhouseTest.clampElement({ kind: 'text', x: 9999, y: 9999, width: 5000, height: 5000 })`
+  );
+  record(
+    heldIn.x === 40 && heldIn.y === 40,
+    'while everything with words in it is still pulled back inside the guide',
+    `${heldIn.x},${heldIn.y}`
   );
 
   /*
