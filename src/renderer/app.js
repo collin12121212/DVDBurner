@@ -1471,41 +1471,15 @@ function drawEditorOverlay(ctx, layout) {
   }
 
   /*
-    Which pictures the remote can land on.
+    Nothing is drawn over a picture that has been given somewhere to go.
 
-    A button and a video tile already look pressable. A picture does not, so one
-    that has been given somewhere to go is marked with a small badge — otherwise
-    she sets a destination, sees nothing change, and has no way of telling a
-    clickable picture from an ordinary one.
-
-    The badge sits at the element's visible corner rather than its own: a picture
-    larger than the frame has its corner off the edge, where a mark would never
-    be seen. This is editor furniture, drawn after the slide itself, and it never
-    reaches the disc.
+    There used to be an amber badge with a chevron on the corner of every such
+    picture, so that a clickable picture could be told from an ordinary one. It
+    was editor furniture and it never reached the disc, but it sat on her
+    photograph in the one place she was trying to look at, and the panel already
+    says where a picture goes. Those are two ways of saying the same thing, and
+    only one of them is worth looking at.
   */
-  for (const element of layout.buttons || []) {
-    if (element.kind !== 'image' || element.id === selected) continue;
-    const box = element.box;
-    const spotX = Math.max(4, Math.min(Math.round(box.x), layout.width - 30));
-    const spotY = Math.max(4, Math.min(Math.round(box.y), layout.height - 26));
-
-    ctx.save();
-    ctx.fillStyle = 'rgba(217, 163, 83, 0.95)';
-    ctx.beginPath();
-    ctx.roundRect(spotX, spotY, 24, 20, 5);
-    ctx.fill();
-
-    ctx.strokeStyle = '#1c1b19';
-    ctx.lineWidth = 2;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.beginPath();
-    ctx.moveTo(spotX + 10, spotY + 6);
-    ctx.lineTo(spotX + 15, spotY + 10);
-    ctx.lineTo(spotX + 10, spotY + 14);
-    ctx.stroke();
-    ctx.restore();
-  }
 
   if (state.showSafeArea) {
     ctx.save();
@@ -5551,11 +5525,9 @@ function openHelp() {
       text:
         'A button goes to another slide: choose where in "Goes to". A picture can do ' +
         'exactly the same \u2014 click it, set "Goes to" in the panel on the right, and the ' +
-        'remote will land on the picture and open that slide when it is pressed. A ' +
-        'picture with a destination is marked with a small arrow so you can tell it ' +
-        'apart from an ordinary one. Leave it on "None" and the picture is just a ' +
-        'picture. Point either one at a slide holding a video and it plays that video ' +
-        'straight away.',
+        'remote will land on the picture and open that slide when it is pressed. Leave ' +
+        'it on "None" and the picture is just a picture. Point either one at a slide ' +
+        'holding a video and it plays that video straight away.',
     }),
     el('h2', { text: 'Choosing something that is underneath something else' }),
     el('p', {

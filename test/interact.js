@@ -1043,6 +1043,61 @@ async function run() {
   );
 
   /*
+    Nothing is drawn over a picture for having somewhere to go.
+
+    An amber badge with a chevron used to be painted on the corner of every
+    picture with a destination, which sat on her photograph in the one place she
+    was trying to look at. The check is a straight pixel comparison: the same
+    slide, screenshotted with the destination set and with it taken away. If
+    anything at all is drawn for the destination, the two pictures differ.
+
+    Nothing is selected while either shot is taken, because a selection outline
+    is real editor furniture and would differ between them for reasons that have
+    nothing to do with this.
+  */
+  const badge = await js(`(async () => {
+    const T = window.__burnhouseTest;
+    const shot = async () => {
+      // Going to the slide also drops the selection, so no outline is drawn.
+      T.goToSlide(${JSON.stringify(linkSetup.firstId)});
+      await new Promise((r) => setTimeout(r, 500));
+      return document.getElementById('slideCanvas').toDataURL('image/png');
+    };
+
+    const linked = T.getState().slides[0].elements
+      .find((e) => e.kind === 'image' && e.targetSlideId);
+    if (!linked) return { error: 'no picture with a destination' };
+
+    const withTarget = await shot();
+    T.setImageTarget(linked.id, null);
+    const withoutTarget = await shot();
+    // Put back, and prove it is the same picture again, so the three shots are
+    // comparable rather than merely two of them.
+    T.setImageTarget(linked.id, ${JSON.stringify(linkSetup.secondId)});
+    const restored = await shot();
+
+    return {
+      id: linked.id,
+      same: withTarget === withoutTarget,
+      restored: withTarget === restored,
+      bytes: withTarget.length,
+    };
+  })()`);
+  await settle(600);
+
+  record(!badge.error, 'there is a picture with a destination to check', badge.error || badge.id);
+  record(
+    badge.same === true,
+    'a picture with somewhere to go is drawn exactly like one without',
+    badge.same ? `${badge.bytes} bytes, identical` : 'the two pictures differ'
+  );
+  record(
+    badge.restored === true,
+    'and giving it a destination again changes nothing either',
+    String(badge.restored)
+  );
+
+  /*
     What the disc makes of them.
 
     The point of the whole thing: a picture that has been given a destination is
