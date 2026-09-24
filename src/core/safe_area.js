@@ -49,14 +49,18 @@
   const SHAPE_LOCKED = new Set(['video', 'image']);
 
   /**
-   * Whether an element may be larger than the safe area.
+   * Whether an element is free of the safe-area rules.
    *
-   * A picture may. A photograph filling the frame, with its edges cropped by the
-   * television, is an ordinary thing to want, and there is nothing on it that a
-   * cropped edge could hide.
+   * A picture is. It may be bigger than the frame and it may be dragged anywhere
+   * at all, including clear off the slide — choosing a crop sometimes means
+   * pushing the picture right out of the way, and every limit here turned out to
+   * be one somebody hit and then had to work around. The size keeps its floor,
+   * as every kind does, so a picture cannot be resized into nothing by mistake,
+   * and the position can always be typed back in the panel.
    *
-   * Nothing else may. Text half off the edge is text that is simply not on the
-   * disc, and a button outside the area cannot be relied on with a remote.
+   * Nothing else is free. Text half off the edge is text that is simply not on
+   * the disc, and a button outside the area cannot be relied on with a remote —
+   * so both are pulled back to where they can be read and pressed.
    */
   function mayOverflow(kind) {
     return kind === 'image';
@@ -65,18 +69,15 @@
   /**
    * Where an element's edge may sit along one axis.
    *
-   * Two cases, and the difference between them is the whole point. An element
-   * that fits inside the limits is held entirely within them. An element LARGER
-   * than the limits cannot satisfy both edges at once, so the rule turns around:
-   * the limits are held inside the element, and moving it chooses which part of
-   * the picture shows through the frame.
+   * For elements that have to stay on screen, and it is a real clamp: an element
+   * that fits is held inside the limits, and one that does not — which only
+   * happens to a video tile whose shape makes it too tall — is held covering
+   * them, so the drag chooses which part shows.
    *
-   * The version this replaces applied the first case unconditionally, as
-   * `min(max(lo, v), hi - size)`. With an element wider than the area, `hi -
-   * size` came out *below* `lo`, so the two halves fought each other and every
-   * value collapsed to the same negative number. A picture scaled up too far
-   * could not be dragged at all: it sat pinned with its top-left corner off the
-   * slide, and every drag snapped it straight back there.
+   * The version this replaces applied only the first form, as `min(max(lo, v),
+   * hi - size)`. With an element larger than the area, `hi - size` came out
+   * *below* `lo`, so the two halves fought each other and every value collapsed
+   * to the same negative number — an element that could not be moved at all.
    */
   function clampEdge(start, size, boxStart, boxEnd) {
     const value = Math.round(Number(start) || 0);
@@ -109,15 +110,21 @@
 
     if (mayOverflow(element.kind)) {
       /*
-        Free to be bigger than the safe area, and free to move within it, so she
-        can choose which part of the picture the frame shows. The limits are
-        still respected — the picture cannot be pulled so far that a blank strip
-        appears inside the safe area — but they no longer pin it in one place.
+        A picture is not clamped at all — not to the safe area and not to the
+        slide. It may be dragged past either edge, or entirely off the frame.
+
+        Two narrower rules were tried first: hold an oversized picture so the
+        area it sits on stays covered, and then let it cross the edge but keep a
+        grabbable strip on screen. Both were still a wall to walk into, and both
+        were reported. The size keeps its floor so a picture cannot be resized
+        into nothing, and its position can be typed back in the panel if it ends
+        up somewhere awkward — which is enough to make "anywhere at all" safe to
+        allow.
       */
       element.width = w;
       element.height = h;
-      element.x = clampEdge(element.x, w, SAFE_MARGIN, boxRight);
-      element.y = clampEdge(element.y, h, SAFE_MARGIN, boxBottom);
+      element.x = Math.round(Number(element.x) || 0);
+      element.y = Math.round(Number(element.y) || 0);
       return element;
     }
 

@@ -3342,20 +3342,28 @@ function propArea(value, onInput, options = {}) {
   return area;
 }
 
+/**
+ * A number field.
+ *
+ * `min` defaults to 0 and `min: null` means no floor at all — which is what a
+ * picture's position needs, since a picture may be dragged off the slide and
+ * typing a negative number is then the only way back to it.
+ */
 function propNumber(value, onChange, options = {}) {
   const floor = options.min === undefined ? 0 : options.min;
+  const unbounded = floor === null;
   const ceiling = options.max === undefined ? undefined : options.max;
   const input = el('input', {
     type: 'number',
     value: String(Math.round((Number(value) || 0) * 100) / 100),
-    min: String(floor),
+    min: unbounded ? null : String(floor),
     max: ceiling === undefined ? null : String(ceiling),
     step: options.step === undefined ? '1' : String(options.step),
   });
   input.addEventListener('change', () => {
     let next = Number(input.value);
-    if (!Number.isFinite(next)) next = floor;
-    next = Math.max(floor, next);
+    if (!Number.isFinite(next)) next = unbounded ? 0 : floor;
+    if (!unbounded) next = Math.max(floor, next);
     if (ceiling !== undefined) next = Math.min(ceiling, next);
     onChange(next);
   });
@@ -3482,9 +3490,17 @@ function buildElementInspector(slide, element) {
     )),
   ];
 
+  /*
+    A picture has no position limits, so its X and Y accept a negative number —
+    which is the only way to bring one back if it has been dragged clear off the
+    slide. Everything else is held on the slide, so 0 is its floor and typing a
+    minus sign means nothing.
+  */
+  const positionFloor = element.kind === 'image' ? null : 0;
+
   const layoutRows = () => [
-    propRow('PositionX', propNumber(element.x, (v) => { element.x = v; clampElementInPlace(element); apply({}, { rebuild: true }); }, { min: 0 })),
-    propRow('PositionY', propNumber(element.y, (v) => { element.y = v; clampElementInPlace(element); apply({}, { rebuild: true }); }, { min: 0 })),
+    propRow('PositionX', propNumber(element.x, (v) => { element.x = v; clampElementInPlace(element); apply({}, { rebuild: true }); }, { min: positionFloor }), 'Position X'),
+    propRow('PositionY', propNumber(element.y, (v) => { element.y = v; clampElementInPlace(element); apply({}, { rebuild: true }); }, { min: positionFloor }), 'Position Y'),
     propRow('Width', propNumber(element.width, (v) => { element.width = v; clampElementInPlace(element); apply({}, { rebuild: true }); }, { min: MIN_ELEMENT_WIDTH })),
     propRow('Height', propNumber(element.height, (v) => { element.height = v; if (element.kind === 'text') element.autoHeight = false; clampElementInPlace(element); apply({}, { rebuild: true }); }, { min: MIN_ELEMENT_HEIGHT })),
     /*
@@ -3713,7 +3729,11 @@ function buildElementInspector(slide, element) {
   panel.append(
     el('p', {
       class: 'prop-hint',
-      text: 'Drag it on the slide to move it, or its handles to resize. It stays inside the safe area.',
+      text: element.kind === 'image'
+        ? 'Drag it to move it, or its handles to resize. A picture can go anywhere — ' +
+          'past the edge, or right off the slide — and the X and Y above can bring it back.'
+        : 'Drag it on the slide to move it, or its handles to resize. It stays inside ' +
+          'the safe area.',
     })
   );
 
@@ -3872,11 +3892,15 @@ function buildMultiElementInspector(elements) {
 
   const groups = [];
 
+  // Pictures have no position limits, so a negative X or Y is meaningful for
+  // them and only for them — see the single-element panel.
+  const positionFloor = elements.every((e) => e.kind === 'image') ? null : 0;
+
   groups.push({
     title: 'Position and size',
     rows: [
-      numberRow('PositionX', 'X', 'x', { min: 0 }),
-      numberRow('PositionY', 'Y', 'y', { min: 0 }),
+      numberRow('PositionX', 'X', 'x', { min: positionFloor }),
+      numberRow('PositionY', 'Y', 'y', { min: positionFloor }),
       numberRow('Width', 'Width', 'width', { min: MIN_ELEMENT_WIDTH }),
       numberRow('Height', 'Height', 'height', { min: MIN_ELEMENT_HEIGHT }),
     ],
@@ -5386,9 +5410,11 @@ function openHelp() {
         'bigger or smaller. Videos and pictures keep their shape while you do, so nothing ' +
         'gets stretched; hold Shift if you really do want to stretch one. Words and ' +
         'buttons are held inside the safe area, because some televisions crop the edge ' +
-        'of the picture. A picture may be made larger than that and moved around within ' +
-        'it, so a photograph can fill the frame. A background picture is removed by ' +
-        'pointing at it in the panel and pressing the cross that appears over it.',
+        'of the picture. A picture has no such limit: make it as big as you like and drag ' +
+        'it anywhere, including right off the slide, so a photograph can fill the frame. ' +
+        'If one ends up out of reach, its X and Y in the panel will bring it back. A ' +
+        'background picture is removed by pointing at it in the panel and pressing the ' +
+        'cross that appears over it.',
     }),
     el('h2', { text: 'Right-clicking' }),
     el('p', {

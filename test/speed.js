@@ -901,41 +901,45 @@ test('an element the size of the safe area can still be moved to both edges', ()
   assertEqual(right, 40, 'And at the right one, which is the same place when it is exactly full width');
 });
 
-test('a picture wider than the safe area can be dragged across it', () => {
+test('a picture is not clamped at all, however far it is dragged', () => {
   /*
-    The reported bug. A picture scaled past the safe area used to be pinned: the
-    upper position bound came out below the lower one, so both halves of the
-    clamp collapsed to the same negative number and every drag snapped it back
-    there. What has to be true instead is that its position varies with the drag.
+    Three complaints, one rule, arrived at by removing it.
+
+    First: a picture scaled past the safe area was pinned, because the clamp's
+    two halves collapsed to the same negative number and every drag snapped it
+    back there. Then it could be dragged but only as far as the safe margin,
+    which read as being clamped by the edge of the slide. Then, allowed past the
+    margin, it still stopped once a grabbable strip was all that was left.
+
+    Every one of those limits was hit in turn, so there is no limit: a picture
+    keeps the position it is given, however far out, including clear off the
+    slide. The size keeps its floor, as every kind does, so it cannot be resized
+    into nothing — and its position can be typed back in the panel.
   */
-  const hardLeft = dragged('image', -9999, -9999, 900, 600);
-  const hardRight = dragged('image', 9999, 9999, 900, 600);
-  const middle = dragged('image', 0, 0, 900, 600);
+  const cases = [
+    ['hard right', 9999, 9999],
+    ['hard left', -9999, -9999],
+    ['clear off the slide', 5000, 5000],
+    ['just past the edge', 760, -60],
+  ];
 
-  assert(hardLeft.x < hardRight.x, `Dragging must move it: ${hardLeft.x} then ${hardRight.x}`);
-  assert(hardLeft.y < hardRight.y, `On both axes: ${hardLeft.y} then ${hardRight.y}`);
-  assert(middle.x > hardLeft.x && middle.x < hardRight.x, 'And it passes through the middle');
-
-  // It must never leave a blank strip inside the safe area: an oversized picture
-  // covers the area it is placed against, and the drag chooses which part shows.
-  const right = 720 - safeArea.SAFE_MARGIN;
-  const bottom = 480 - safeArea.SAFE_MARGIN;
-  for (const box of [hardLeft, hardRight, middle]) {
-    assert(box.x <= safeArea.SAFE_MARGIN, `A gap opens on the left at x=${box.x}`);
-    assert(box.x + box.width >= right, `A gap opens on the right at x=${box.x}`);
-    assert(box.y <= safeArea.SAFE_MARGIN, `A gap opens at the top at y=${box.y}`);
-    assert(box.y + box.height >= bottom, `A gap opens at the bottom at y=${box.y}`);
+  for (const [what, x, y] of cases) {
+    const box = dragged('image', x, y, 900, 600);
+    assertEqual(box.x, x, `${what}: the x it was given must be the x it keeps`);
+    assertEqual(box.y, y, `${what}: and the y`);
   }
-});
 
-test('a picture that fits is held inside, exactly as before', () => {
-  const tooFar = dragged('image', -500, -500, 260, 190);
-  assertEqual(tooFar.x, safeArea.SAFE_MARGIN, 'A small picture stops at the left guide');
-  assertEqual(tooFar.y, safeArea.SAFE_MARGIN, 'And at the top one');
+  // A picture that fits is not clamped either: there is one rule for pictures,
+  // not one for each size.
+  const small = dragged('image', -120, -80, 260, 190);
+  assertEqual(small.x, -120, 'A small picture keeps a negative position too');
+  assertEqual(small.y, -80, 'On both axes');
 
-  const tooFarRight = dragged('image', 5000, 5000, 260, 190);
-  assertEqual(tooFarRight.x, 720 - safeArea.SAFE_MARGIN - 260, 'And at the right one');
-  assertEqual(tooFarRight.y, 480 - safeArea.SAFE_MARGIN - 190, 'And at the bottom one');
+  // The size floor is the one thing that stays, so a picture cannot be lost by
+  // being resized to nothing.
+  const empty = dragged('image', 10, 10, 0, 0);
+  assert(empty.width >= safeArea.MIN_WIDTH, `Width must keep a floor, got ${empty.width}`);
+  assert(empty.height >= safeArea.MIN_HEIGHT, `Height must keep a floor, got ${empty.height}`);
 });
 
 test('text and buttons are pulled back to the safe area instead of getting stuck', () => {
