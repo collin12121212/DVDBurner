@@ -677,8 +677,14 @@ async function buildMenus({ project, videos, tools, root, BrowserWindow, signal,
   });
   const { deck, layout } = model;
 
-  // Only slides that carry at least one button become a menu page: a DVD menu
-  // with nothing to choose is a dead end for whoever is holding the remote.
+  /*
+    A page can have nothing on it that can be pressed, and still be a page.
+
+    Which slides are pages is decided in the disc model, and it counts a slide a
+    button points at as well as a slide with buttons on it — a page of words is
+    somewhere the viewer is sent, and the remote's Menu key brings them back. All
+    this needs to know is whether there is anything to build at all.
+  */
   if (!model.menus.length) {
     return { menus: [], layout, deck, model };
   }
@@ -791,21 +797,35 @@ async function buildMenus({ project, videos, tools, root, BrowserWindow, signal,
     if (highlightArgs) await runFfmpeg(tools.ffmpeg, highlightArgs);
     if (selectArgs) await runFfmpeg(tools.ffmpeg, selectArgs);
 
-    const buttonedPath = path.join(menuDir, `menu_buttoned_${page.slideIndex + 1}.mpg`);
-    await runSpumuxToFile({
-      spumuxPath: tools.spumux,
-      xml: author.buildSpumuxXml({
-        buttons: page.buttons,
-        navigation: page.navigation,
-        highlightPath: highlightArgs ? highlightName : null,
-        selectPath: selectArgs ? selectName : null,
-        videoFormat: project.videoFormat,
-      }),
-      inputVob: stillPath,
-      outputPath: buttonedPath,
-      workDir: menuDir,
-      signal,
-    });
+    /*
+      A page with nothing to press is the still on its own.
+
+      Spumux exists here to attach the button rectangles and the highlight
+      pictures to a still. With no buttons there is nothing to attach — both
+      highlight pictures come back empty for an empty box list — so asking it for
+      an empty subpicture stream is work with a failure mode and no upside. The
+      still VOB is already a page a player can show and leave with the remote's
+      Menu key. Such a page is only ever built because a button points at it,
+      which is settled in the disc model.
+    */
+    let buttonedPath = stillPath;
+    if (page.buttons.length) {
+      buttonedPath = path.join(menuDir, `menu_buttoned_${page.slideIndex + 1}.mpg`);
+      await runSpumuxToFile({
+        spumuxPath: tools.spumux,
+        xml: author.buildSpumuxXml({
+          buttons: page.buttons,
+          navigation: page.navigation,
+          highlightPath: highlightArgs ? highlightName : null,
+          selectPath: selectArgs ? selectName : null,
+          videoFormat: project.videoFormat,
+        }),
+        inputVob: stillPath,
+        outputPath: buttonedPath,
+        workDir: menuDir,
+        signal,
+      });
+    }
 
     menus.push({
       slideId: page.slideId,

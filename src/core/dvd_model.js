@@ -109,28 +109,49 @@ function buildDiscModel({ deck, videos, aspect = '16:9' }) {
   /*
     Which slides are menu pages, and what number each one gets.
 
-    Page numbers have to be settled *after* the buttons are resolved, not before.
-    A slide whose every button leads nowhere is not a page at all, and if it were
-    still given a number then every page after it would be off by one — so a
-    button saying "jump menu 2" would arrive at the third page. That is a
-    silent, disc-wide navigation bug, and it is why this runs as a short loop: the
-    numbering depends on which buttons resolve, and a slide-targeting button
-    resolves only if its destination is itself a page.
+    A slide is a page when something on it can be pressed, *or* when a button
+    somewhere points at it. Either is enough, and the second half is not an
+    afterthought: a page of words, or a page carrying one photograph, has nothing
+    to press on it. Dropping such a page took the button pointing at it with it,
+    and then the page that button was on — so a deck whose only link was
+    "picture goes to a page of words" produced a disc with no menus at all, and
+    the picture silently did nothing when it was pressed.
 
-    Two passes settle it for any deck that can actually be built, and the cap
-    stops a pathological one from spinning.
+    Destinations are collected here, before any numbering, from the authored
+    buttons rather than from their resolved commands. A button aimed at a page
+    that is not yet a page has no command yet, so waiting for the command would
+    mean the destination never became one.
+
+    Numbering still has to settle after the buttons resolve. If a slide whose
+    every button leads nowhere were given a number, every page after it would be
+    off by one — so a button saying "jump menu 2" would arrive at the third page.
+    That is a silent, disc-wide navigation bug, and it is why this runs as a
+    short loop. Two passes settle it for any deck that can actually be built, and
+    the cap stops a pathological one from spinning.
   */
-  const hasButtons = (index) => layout.slides[index].buttons.length > 0;
+  const slideIndexById = new Map();
+  layout.slides.forEach((entry, index) => slideIndexById.set(entry.slide.id, index));
+
+  const pointedAt = new Set();
+  for (const entry of layout.slides) {
+    for (const element of entry.elements) {
+      // A button that names a film plays that film; it does not open a page, so
+      // it says nothing about whether its destination has to exist as one.
+      if (!element.targetSlideId || element.videoId) continue;
+      const at = slideIndexById.get(element.targetSlideId);
+      if (at !== undefined) pointedAt.add(at);
+    }
+  }
+
+  const candidateIndexes = [];
+  layout.slides.forEach((entry, index) => {
+    if (entry.buttons.length || pointedAt.has(index)) candidateIndexes.push(index);
+  });
 
   let menuNumberBySlideIndex = new Map();
   let menus = [];
 
   for (let pass = 0; pass < 4; pass += 1) {
-    const candidateIndexes = [];
-    layout.slides.forEach((entry, index) => {
-      if (hasButtons(index)) candidateIndexes.push(index);
-    });
-
     const numbering = new Map();
     candidateIndexes.forEach((slideIndex, position) => {
       numbering.set(slideIndex, position + 1);
@@ -158,9 +179,14 @@ function buildDiscModel({ deck, videos, aspect = '16:9' }) {
         });
       }
 
-      // A page with nothing usable on it is not a page.
-      if (!buttons.length) continue;
+      /*
+        Built even with no buttons on it.
 
+        A page pointed at by a button is a page whether or not anything on it can
+        be pressed: it is somewhere the viewer is sent, and the only way off it is
+        the remote's Menu key, which returns to the disc root. Leaving it out here
+        is what made the pointer dangle.
+      */
       built.push({
         page: numbering.get(slideIndex),
         slideIndex,
@@ -174,8 +200,11 @@ function buildDiscModel({ deck, videos, aspect = '16:9' }) {
       });
     }
 
-    // Renumber to close any gap the dropping left, and re-resolve with the
-    // settling numbers. Once nothing changes the answer is final.
+    /*
+      Renumber in slide order, and resolve again with the settled numbers. The
+      numbering a pass used is the one it was built with, so a command written
+      during it can be one page out until the next pass agrees.
+    */
     const settled = new Map();
     built.forEach((page, index) => settled.set(page.slideIndex, index + 1));
 

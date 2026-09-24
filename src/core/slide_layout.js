@@ -442,45 +442,16 @@ function clampDeck(deck) {
 /**
  * The whole deck, laid out.
  *
- * Also the one place that can see across slides, which is what the check below
- * needs: whether a button points at a page that will not exist.
+ * The problems are per slide. There used to be a deck-wide check here for a
+ * button pointing at a slide with nothing to press on it, warning that it would
+ * not be a page — which was true, and was the bug: the pointer was dropped, and
+ * took its own page with it. A page a button points at is now a page whatever is
+ * on it, so there is nothing left to warn about. The way off such a page is the
+ * remote's own Menu key, and a button on it if she wants one.
  */
 function layoutDeck(deck) {
   const slides = deck.slides.map((slide) => layoutSlide(deck, slide));
   const problems = slides.flatMap((layout) => layout.problems);
-
-  /*
-    A button that goes to a slide with nothing to press on it.
-
-    The disc numbers its pages by which slides have something usable on them, so
-    a slide with no buttons of its own is not a page at all — and a button aimed
-    at one is quietly dropped from the disc. Silence is the wrong answer there:
-    the disc simply does not do what it looks like it does, and nothing says so.
-
-    Not counted when the slide holds a film, because then the button plays the
-    film directly rather than opening the page, and not when the button has a
-    film of its own for the same reason.
-  */
-  const byId = new Map(slides.map((entry) => [entry.slide.id, entry]));
-  const pointedAt = new Set();
-  for (const entry of slides) {
-    for (const element of entry.elements) {
-      if (element.targetSlideId && !element.videoId) pointedAt.add(element.targetSlideId);
-    }
-  }
-
-  for (const slideId of pointedAt) {
-    const target = byId.get(slideId);
-    if (!target || target.buttons.length) continue;
-    const holdsAFilm = target.elements.some((e) => e.kind === 'video' && e.videoId);
-    if (holdsAFilm) continue;
-    problems.push(
-      `Something goes to "${target.slide.title}", but that slide has nothing to press ` +
-        `on it, so it would not be a page on the disc. Put a button on it \u2014 one ` +
-        `that goes back to the menu, for instance.`
-    );
-  }
-
   return { deck, slides, problems };
 }
 

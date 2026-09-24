@@ -134,7 +134,7 @@ function buildDvdauthorXml({ videoFormat, titleAspect, menus, titles }) {
   // actual GOP length, which is the one that matters.
   const resolution = isPal ? '720x576' : '720x480';
   const aspect = titleAspect === '4:3' ? '4:3' : '16:9';
-  const hasMenus = Array.isArray(menus) && menus.some((m) => m && m.vobPath && m.buttons.length);
+  const hasMenus = Array.isArray(menus) && menus.some((m) => m && m.vobPath);
 
   const out = [];
   out.push('<?xml version="1.0" encoding="UTF-8"?>');
@@ -181,7 +181,18 @@ function buildDvdauthorXml({ videoFormat, titleAspect, menus, titles }) {
 
     let menuNumber = 1;
     menus.forEach((menu, index) => {
-      if (!menu || !menu.vobPath || !menu.buttons.length) return;
+      /*
+        A page with no buttons is written out too.
+
+        It is a page a button somewhere points at — a page of words, or one
+        photograph — and the disc has to be able to go there. Leaving it out here
+        while the model had already given it a number is the disc-wide bug this
+        whole ordering exists to avoid: every page after it would be one out, and
+        a button saying "jump menu 2" would land on the third page. A `<pgc>` with
+        a still and no `<button>` children is a legal page; it simply has nothing
+        to light up.
+      */
+      if (!menu || !menu.vobPath) return;
 
       // The first menu page is what a player shows when the disc is inserted
       // and what the remote's menu button returns to.

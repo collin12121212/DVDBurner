@@ -6723,8 +6723,8 @@ function buildSimulatorDom() {
     el('strong', { text: 'Nothing to choose yet' }),
     el('span', {
       text:
-        'A slide with no buttons cannot be a menu page, so this disc has no menus. ' +
-        'Add a video and its buttons appear here.',
+        'This disc has no menu pages, so there is nothing to press. Put a button on ' +
+        'a slide, or point a picture at another slide, and the pages appear here.',
     }),
   ]);
 
